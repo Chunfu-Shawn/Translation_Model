@@ -133,15 +133,15 @@ class FlashMultiHeadedAttention(nn.Module):
         attention_mask: a bool (1/0) tensor of shape (bs, seq_len)
         returns: out (bs, seq_len, d_model)
         """
-        bs = x.shape[0]
+        bs, seq_len = x.shape[0:2]
         # x shape: (bs, seq_len, n_heads*head_dim)
         # head_dim * n_heads = d_model
         # .view(bs, seq_len, n_heads, head_dim) split d_model to [n_heads, head_dim]
         # .transpose(1,2) -> (bs, n_heads, seq_len, head_dim) for calculating parallelly in muti-heads
         # be careful for attention_mask shape
-        query = self.toqueries(x).view(bs, -1, self.heads, self.head_dim).transpose(1, 2)
-        key = self.tokeys(x).view(bs, -1, self.heads, self.head_dim).transpose(1, 2)
-        value = self.tovalues(x).view(bs, -1, self.heads, self.head_dim).transpose(1, 2)
+        query = self.toqueries(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        key = self.tokeys(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        value = self.tovalues(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
 
         if "RoPE":
             query = self.RoPE(query)
@@ -175,10 +175,10 @@ class FlashMultiHeadedAttention(nn.Module):
         ).to(torch.float32)
 
         # 5. recover to (bs, seq_len, heads, head_dim)
-        attention_qkv = pad_input(attention_qkv_unpad, indices, bs, max_seqlen)
+        attention_qkv = pad_input(attention_qkv_unpad, indices, bs, seq_len)
 
         # 6. catenate output of multi-heads: (bs, seq_len, n_heads, head_dim) -> (bs, seq_len, n_heads*head_dim)
-        attention_qkv = attention_qkv.reshape(bs, -1, self.heads * self.head_dim)
+        attention_qkv = attention_qkv.reshape(bs, seq_len, self.heads * self.head_dim)
         representations_batch = self.unifyheads(attention_qkv)
 
         return representations_batch

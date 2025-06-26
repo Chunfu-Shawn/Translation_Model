@@ -1,35 +1,46 @@
 import numpy as np
 from numpy import random
 
-__author__ = "Chunfu Xiao"
-__contributor__="..."
-__copyright__ = ""
-__credits__ = []
-__license__ = ""
-__version__="1.0.0"
-__maintainer__ = "Chunfu Xiao"
-__email__ = "chunfushawn@126.com"
 
-def mask_random_single_base(seq, tx_idx, embedding, mask_perc, mask_value):
+def mask_random_single_base(seq, tx_idx, embedding, mask_perc, mask_value, motifs_automaton):
+    """
+    Single-base masking for RNA sequences
+    
+    Args:
+        seq (str): RNA sequence
+        tx_idx (dict): Transcript index information
+        embedding (np.ndarray): Original embedding matrix (max_src_len, d_model)
+        mask_perc (float): Maximum masking percentage (0-1)
+        mask_value (float): Value to use for masking
+        
+    Returns:
+        masked_embedding (np.ndarray): Masked embedding matrix
+        inverse_embedding_mask (np.ndarray): Boolean mask indicating masked positions
+    """
+
     src_len = len(seq)
     max_src_len = embedding.shape[0]
     d_model = embedding.shape[1]
-    masked_embedding = embedding
-    inverse_embedding_mask = np.array([True for _ in range(src_len)])
+    masked_embedding = embedding.copy()
+    inverse_embedding_mask = np.ones(src_len, dtype=bool)
 
     mask_amount = round(src_len * mask_perc)
     for _ in range(mask_amount):
         i = random.randint(0, src_len - 1)
-
-        if random.random() < 0.8:
-            masked_embedding[i, :] = np.full(d_model, mask_value) # 80% of the time, replace with [MASK]
+        perc = random.random()
+        if perc < 0.8:
+            MASK = mask_value # 80% of the time, replace with [MASK]
+        elif perc < 0.9:
+            MASK = random.rand(d_model) # replace with random embedding
         else:
-            masked_embedding[i, :] = random.rand(d_model) # replace with random embedding
+            MASK = embedding[i, :] # replace with raw embedding
+        # replace with MASK
+        masked_embedding[i, :] = MASK
         inverse_embedding_mask[i] = False
 
     # padding to maximum length
     if max_src_len > src_len:
-        mask_p = np.full(max_src_len - src_len, True)
-        inverse_embedding_mask = np.hstack((inverse_embedding_mask, mask_p))
+        pad_mask = np.full(max_src_len - src_len, True)
+        inverse_embedding_mask = np.hstack((inverse_embedding_mask, pad_mask))
 
     return masked_embedding, inverse_embedding_mask

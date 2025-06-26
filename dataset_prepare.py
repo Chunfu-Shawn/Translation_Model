@@ -1,12 +1,10 @@
 import numpy as np
 from tqdm import tqdm
 from numpy import random
-from concurrent.futures import ProcessPoolExecutor
 from collections import defaultdict
 from torch.utils.data import Dataset
 from data_generate_RPF_count import *
-from mask_random_single_base import *
-from mask_random_trinucleotide import *
+from masking_adapter import *
 
 __author__ = "Chunfu Xiao"
 __contributor__="..."
@@ -17,12 +15,11 @@ __version__="1.0.0"
 __maintainer__ = "Chunfu Xiao"
 __email__ = "chunfushawn@126.com"
 
-class BatchDatasetLoader(Dataset):
-    MASK = -1
-    MASK_PERCENTAGE = 0.15
 
+class BatchDataLoader(Dataset):
     def __init__(self, transcript_seq_dict, transcript_index, chroms,
-                 batch_size=8, min_length=0, max_length=None, padding_value=-1):
+                 batch_size=8, min_length=0, max_length=None, padding_value=-1,
+                 mask_perc=0.15, mask_value=-1, motif_file_path=""):
         """
         RNA sequence dataset class, could be grouped and padded by sequence length
         
@@ -38,6 +35,7 @@ class BatchDatasetLoader(Dataset):
         # filter transcript with RPF reads in specific chromosomes
         self.tids = [tid for (tid, v) in transcript_index.items() if (v["chrom"] in chroms)]
         self.length_groups = defaultdict(list)
+        self.masking_adapter = MaskingAdapter(transcript_seq_dict, mask_perc, mask_value, motif_file_path)
         self._base_seq_emb = {}
         self._base_pad_mask = {}
         
@@ -59,55 +57,6 @@ class BatchDatasetLoader(Dataset):
         # set parameters
         self.batch_size = batch_size
         self.padding_value = padding_value
-
-    def single_base_mask(self, embedding, tid):
-        src_len = len(self.seq_dict[tid])
-        max_src_len = embedding.shape[0]
-        d_model = embedding.shape[1]
-        masked_embedding = embedding
-        inverse_embedding_mask = np.array([True for _ in range(src_len)])
-
-        mask_amount = round(src_len * self.MASK_PERCENTAGE)
-        for _ in range(mask_amount):
-            i = random.randint(0, src_len - 1)
-
-            if random.random() < 0.8:
-                masked_embedding[i, :] = np.full(d_model, self.MASK) # 80% of the time, replace with [MASK]
-            else:
-                masked_embedding[i, :] = random.rand(d_model) # replace with random embedding
-            inverse_embedding_mask[i] = False
-
-        # padding to maximum length
-        if max_src_len > src_len:
-            mask_p = np.full(max_src_len - src_len, True)
-            inverse_embedding_mask = np.hstack((inverse_embedding_mask, mask_p))
-
-        return masked_embedding, inverse_embedding_mask
-    
-    def codon_level_mask(self, embedding, tid):
-        src_len = len(self.seq_dict[tid])
-        max_src_len = embedding.shape[0]
-        d_model = embedding.shape[1]
-        masked_embedding = embedding
-        if self.tx_idx[tid]['cds_start'] == -1:
-            inverse_embedding_mask = np.array([True for _ in range(src_len)])
-
-        mask_amount = round(src_len * self.MASK_PERCENTAGE)
-        for _ in range(mask_amount):
-            i = random.randint(0, src_len - 1)
-
-            if random.random() < 0.8:
-                masked_embedding[i, :] = np.full(d_model, self.MASK) # 80% of the time, replace with [MASK]
-            else:
-                masked_embedding[i, :] = random.rand(d_model) # replace with random embedding
-            inverse_embedding_mask[i] = False
-
-        # padding to maximum length
-        if max_src_len > src_len:
-            mask_p = np.full(max_src_len - src_len, True)
-            inverse_embedding_mask = np.hstack((inverse_embedding_mask, mask_p))
-
-        return masked_embedding, inverse_embedding_mask
 
     def one_hot_encode(self, tid):
         seq = self.seq_dict[tid]
@@ -179,10 +128,9 @@ class BatchDatasetLoader(Dataset):
                 # masked embedding
                 combined_batch = np.concatenate((seq_batch, count_batch), axis=2)
                 masked, seq_mask = zip(*[
-                    random.choice(
-                        [mask_random_single_base, mask_random_trinucleotide]
-                        )(self.seq_dict[tid], self.tx_idx[tid], combined_batch[i], self.MASK_PERCENTAGE, self.MASK)
-                    for i, tid in enumerate(batch_tids)
+                    self.masking_adapter.get_random_mask_function(
+                        self.seq_dict[tid], combined_batch[i], self.tx_idx[tid]
+                        ) for i, tid in enumerate(batch_tids)
                     ])
                 masked = np.stack(masked, axis=0)
                 seq_mask = np.stack(seq_mask, axis=0)
@@ -204,29 +152,3 @@ class BatchDatasetLoader(Dataset):
         self.batch_indices = batches
 
         return batches
-
-if __name__ == "__main__":
-    tx_arrays_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_arrays.pkl'
-    RPF_count_file = '/home/user/data3/rbase/translation_pred/models/test/SRR15513158.read_count.pkl'
-    tx_seq_file = '/home/user/data3/rbase/translation_pred/models/lib/tx_seq.v48.pkl'
-    with open(tx_arrays_file, 'rb') as f:
-        tx_arrays = pickle.load(f)
-    with open(RPF_count_file, 'rb') as f:
-        RPF_count = pickle.load(f)
-    with open(tx_seq_file, 'rb') as f:
-        tx_seq = pickle.load(f)
-    d_model = 4
-    batch_size = 8
-    print("### Generate batch dataset ###")
-
-    # split dataset
-    chrom_train = ["chr" + str(i) for i in range(1,16)] + ["X"]
-    chrom_valid = ["chr" + str(i) for i in range(16,21)]
-    chrom_test = ["chr" + str(i) for i in range(21,23)] + ["Y"]
-    # create dataset
-    train_dataset = BatchDatasetLoader(RPF_count, tx_seq, tx_arrays, chrom_train, batch_size, min_length=100)
-
-    max_batch_idx = train_dataset.__len__() - 1
-    print(train_dataset.__getitem__(max_batch_idx))
-    print(train_dataset.get_batch_seq_embedding(max_batch_idx).shape)
-    print(train_dataset.get_batch_count_embedding(max_batch_idx).shape)
