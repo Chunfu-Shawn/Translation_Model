@@ -1,8 +1,8 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-from genome_tx_exon_index import *
-from data_generate_RPF_count import *
+import pickle
+import numpy as np
 
 __author__ = "Chunfu Xiao"
 __contributor__="..."
@@ -13,7 +13,7 @@ __version__="1.0.0"
 __maintainer__ = "Chunfu Xiao"
 __email__ = "chunfushawn@gmail.com"
 
-def plot_bar_RPF_along_tx(RPF_count, tx_info, output_file, log_y=False):
+def plot_bar_RPF_along_tx(RPF_count, tx_info, cds_info, output_file, log_y=False):
     read_len = sorted(list(RPF_count.keys()))
     num_read_len = len(read_len)
     if num_read_len == 0:
@@ -42,7 +42,7 @@ def plot_bar_RPF_along_tx(RPF_count, tx_info, output_file, log_y=False):
     plt.ylabel('log2 RPF count' if log_y else 'RPF count', fontsize=8)
 
     # different read length
-    tx_len = tx_info["tx_ends"][-1]
+    tx_len = cds_info["tx_ends"][-1]
     sum = np.zeros(tx_len)
     for i in range(0,num_read_len):
         l = read_len[i]
@@ -57,14 +57,14 @@ def plot_bar_RPF_along_tx(RPF_count, tx_info, output_file, log_y=False):
     axs[-2].set_title("All RPF length", fontsize=10, pad=1)
 
     # coding region
-    axs[-1].axvspan(tx_info["cds_start"], tx_info["cds_end"], ymin=0.05, ymax=0.45, color='darkorange', label='Coding Region')
+    axs[-1].axvspan(cds_info["cds_start"], cds_info["cds_end"], ymin=0.05, ymax=0.45, color='darkorange', label='Coding Region')
     axs[-1].legend(loc='upper right')
 
     # save pdf
     plt.savefig(output_file)
     plt.close()
 
-def plot_heatmap_RPF_along_tx(RPF_count, tx_info, output_file, log_y=False):
+def plot_heatmap_RPF_along_tx(RPF_count, tx_info, cds_info, output_file, log_y=False):
     # data prepare
     read_len = sorted(list(RPF_count.keys()))
     if len(read_len) == 0:
@@ -97,26 +97,30 @@ def plot_heatmap_RPF_along_tx(RPF_count, tx_info, output_file, log_y=False):
 
 if __name__=="__main__":
     RPF_count_file = '/home/user/data3/rbase/translation_pred/models/test/SRR15513158.v48.read_count.pkl'
-    tx_arrays_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_arrays.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
+    tx_cds_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_cds.pkl'
     output_dir = '/home/user/data3/rbase/translation_pred/models/test/figures'
     tx_ids = ['ENST00000382361.8']
     # load results
     with open(RPF_count_file, 'rb') as f_RPF:
         final_counts = pickle.load(f_RPF)
-    with open(tx_arrays_file, 'rb') as f_tx:
-        tx_arrays = pickle.load(f_tx)
+    with open(tx_meta_file, 'rb') as f_tx:
+        tx_meta = pickle.load(f_tx)
+    with open(tx_cds_file, 'rb') as f_cds:
+        tx_cds = pickle.load(f_tx)
     
     # plot
     for tx_id in tx_ids:
         target_counts = final_counts[tx_id]
-        tx_info = tx_arrays[tx_id]
+        tx_info = tx_meta[tx_id]
+        cds_info = tx_cds[tx_id]
         print("--- plot the read distribution of " + tx_id + " ---")
         # plot 
         plot_bar_RPF_along_tx(
-            target_counts, tx_info, output_dir + "/Barplot RPF count along the transcript of "+ tx_id + ".pdf", True
+            target_counts, tx_info, cds_info, output_dir + "/Barplot RPF count along the transcript of "+ tx_id + ".pdf", True
             )
         plot_heatmap_RPF_along_tx(
-            target_counts, tx_info, output_dir + "/Heatmap RPF count along the transcript of "+ tx_id + ".pdf", True
+            target_counts, tx_info, cds_info, output_dir + "/Heatmap RPF count along the transcript of "+ tx_id + ".pdf", True
             )
     # plot_three_nucleotide_periodicity(
     #     target_counts, 

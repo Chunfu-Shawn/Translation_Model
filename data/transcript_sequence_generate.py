@@ -1,6 +1,6 @@
-import h5py
+import pickle
 from itertools import groupby
-from genome_tx_exon_index import *
+
 
 __author__ = "Chunfu Xiao"
 __contributor__="..."
@@ -26,21 +26,22 @@ def fasta_iter(fasta_file):
             yield header, seq
 
 if __name__=="__main__":
-    tx_arrays_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_arrays.pkl'
-    fasta_tx_file = '/home/user/data3/rbase/genome_ref/Homo_sapiens/hg38/fasta/transcripts/gencode.v48.all_transcripts.fa'
+    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
+    fasta_tx_file = '/home/user/data3/rbase/genome_ref/Homo_sapiens/hg38/fasta/transcripts/gencode.v48.transcripts.fa'
     tx_seq_file = '/home/user/data3/rbase/translation_pred/models/lib/tx_seq.v48.pkl'
 
     # load tx index
-    with open(tx_arrays_file, 'rb') as f:
-        tx_arrays = pickle.load(f)
+    with open(tx_meta_file, 'rb') as f:
+        tx_meta = pickle.load(f)
 
     # process fasta data
     fasta_tx = fasta_iter(fasta_tx_file)
     # save pickle data
     tx_seq = {}
-    for h, s in fasta_iter(fasta_tx_file):
+    for h, s in fasta_tx:
         tx_id = h.split("|")[0]
-        if tx_id in tx_arrays:
+        if tx_id in tx_meta:
             tx_seq[tx_id] = s
+
     with open(tx_seq_file, 'wb') as f_seq:
         pickle.dump(tx_seq, f_seq, protocol=pickle.HIGHEST_PROTOCOL)

@@ -3,8 +3,8 @@ from tqdm import tqdm
 from numpy import random
 from collections import defaultdict
 from torch.utils.data import Dataset
-from data_generate_RPF_count import *
-from masking_adapter import *
+from data.RPF_counter import *
+from data.masking_adapter import *
 
 __author__ = "Chunfu Xiao"
 __contributor__="..."
@@ -16,7 +16,7 @@ __maintainer__ = "Chunfu Xiao"
 __email__ = "chunfushawn@126.com"
 
 
-class BatchDataLoader(Dataset):
+class LengthBucketDataset(Dataset):
     def __init__(self, transcript_seq_dict, transcript_index, chroms,
                  batch_size=8, min_length=0, max_length=None, padding_value=-1,
                  mask_perc=0.15, mask_value=-1, motif_file_path=""):
@@ -30,18 +30,19 @@ class BatchDataLoader(Dataset):
         :param padding_value: 填充值
         """
 
+        self.data = []
         self.seq_dict = transcript_seq_dict
         self.tx_idx = transcript_index
         # filter transcript with RPF reads in specific chromosomes
         self.tids = [tid for (tid, v) in transcript_index.items() if (v["chrom"] in chroms)]
-        self.length_groups = defaultdict(list)
         self.masking_adapter = MaskingAdapter(transcript_seq_dict, mask_perc, mask_value, motif_file_path)
         self._base_seq_emb = {}
         self._base_pad_mask = {}
+        self.length_groups = defaultdict(list)
         
-        # filter and group training transcript
-        print("### Data Preparation ###")
-        for tid in tqdm(self.tids, desc="Data Processing"):
+        # data cache
+        print("### Data Cache ###")
+        for tid in tqdm(self.tids, desc="Data Cache", mininterval=1000):
             seq_len = len(self.seq_dict[tid])
             if seq_len < min_length:
                 continue
@@ -51,12 +52,16 @@ class BatchDataLoader(Dataset):
             self._base_seq_emb[tid] = self.one_hot_encode(tid)
             # pad mask
             self._base_pad_mask[tid] = np.array([True for _ in range(seq_len)])
-            # group
-            self.length_groups[seq_len].append(tid)
-        self.sorted_length_groups = sorted(self.length_groups.keys())
+        
         # set parameters
         self.batch_size = batch_size
         self.padding_value = padding_value
+
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
 
     def one_hot_encode(self, tid):
         seq = self.seq_dict[tid]
@@ -66,33 +71,61 @@ class BatchDataLoader(Dataset):
 
         return onehot
     
-    def count_normalized_embedding(self, count_dict, tid, read_len=False):
+    def count_normalize_transcript(self, counts: np.ndarray):
+        # non-zero counts
+        nz = counts[counts > 0]
+
+        # median of non-zero counts
+        if nz.size > 0:
+            med_nz = np.median(nz)
+        else:
+            return counts
+        
+        # asinh(x) ≈ x when x small, ≈ log(2x) when x large
+        asinh_counts = np.arcsinh(counts)
+
+        # normlize by median value
+        return asinh_counts / (np.arcsinh(med_nz) + 1)
+    
+    def count_embedding(self, count_dict, tid, read_len=False):
         seq = self.seq_dict[tid]
-        raw_count = np.zeros((len(seq), 10)) # shape (len(seq), 10)
-        # save read length information
+
+        # extend to shape (len(seq), 10)
+        raw_count = np.zeros((len(seq), 10)) if read_len else np.zeros((len(seq), 1))
         if tid in count_dict:
             count = count_dict[tid]
             for read_l in count:
                 for pos in count[read_l]:
                     raw_count[pos-1, read_l-25] = count[read_l][pos]
-            sum_count = np.sum(raw_count)
-            # save read length information
-            if read_len:
-                nor_count = np.log2(raw_count/(sum_count/np.size(raw_count) + 3) + 1) # shape (len(seq), 10)
-            else:
-                pos_sum_count = np.sum(raw_count, axis=1, keepdims=True) # shape (len(seq), 1)
-                nor_count = np.log2(pos_sum_count/(sum_count/len(seq) + 3) + 1) # shape (len(seq), 1)
+            # normalize in a transcript
+            return self.count_normalize_transcript(raw_count)
         else:
-            nor_count = raw_count if read_len else np.zeros((len(seq), 1))
+            return raw_count
+        
+    
+    def _length_batches(self, tids):
+        # bucketing by length
+        print("### Length Bucketing ###")
 
-        return nor_count
+        # only consider filtered transcript
+        for tid in tqdm(tids, desc="Length Bucketing", mininterval=1000):
+            seq_len = len(self.seq_dict[tid])
+            if tid not in self.tids:
+                continue
+            self.length_groups[seq_len].append(tid)
 
-    def compute_batches(self, count_dict):
+        # sorted length (short to long)
+        return sorted(self.length_groups.keys())
+    
+
+    def generate_batch_dataset(self, count_dict, coding_dict=None, tissue_type=None):
+        # length bucketing
+        sorted_length_groups = self._length_batches(count_dict.keys())
+
+        # generate batch dataset
         batches = []
         remnant = []
-        
-        # 对每个长度组进行处理
-        for L in tqdm(self.sorted_length_groups, desc="Batch Processing"):
+        for L in tqdm(sorted_length_groups, desc="Batch Processing", mininterval=200):
             current_group = remnant + self.length_groups[L]
             # shuffle items for batch
             random.shuffle(current_group)
@@ -102,11 +135,12 @@ class BatchDataLoader(Dataset):
             while idx + self.batch_size <= len(current_group):
                 batch_tids = current_group[idx: idx + self.batch_size]
                 idx += self.batch_size
-                count_embs = [self.count_normalized_embedding(count_dict, tid, True) for tid in batch_tids]
                 seq_embs = [self._base_seq_emb[tid] for tid in batch_tids]
+                count_embs = [self.count_embedding(count_dict, tid, True) for tid in batch_tids]
+                # coding_embs = [coding_dict[tid] for tid in batch_tids]
                 pad_masks = [self._base_pad_mask[tid] for tid in batch_tids]
                 
-                # pad seq and count embeddings to L length
+                # pad embeddings to L length
                 seq_batch = np.stack([
                     np.pad(e,
                         ((0, L - e.shape[0]), (0, 0)),
@@ -119,6 +153,12 @@ class BatchDataLoader(Dataset):
                         constant_values=self.padding_value
                     ) for e in count_embs
                 ], axis=0)
+                # coding_batch = np.stack([
+                #     np.pad(e,
+                #         ((0, L - e.shape[0]), (0, 0)),
+                #         constant_values=self.padding_value
+                #     ) for e in coding_embs
+                # ], axis=0)
 
                 # padding mask
                 pad_masks_2 = np.stack([
@@ -127,28 +167,27 @@ class BatchDataLoader(Dataset):
 
                 # masked embedding
                 combined_batch = np.concatenate((seq_batch, count_batch), axis=2)
-                masked, seq_mask = zip(*[
+                masked, pred_mask = zip(*[
                     self.masking_adapter.get_random_mask_function(
                         self.seq_dict[tid], combined_batch[i], self.tx_idx[tid]
                         ) for i, tid in enumerate(batch_tids)
                     ])
                 masked = np.stack(masked, axis=0)
-                seq_mask = np.stack(seq_mask, axis=0)
+                pred_mask = np.stack(pred_mask, axis=0)
                 
                 batches.append({
                         'tids': batch_tids, 
                         'length': L, 
-                        'seq_embeddings': seq_batch,
-                        'count_embeddings': count_batch,
+                        'seq_emb': seq_batch,
+                        'count_emb': count_batch,
+                        # 'coding_emb': coding_batch,
                         'pad_mask': pad_masks_2,
-                        'masked_embedding': masked,
-                        'seq_mask': seq_mask
+                        'masked_emb': masked,
+                        'pred_mask': pred_mask
                         })
             # 剩余不足 batch_size 的序列，留到下一轮
             remnant = current_group[idx:]
 
         # drop the last remnant and shuffle all batches
         random.shuffle(batches)
-        self.batch_indices = batches
-
-        return batches
+        self.data = batches
