@@ -2,7 +2,6 @@ import numpy as np
 from numpy import random
 import ahocorasick
 import copy
-import torch
 
 def load_motifs_from_file(motif_file_path):
     motifs = []
@@ -33,7 +32,7 @@ def build_automaton(motifs):
 
 
 class MaskingAdapter:
-    def __init__(self, seq_dict, mask_value, motif_file_path, mask_perc=[0.15, 0.15], offset=12):
+    def __init__(self, seq_dict, mask_value, motif_file_path, mask_perc=[0.15, 0.15]):
         """
         Masking adapter for RNA sequences
         
@@ -46,10 +45,8 @@ class MaskingAdapter:
         self.motifs_list = load_motifs_from_file(motif_file_path)
         self.motif_automaton = build_automaton(self.motifs_list)
         self.mask_perc = mask_perc
-        self.offset = offset
-
     
-    def mask_random_single_base(self, seq, embeddings, tx_cds):
+    def mask_random_single_base(self, seq, embeddings, cds_start_pos):
         """
         Single-base masking for RNA sequences
         
@@ -66,12 +63,12 @@ class MaskingAdapter:
         
         masked_emb = copy.deepcopy(embeddings)
         num = len(embeddings)
-        emb_mask = [np.zeros(src_len, dtype=bool)] * num
+        emb_mask = [np.zeros(src_len, dtype=bool) for _ in range(num)] # mask indicator
         # for seq or count
         for i in range(num):
             d_model = embeddings[i].shape[1]
             mask_amount = round(src_len * self.mask_perc[i])
-            mask_pos = random.sample(range(src_len - 1), mask_amount)
+            mask_pos = random.choice(range(src_len - 1), mask_amount, replace=False)
             for p in mask_pos:
                 perc = random.random()
                 if perc < 0.8:
@@ -86,7 +83,7 @@ class MaskingAdapter:
 
         return masked_emb, emb_mask
     
-    def mask_random_trinucleotide(self, seq, embeddings, tx_cds):
+    def mask_random_trinucleotide(self, seq, embeddings, cds_start_pos):
         """
         Trinucleotide (codon) masking for RNA sequences
         
@@ -105,25 +102,25 @@ class MaskingAdapter:
         start = 0 # frame-shift
         masked_emb = copy.deepcopy(embeddings)
         num = len(embeddings)
-        emb_mask = [np.zeros(src_len, dtype=bool)] * num # mask indicator
+        emb_mask = [np.zeros(src_len, dtype=bool) for _ in range(num)]
 
         # for seq or count
         for i in range(num):
-            mask_tri_amount = int(src_len * self.mask_perc[i] // 3) # number of trinucleotide needed to mask
+            mask_tri_amount = round(src_len * self.mask_perc[i] // 3) # number of trinucleotide needed to mask
             d_model = embeddings[i].shape[1]
 
             # mask random or mask in-frame trinucleotide
-            if tx_cds['cds_start_pos'] == -1:
+            if cds_start_pos == -1:
                 tri_len = src_len // 3
             else:
-                cds_start = tx_cds['cds_start_pos'] - 1
+                cds_start = cds_start_pos - 1
                 start = cds_start % 3 # in-frame
                 tri_len = (src_len - start) // 3
             
             # mask trinucleotide by index
-            p = random.choice(tri_len, mask_tri_amount, replace=False)
-            mask_start = start + p * 3
-            mask_end = start + p * 3 + 3
+            mask_pos = random.choice(tri_len, mask_tri_amount, replace=False)
+            mask_start = start + mask_pos * 3
+            mask_end = start + mask_pos * 3 + 3
 
             for n in range(mask_tri_amount):
                 perc = random.random()
@@ -139,7 +136,7 @@ class MaskingAdapter:
 
         return masked_emb, emb_mask
 
-    def mask_random_motif(self, seq, embeddings, tx_cds):
+    def mask_random_motif(self, seq, embeddings, cds_start_pos):
         """
         Fast motif masking for RNA sequences using Aho-Corasick algorithm.
         
@@ -155,15 +152,15 @@ class MaskingAdapter:
         src_len = len(seq)
         masked_emb = copy.deepcopy(embeddings)
         num = len(embeddings)
-        emb_mask = [np.zeros(src_len, dtype=bool)] * num
+        emb_mask = [np.zeros(src_len, dtype=bool) for _ in range(num)]
 
         # for seq or count
         for i in range(num):
             d_model = embeddings[i].shape[1]
 
-            # If no motifs provided, return original sequence
+            # If no motifs provided, return random single base mask
             if not self.motif_automaton:
-                return masked_emb, emb_mask
+                return self.mask_random_single_base(seq, embeddings, cds_start_pos)
             else:
                 # 1. Find all motif occurrences in the sequence
                 seq_upper = seq.upper()
@@ -173,7 +170,7 @@ class MaskingAdapter:
                     motif_occurrences.append((start_idx, end_idx + 1))  # (start, end) where end is exclusive
                 
                 # 2. Calculate mask limits
-                max_mask_tokens = int(src_len * self.mask_perc[i])
+                max_mask_tokens = round(src_len * self.mask_perc[i])
                 if not motif_occurrences or max_mask_tokens == 0:
                     return masked_emb, emb_mask
                 
@@ -182,9 +179,9 @@ class MaskingAdapter:
                 random.shuffle(motif_occurrences)
                 
                 for j in range(len(motif_occurrences)):
-                    total_masked = sum([e - s for s, e in motif_occurrences[j:]])
+                    total_num_masked = sum([e - s for s, e in motif_occurrences[j:]])
                     # Skip if selected motif would not exceed the mask limit
-                    if total_masked <= max_mask_tokens:
+                    if total_num_masked <= max_mask_tokens:
                         motif_occurrences = motif_occurrences[j:]
                         break
                 
@@ -214,6 +211,10 @@ class MaskingAdapter:
 
 if __name__ == "__main__":
     seq = "ACGATCGTAGCTAGCTACGTACGTAGC"
-    embs = [torch.from_numpy(np.ones(len(seq))).unsqueeze(1)]
+    embs = [np.ones((len(seq),1))] * 2
+    adp = MaskingAdapter({}, -1, "/home/user/data3/rbase/translation_pred/models/lib/RBP_motif_annotation.v1.tsv")
+    masked_emb, emb_mask = adp.mask_random_single_base(seq, embs, {'cds_start_pos': -1})
+
     print(len(seq))
-    print(mask_random_single_base(seq, embs, [0.15], -1))
+    print(emb_mask)
+    print(emb_mask[0].sum())

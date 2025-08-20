@@ -4,7 +4,7 @@ from numpy import random
 from collections import defaultdict
 from torch.utils.data import Dataset
 from data.RPF_counter import *
-from data.masking_adapter import *
+from data.masking_adapter_tensor import *
 
 __author__ = "Chunfu Xiao"
 __contributor__="..."

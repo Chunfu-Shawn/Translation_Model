@@ -44,9 +44,10 @@ class PretrainingTrainer:
                  print_progress_every: int = 50,
                  save_every: int = 5,
                  epoch_num = 100,
-                 num_losses = 2,
+                 mask_learn_task_warmup_perc: dict = {"seq": 0, "count": 0.3, "tissue": 0.3},
+                 mask_perc: dict = {"seq": 0.1, "count": 0.3, "tissue": 0.15},
                  learning_rate: float = 0.00001,
-                 warmup_perc: float = 0.2,
+                 lr_warmup_perc: float = 0.2,
                  accumulation_steps: int = 5,
                  beta: list = (0.9, 0.98),
                  epsilon: float = 1e-9,
@@ -67,31 +68,33 @@ class PretrainingTrainer:
         self.sampler = DistributedBucketSampler(
             lengths = dataset.lengths,
             batch_size = self.batch_size,
-            num_replicas = self.world_size,
-            rank = self.rank,
-            shuffle = True,
-            drop_last = True
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True,
+            drop_last=True
         )
         self.val_sampler = DistributedBucketSampler(
             lengths = val_dataset.lengths,
             batch_size = self.batch_size,
-            num_replicas = self.world_size,
-            rank = self.rank,
-            shuffle = True,
-            drop_last = True
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True,
+            drop_last=True
         )
         self.batch_num = len(dataset)
         self.epoch_num = epoch_num
         self.current_epoch = 0
         self.ac_steps = accumulation_steps
         self._total_steps = int(self.epoch_num * self.batch_num / self.ac_steps)
-        self.warmup_perc = warmup_perc
+        self.lr_warmup_perc = lr_warmup_perc
+        self.mask_learn_task_warmup_perc = mask_learn_task_warmup_perc
         self._print_progress_every = print_progress_every
         self._save_every = save_every
         self.checkpoint_dir = os.path.join(checkpoint_dir, "pretrain")
         self.log_dir = log_dir
-        self.num_losses = num_losses
-        self.classify_criterion = nn.CrossEntropyLoss(reduction="mean") # for ATCG
+        self.num_losses = len(mask_learn_task_warmup_perc.keys())
+        self.mask_perc = mask_perc
+        self.classify_criterion = nn.CrossEntropyLoss(reduction="mean") # for tissue type
         self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1) # nn.MSELoss(reduction="none") # for count 
         self.lr = learning_rate
         self.optimizer = torch.optim.AdamW(
@@ -104,11 +107,11 @@ class PretrainingTrainer:
             optimizer = self.optimizer,
             lr_lambda = create_lr_lambda(
                 total_steps = self._total_steps,
-                warmup_steps = int(self.warmup_perc * self._total_steps),
+                warmup_steps = int(self.lr_warmup_perc * self._total_steps),
                 min_eta = 1e-4
             ))
         self.scaler = torch.amp.GradScaler() # for gradiant scaling in autocasting
-        self.model_full_name = '.'.join([model_name, str(self.lr), str(self.warmup_perc), str(self.ac_steps)])
+        self.model_full_name = '.'.join([model_name, str(self.lr), str(self.lr_warmup_perc), str(self.ac_steps)])
         self.training_epoch_data = []
         self.training_batch_data = []
 
@@ -116,15 +119,28 @@ class PretrainingTrainer:
         for p in self.coding_params:
             p.requires_grad = False
         print('==> Frost the coding head, fine-tune it after pretraining')
+        print(f'==> Mask learning task: {mask_learn_task_warmup_perc}')
+        print(f'==> Mask percentage: {mask_perc}')
     
-    def collate_mask_pad_batch_to_cuda(self, batch, mode):
+    def get_active_heads(self, epoch):
+        heads = []
+        if "seq" in self.mask_perc and epoch >= self.mask_learn_task_warmup_perc.get("seq", np.inf) * self.epoch_num:
+            heads.append("seq")
+        if "count" in self.mask_perc and epoch >= self.mask_learn_task_warmup_perc.get("count", np.inf) * self.epoch_num:
+            heads.append("count")
+        if "tissue" in self.mask_perc and epoch >= self.mask_learn_task_warmup_perc.get("tissue", np.inf) * self.epoch_num:
+            heads.append("tissue")
+        print(f'--> Activate heads: {heads}')
+        return heads
+    
+    def collate_mask_pad_batch_to_cuda(self, batch, active_heads):
         """
         batch_list: list, length is equal to the batch_size of DataLoader.
         batch_list[0] is a dict, including:
         'seq_embeddings', 'count_embeddings', 'masked_embedding', 'pad_mask', 'pred_mask'
         return Tensor values
         """
-        # 取出唯一的元素
+        # batch elements: (tissue_idx, cds_start, motif_occs, seq_emb, count_emb, coding_emb)
         tissue_idxs, cds_starts, motif_occs, seq_embs, count_embs, coding_embs = zip(*batch)
 
         # 1. pad sequence for [:, seq_len, :]
@@ -136,64 +152,114 @@ class PretrainingTrainer:
         # 2. pad_mask (True indicate this is a valid value
         pad_masks = (seq_embs_padded != -1)[:, :, 0].squeeze(-1)
 
-        # 3. mask embedding for learning (True indicate this is a masked token
-        masked_seq_embs, seq_emb_masks = self.masking_adapter.get_random_masked_batch(
-            embeddings = seq_embs_padded,
-            cds_starts = cds_starts,
-            occs = motif_occs,
-            pad_mask = pad_masks,
-            mask_perc = 0.1
-            )
-        masked_count_embs, count_emb_masks = self.masking_adapter.get_random_masked_batch(
-            embeddings = count_embs_padded,
-            cds_starts = cds_starts,
-            occs = motif_occs,
-            pad_mask = pad_masks,
-            mask_perc = 0.4
-            )
+        # 3. seq embedding masking for learning (True indicate this is a masked token
+        B, L = seq_embs_padded.shape[:2]
+        seq_emb_masks = torch.zeros((B, L), dtype=torch.bool)
+        if "seq" in active_heads:
+            seq_embs_masked, seq_emb_masks = self.masking_adapter.get_random_masked_batch(
+                embeddings = seq_embs_padded,
+                cds_starts = cds_starts,
+                occs = motif_occs,
+                pad_mask = pad_masks,
+                mask_perc = self.mask_perc.get("seq", 0)
+                )
+        else:
+            seq_embs_masked = seq_embs_padded.clone()
+
+        # 4. count masking
+        count_emb_masks = torch.zeros((B, L), dtype=torch.bool)
+        if "count" in active_heads:
+            count_embs_masked, count_emb_masks = self.masking_adapter.get_random_masked_batch(
+                embeddings = count_embs_padded,
+                cds_starts = cds_starts,
+                occs = motif_occs,
+                pad_mask = pad_masks,
+                mask_perc = self.mask_perc.get("count", 0)
+                )
+        else:
+            count_embs_masked = count_embs_padded.clone()
+        
+        # 5. tissue masking
+        tissue_mask = torch.zeros(B, dtype=torch.bool)  # True indicate the tissue idx of this sample was masked
+        if "tissue" in active_heads:
+            # randomly mask tissue type of some samples
+            probs = torch.rand(B)
+            tissue_mask = probs < self.mask_perc.get("tissue", 0)
+            # replace true tissue idx as mask_idx
+            mask_idx = self.model.module.num_tissues if hasattr(self.model, "module") else self.model.num_tissues
+            tissue_idxs_masked = tissue_idxs.clone()
+            tissue_idxs_masked[tissue_mask] = mask_idx
+        else:
+            tissue_idxs_masked = tissue_idxs.clone()
 
         return (
-            tissue_idxs,
+            tissue_idxs,               # original tissue idx (ground truth) for loss calculation
+            tissue_idxs_masked,        # use masked tissue idx for prompt construction
+            tissue_mask,               # bool: which samples were masked (for tissue loss)
             seq_embs_padded, 
-            masked_seq_embs,
+            seq_embs_masked,
             seq_emb_masks,
             count_embs_padded,
-            masked_count_embs, 
+            count_embs_masked, 
             count_emb_masks, 
             pad_masks
         )
         
 
-    def multi_task_criterion(self, 
-                       result: torch.Tensor,
-                       # tissue_logits: torch.Tensor,
-                       seq_raw_emb: torch.Tensor, 
-                       seq_emb_masks: torch.Tensor, 
-                       count_raw_emb: torch.Tensor, 
-                       count_emb_masks: torch.Tensor, 
-                       # tissue_idx: torch.Tensor,
-                       eps = 1e-6):
-        # split tensor for separate loss calculation
-        seq_pred_emb, count_pred_emb = result # shape: (batch_size, seq_len, 1)
+    def multi_task_criterion(self, active_heads, result: list,
+                   seq_raw_emb: torch.Tensor, seq_emb_masks: torch.Tensor,
+                   count_raw_emb: torch.Tensor, count_emb_masks: torch.Tensor,
+                   tissue_idx: torch.Tensor, tissue_mask: torch.Tensor,
+                   eps=1e-6):
+        """
+        result: dictionary mapping result to active_heads, e.g. {"seq","count","tissue" -> seq_pred, count_pred, tissue_logits}
+        tissue_idx: original tissue labels (bs,)
+        tissue_mask: bool (bs,) True means this sample's tissue was masked and should be predicted
+        Returns: tensor([seq_loss, count_loss, tissue_loss])  length == self.num_losses
+        """
+        # get outputs by name mapping: map result list to names using active_heads available in scope.
+        # but simpler: the trainer when calling this function will pass the outputs in fixed order:
+        # assume order [seq_pred, count_pred, tissue_logits] when all active. We'll do safe extraction.
 
-        # masked token was indicated by [True], raw token by [False]
-        num_masked_seq_token = seq_emb_masks.sum() # number of masked token: batch_size * seq_len(True)
-        num_masked_count_token = count_emb_masks.sum()
+        # find seq and count outputs
+        seq_pred = None; count_pred = None; tissue_logits = None
+        # length-based approach: if result[0] is tensor with same last dim as seq_raw_emb dim -> seq
 
-        # for ACTG prediction (already logSoftmax)
-        seq_loss_all = -(seq_pred_emb * seq_raw_emb * seq_emb_masks.unsqueeze(-1).float()) # all CrossEntropy loss of masked token
-        seq_loss = seq_loss_all.sum() / (num_masked_seq_token + eps) # self.seq_criterion(result[:,:,:4].view(-1, 4), target_seq.view(-1))  # mean loss
+        # seq loss (same as you had)
+        if "seq" in active_heads:
+            seq_pred = result["seq"]
+            num_masked_seq_token = seq_emb_masks.sum()
+            seq_loss_all = -(F.log_softmax(seq_pred, dim=-1) * seq_raw_emb * seq_emb_masks.unsqueeze(-1).float())
+            seq_loss = seq_loss_all.sum() / (num_masked_seq_token + eps)
+        else:
+            seq_loss = torch.tensor(0.0, device=seq_raw_emb.device)
 
-        # for normlized count prediction
-        count_loss_all = self.count_criterion(count_pred_emb, count_raw_emb) * count_emb_masks.unsqueeze(-1).float() # all loss of masked token
-        count_loss = count_loss_all.sum() / (num_masked_count_token + eps) # mean loss
+        # count loss
+        if "count" in active_heads:
+            count_pred = result["count"]
+            num_masked_count_token = count_emb_masks.sum()
+            count_loss_all = self.count_criterion(count_pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
+            count_loss = count_loss_all.sum() / (num_masked_count_token + eps)
+        else:
+            count_loss = torch.tensor(0.0, device=seq_raw_emb.device)
 
-        # for tissue prediction
-        # tissue_loss = self.classify_criterion(tissue_logits, tissue_idx)
+        # tissue loss (only for masked samples)
+        if "tissue" in active_heads:
+            tissue_logits = result["tissue"]  # (bs, num_tissues)
+            mask_idx = tissue_mask.nonzero(as_tuple=False).view(-1)
+            if mask_idx.numel() == 0:
+                tissue_loss = torch.tensor(0.0, device=seq_raw_emb.device)
+            else:
+                # select logits and true labels
+                sel_logits = tissue_logits[mask_idx]  # (n_mask, num_tissues)
+                sel_labels = tissue_idx[mask_idx].to(torch.long)
+                tissue_loss = self.classify_criterion(sel_logits, sel_labels)
+        else:
+            tissue_loss = torch.tensor(0.0, device=seq_raw_emb.device)
 
-        return torch.stack([seq_loss, count_loss], dim=0) # torch.mul(losses, loss_weight) # torch.sqrt((seq_loss + eps) * (count_loss + eps))
+        return torch.stack([seq_loss, count_loss, tissue_loss], dim=0)
+
     
-
     def dynamic_weight_average(self, epoch, T = 2.0, eps = 1e-8):
         # 'End-To-End Multi-Task Learning With Attention'
         device = torch.device(f'cuda:{self.rank}') if torch.cuda.is_available() else torch.device('cpu')
@@ -207,9 +273,9 @@ class PretrainingTrainer:
                 dtype=torch.float32, device=device
             )
             w_i = prev / (prev2 + eps)
-            loss_weight = torch.tensor([3, 1], device=device) * F.softmax(w_i / T, dim=-1) # default weight for seq, count and tissue is 5, 1
+            loss_weight = torch.tensor([3, 1, 1], device=device) * F.softmax(w_i / T, dim=-1) # default weight for seq, count and tissue is 5, 1
         else:
-            loss_weight = torch.tensor([3, 1], device=device)  # torch.ones(self.num_losses, device=device) # torch.ones_like(losses).cuda()
+            loss_weight = torch.tensor([3, 1, 1], device=device)  # torch.ones(self.num_losses, device=device) # torch.ones_like(losses).cuda()
         
         if self.rank == 0:
             print("loss_weight: ", loss_weight)
@@ -229,14 +295,16 @@ class PretrainingTrainer:
     
     def train(self, epoch):
         self.model.train() # set train mode
+        active_heads = self.get_active_heads(epoch)
+        print(f"--- Active heads of model: {active_heads} ---")
         dataloader = DataLoader(
             self.dataset,
             batch_sampler=self.sampler,
-            num_workers=2,
-            prefetch_factor=2,
+            num_workers=3,
+            prefetch_factor=3,
             persistent_workers=True,
-            pin_memory=False,
-            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, "train")
+            pin_memory=True,
+            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, active_heads)
         )
         total_losses = torch.zeros(self.num_losses).cuda()
         local_losses = []
@@ -249,31 +317,25 @@ class PretrainingTrainer:
             pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} for training")
 
         for batch_idx, batch_data in enumerate(dataloader):
-            # t0 = time.time()
-            tissue_idxs, \
-                seq_embs_padded, masked_seq_embs, seq_emb_masks, \
-                    count_embs_padded, masked_count_embs, count_emb_masks,\
+            tissue_idxs, tissue_idxs_masked, tissue_mask, \
+                seq_embs_padded, seq_embs_masked, seq_emb_masks, \
+                    count_embs_padded, count_embs_masked, count_emb_masks,\
                         pad_masks = [data.cuda(non_blocking=True) for data in batch_data]
-            # to_device_done = time.time()
-            # torch.cuda.synchronize()
-            # # forward timing
-            # fstart = torch.cuda.Event(enable_timing=True)
-            # fm   = torch.cuda.Event(enable_timing=True)
-            # fend   = torch.cuda.Event(enable_timing=True)
-            # fstart.record()
-            
+
             # run the forward pass with autocasting
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                output = self.model(masked_seq_embs, masked_count_embs, tissue_idxs, pad_masks, ["seq", "count"])
+                output = self.model(seq_embs_masked, count_embs_masked, tissue_idxs_masked, pad_masks, active_heads)
                 # multi-task learning losses
-                losses = self.multi_task_criterion(output, seq_embs_padded, seq_emb_masks, count_embs_padded, count_emb_masks)
+                losses = self.multi_task_criterion(active_heads, output,
+                                                   seq_embs_padded, seq_emb_masks, 
+                                                   count_embs_padded, count_emb_masks,
+                                                   tissue_idxs, tissue_mask)
                 ## mean loss (dynamic weight average) for accumulation
                 acc_losses = losses / self.ac_steps
 
             # to synchronize and update in this batch ?
             do_sync = ((batch_idx + 1) % self.ac_steps == 0)
-            # print(f"[rank {self.rank}] batch {batch_idx}/{batch_num}")
-            # fm.record()
+
             # if not in last step，with no_sync to skip this turn of all-reduce
             context = (
                 self.model.no_sync() # forbid the all-reduce in DDP
@@ -298,13 +360,6 @@ class PretrainingTrainer:
                 pbar.update(self._print_progress_every)
                 print(losses)
 
-            # fend.record()
-            # torch.cuda.synchronize()
-            # fm_time = fstart.elapsed_time(fm) # ms
-            # fend_time = fstart.elapsed_time(fend) # ms
-            # t1 = time.time()
-            # print(f"[rank {self.rank}] host_prep={(t0-start_time):.3f}s, copy={(to_device_done-t0):.3f}s, gpu_fwd={fm_time/1000:.3f}s, gpu_fwd_back={fend_time/1000:.3f}s, total={(t1-start_time):.3f}s")
-
         if self.rank == 0:
             pbar.close()
 
@@ -324,14 +379,15 @@ class PretrainingTrainer:
 
     def eval(self, epoch):
         self.model.eval() # set eval mode
+        active_heads = self.get_active_heads(epoch)
         val_loader = DataLoader(
             self.val_dataset,
             batch_sampler=self.val_sampler,
-            num_workers=2,
-            prefetch_factor=2,
+            num_workers=3,
+            prefetch_factor=3,
             persistent_workers=True,
-            pin_memory=False,
-            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, "eval")
+            pin_memory=True,
+            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, active_heads)
         )
         total_losses = torch.zeros(self.num_losses).cuda()
         local_losses = []
@@ -344,16 +400,19 @@ class PretrainingTrainer:
                 pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} for evaluating")
 
             for batch_idx, batch_data in enumerate(val_loader):
-                tissue_idxs, \
-                seq_embs_padded, masked_seq_embs, seq_emb_masks, \
-                    count_embs_padded, masked_count_embs, count_emb_masks,\
+                tissue_idxs, tissue_idxs_masked, tissue_mask, \
+                seq_embs_padded, seq_embs_masked, seq_emb_masks, \
+                    count_embs_padded, count_embs_masked, count_emb_masks,\
                         pad_masks = [data.cuda(non_blocking=True) for data in batch_data]
 
                  # run the forward pass with autocasting
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    output = self.model(masked_seq_embs, masked_count_embs, tissue_idxs, pad_masks, ["seq", "count"])
+                    output = self.model(seq_embs_masked, count_embs_masked, tissue_idxs_masked, pad_masks, active_heads)
                     # multi-task learning losses
-                    losses = self.multi_task_criterion(output, seq_embs_padded, seq_emb_masks, count_embs_padded, count_emb_masks)
+                    losses = self.multi_task_criterion(active_heads, output,
+                                                    seq_embs_padded, seq_emb_masks, 
+                                                    count_embs_padded, count_emb_masks,
+                                                    tissue_idxs, tissue_mask)
 
                 total_losses += losses.detach()
                 local_losses.append([l.item() for l in losses])

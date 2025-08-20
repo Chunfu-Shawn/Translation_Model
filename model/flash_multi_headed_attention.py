@@ -43,9 +43,9 @@ class FlashMultiHeadedAttention(nn.Module):
         key = self.tokeys(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
         value = self.tovalues(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
 
-        if "RoPE":
-            query = self.RoPE(query)
-            key = self.RoPE(key)
+        # RoPE
+        query = self.RoPE(query)
+        key = self.RoPE(key)
         
         # 1. pack query, key and value
         #    qkv: (bs, n_heads, 3, seq_len, head_dim) -> (bs, seq_len, 3, n_heads, head_dim)
@@ -60,7 +60,7 @@ class FlashMultiHeadedAttention(nn.Module):
 
         # 3. remove pad
         #    qkv_unpad: (sum_bs(seq_lens), 3, n_heads, head_dim)
-        #    attention_mask: a bool (1/0) tensor of shape (bs, seq_len), 1 means valid mask and 0 means not valid.
+        #    attention_mask: a bool (1/0) tensor of shape (bs, seq_len), 1 means valid and 0 means not valid.
         #    indices: for recover pad
         qkv_unpad, indices, cu_seqlens, max_seqlen, seqused = unpad_input(qkv, attention_mask.to(torch.int))
         

@@ -191,20 +191,55 @@ class EncoderLayer(nn.Module):
         return src_reps
 
 class AddPromptEmbedding(nn.Module):
-    # embeds tissue information in prompt
-    def __init__(self, pmt_len, num_tissues, d_model):
+    """
+    Prompt = prompt_base (pmt_len x d_model, shared) + tissue_embed (d_model, per-tissue).
+    - Saves parameters vs storing pmt_len * d_model per tissue.
+    - Supports a special mask index = num_tissues (i.e. embedding table size = num_tissues + 1).
+    """
+    def __init__(self, pmt_len: int, num_tissues: int, d_model: int, prompt_scale: float = 1.0):
         super().__init__()
-        self.pmt_len = pmt_len # prompt len = pmt_len
+        self.pmt_len = pmt_len
         self.d_model = d_model
-        self.prompt_emb = nn.Embedding(num_tissues, self.pmt_len * self.d_model)
+        self.num_tissues = num_tissues
+        self.mask_idx = num_tissues  # reserved index for [MASK]
+        # shared prompt base (learned, shape pmt_len x d_model)
+        self.prompt_base = nn.Parameter(torch.randn(pmt_len, d_model) * 0.02)
+        # per-tissue vector (num_tissues + 1 for mask slot)
+        self.tissue_embed = nn.Embedding(num_tissues + 1, d_model) # tissue_idx == num_tissues is [MASK]
+        # optional scale (small scalar) to control magnitude
+        self.prompt_scale = prompt_scale
 
-    def forward(self, src_embs, src_mask, tissue_idx):
+        # init
+        nn.init.normal_(self.tissue_embed.weight, mean=0.0, std=0.02)
+
+    def forward(self, src_embs: torch.Tensor, src_mask: torch.Tensor, tissue_idx: torch.Tensor):
+        """
+        src_embs: (bs, seq_len, d_model)
+        src_mask: (bs, seq_len)  boolean (True=valid)
+        tissue_idx: (bs,) long with values in [0, num_tissues] where num_tissues = mask idx.
+        returns:
+            x: (bs, pmt_len + seq_len, d_model)
+            new_mask: (bs, pmt_len + seq_len) bool
+        """
         bs = src_embs.size(0)
-        p_embs = self.prompt_emb(tissue_idx)
-        p_embs = p_embs.view(bs, self.pmt_len, self.d_model)
-        x = torch.cat([p_embs, src_embs], dim=1)
-        src_mask = torch.cat([torch.zeros(bs, self.pmt_len, device="cuda"), src_mask], dim=1)
-        return x, src_mask
+        device = src_embs.device
+
+        # tissue embedding: (bs, d_model)
+        tissue_vec = self.tissue_embed(tissue_idx.to(device))    # (bs, d_model)
+
+        # prompt_base: (pmt_len, d_model) -> expand to (bs, pmt_len, d_model)
+        prompt_base = self.prompt_base.unsqueeze(0).expand(bs, -1, -1)  # (bs, pmt_len, d_model)
+        # add tissue vector to each prompt token (broadcast)
+        prompt_tokens = prompt_base + tissue_vec.unsqueeze(1) * self.prompt_scale  # (bs, pmt_len, d_model)
+
+        # prepend prompts and update mask
+        x = torch.cat([prompt_tokens, src_embs], dim=1)
+
+        # prompt_mask True (valid tokens)
+        prompt_mask = torch.ones((bs, self.pmt_len), dtype=src_mask.dtype, device=device)
+        new_mask = torch.cat([prompt_mask, src_mask.to(device)], dim=1)
+
+        return x, new_mask
     
 
 # Part2: =================== Encoder ======================
@@ -259,14 +294,13 @@ class MaskedEncoderPredictorHead(nn.Module):
             nn.Linear(d_pred_h, d_model),
             nn.GELU(),
             nn.Dropout(p_drop),
-            nn.Linear(d_model, d_seq),
-            nn.LogSoftmax(dim=-1)
+            nn.Linear(d_model, d_seq)
         )
 
 class MaskedSeqPredictorHead(nn.Module):
-    def __init__(self, d_model, d_seq, d_pred_h, p_drop=0.1):
+    def __init__(self, pmt_len, d_model, d_seq, d_pred_h, p_drop=0.1):
         super().__init__()
-
+        self.pmt_len = pmt_len
         # class output shape: (bs, seq_len, d_seq)
         self.classify_mlp = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -276,20 +310,19 @@ class MaskedSeqPredictorHead(nn.Module):
             nn.Linear(d_pred_h, d_model),
             nn.GELU(),
             nn.Dropout(p_drop),
-            nn.Linear(d_model, d_seq),
-            nn.LogSoftmax(dim=-1)
+            nn.Linear(d_model, d_seq)
         )
 
     def forward(self, src_reps):
         # src_reps: [bs, pmt_len + seq_len, d_model], src_mask: [bs, pmt_len + seq_len]
-        src_reps = src_reps[:, 3:, :] # -> [bs, seq_len, d_model]
+        src_reps = src_reps[:, self.pmt_len:, :] # -> [bs, seq_len, d_model]
 
         return self.classify_mlp(src_reps) # [bs, seq_len, d_seq]
 
 class MaskedCountPredictorHead(nn.Module):
-    def __init__(self, d_model, d_count, d_pred_h, p_drop=0.1):
+    def __init__(self, pmt_len, d_model, d_count, d_pred_h, p_drop=0.1):
         super().__init__()
-
+        self.pmt_len = pmt_len
         # count shape: (bs, seq_len, d_count)
         self.regress_mlp = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -305,27 +338,53 @@ class MaskedCountPredictorHead(nn.Module):
 
     def forward(self, src_reps):
         # src_reps: [bs, pmt_len + seq_len, d_model], src_mask: [bs, pmt_len + seq_len]
-        src_reps = src_reps[:, 3:, :] # -> [bs, seq_len, d_model]
+        src_reps = src_reps[:, self.pmt_len:, :] # -> [bs, seq_len, d_model]
 
         return self.regress_mlp(src_reps)  # [bs, seq_len, d_count]
 
 class TissueClassificationHead(nn.Module):
-    def __init__(self, pmt_len, d_model, num_tissues, d_pred_h, p_drop=0.1):
+    """
+    Reduce prompt tokens by scalar-weighted pooling and classify into num_tissues categories.
+    - Uses (num_tissues) logits (no softmax).
+    - This head is compact: uses mean pooling -> linear -> optional hidden -> output.
+    """
+    def __init__(self, pmt_len: int, d_model: int, num_tissues: int, d_pred_h: int = None, p_drop: float = 0.1):
         super().__init__()
-        self.pmt_len = pmt_len # prompt_len
+        self.pmt_len = pmt_len
         self.d_model = d_model
-        # get flatten prompt tokens to predict tissue type 
-        self.classify_mlp = nn.Sequential(
-            nn.Linear(self.pmt_len * self.d_model, d_pred_h), # all prompt tokens
+        self.num_tissues = num_tissues
+        self.score = nn.Linear(d_model, 1)
+        if d_pred_h is None:
+            d_pred_h = d_model
+
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_pred_h),
             nn.GELU(),
             nn.Dropout(p_drop),
-            nn.Linear(d_pred_h, num_tissues)
+            nn.Linear(d_pred_h, num_tissues)  # logits
         )
+        # init
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
 
-    def forward(self, encoder_outputs):
-        # encoder_outputs: [bs, prompt_len + seq_len, d_model]
-        pmt_repr = encoder_outputs[:, :self.pmt_len, :]
-        flat_pmt_repr = pmt_repr.view(-1, self.pmt_len * self.d_model) # flat the prompt to one-dim vector
-        logits = self.classify_mlp(flat_pmt_repr)
+    def forward(self, encoder_outputs: torch.Tensor, src_mask: torch.Tensor = None, return_weights = False):
+        """
+        encoder_outputs: (bs, pmt_len + seq_len, d_model)
+        src_mask: optional bool mask (bs, pmt_len + seq_len) -> used to weigh prompt tokens if provided.
+        returns logits: (bs, num_tissues) with scalar-weight pooling
+        """
+        prompt_reps = encoder_outputs[:, :self.pmt_len, :]    # (bs, pmt_len, d_model)
+        scores = self.score(prompt_reps).squeeze(-1)          # (bs, pmt_len)
 
+        if src_mask is not None:
+            # mask for prompt positions (True=valid)
+            prompt_mask = src_mask[:, :self.pmt_len]
+            scores = scores.masked_fill(~prompt_mask, float('-inf'))
+
+        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)   # (bs, pmt_len, 1)
+        pooled = (weights * prompt_reps).sum(dim=1)             # (bs, d)
+        logits = self.net(pooled)
+        if return_weights:
+            return logits, weights.squeeze(-1)                # weights (bs, pmt_len)
         return logits

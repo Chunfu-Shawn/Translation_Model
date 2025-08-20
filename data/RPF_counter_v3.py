@@ -76,13 +76,13 @@ def is_compatible(starts, ends, exon_starts0, exon_ends0, tol=2):
         start_ok = np.abs(starts_without_first - exon_starts0[idxs[1:]]) <= tol
         end_ok = np.abs(ends_without_last - exon_ends0[idxs[:-1]]) <= tol
         if not np.all(start_ok & end_ok):
-            print("Junction Error", idxs, m_starts, exon_starts0, m_ends, exon_ends0)
+            # print("Junction Error", idxs, m_starts, exon_starts0, m_ends, exon_ends0)
             return False
 
     # 4) exon-order 连续性检查
     diffs = np.diff(idxs)
     if np.any(diffs < 0) or np.any(diffs > 1):
-        print("Exon-order Error", idxs, diffs, m_starts, exon_starts0, m_ends, exon_ends0)
+        # print("Exon-order Error", idxs, diffs, m_starts, exon_starts0, m_ends, exon_ends0)
         return False
 
     return True
