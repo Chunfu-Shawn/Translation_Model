@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Optional, Tuple, List
 from model.flash_multi_headed_attention import FlashMultiHeadedAttention
 
 __author__ = "Chunfu Xiao"
@@ -102,7 +103,7 @@ class ConformerEncoder(nn.Module):
             x = layer(x, src_mask)
         return x
 
-class CodingPredictorHead(nn.Module):
+class CodingConformerHead(nn.Module):
     def __init__(self, d_model, d_ff, heads, num_layers,
                  conv_kernel_size=31, p_drop=0.1):
         super().__init__()

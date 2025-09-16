@@ -44,8 +44,8 @@ class PretrainingTrainer:
                  print_progress_every: int = 50,
                  save_every: int = 5,
                  epoch_num = 100,
-                 mask_learn_task_warmup_perc: dict = {"seq": 0, "count": 0.3, "tissue": 0.3},
-                 mask_perc: dict = {"seq": 0.1, "count": 0.3, "tissue": 0.15},
+                 mask_learn_task_warmup_perc: dict = {"seq": 0, "count": 0.3, "cell": 0.3},
+                 mask_perc: dict = {"seq": 0.1, "count": 0.3, "cell": 0.15},
                  learning_rate: float = 0.00001,
                  lr_warmup_perc: float = 0.2,
                  accumulation_steps: int = 5,
@@ -94,7 +94,7 @@ class PretrainingTrainer:
         self.log_dir = log_dir
         self.num_losses = len(mask_learn_task_warmup_perc.keys())
         self.mask_perc = mask_perc
-        self.classify_criterion = nn.CrossEntropyLoss(reduction="mean") # for tissue type
+        self.classify_criterion = nn.CrossEntropyLoss(reduction="mean") # for cell type
         self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1) # nn.MSELoss(reduction="none") # for count 
         self.lr = learning_rate
         self.optimizer = torch.optim.AdamW(
@@ -128,8 +128,8 @@ class PretrainingTrainer:
             heads.append("seq")
         if "count" in self.mask_perc and epoch >= self.mask_learn_task_warmup_perc.get("count", np.inf) * self.epoch_num:
             heads.append("count")
-        if "tissue" in self.mask_perc and epoch >= self.mask_learn_task_warmup_perc.get("tissue", np.inf) * self.epoch_num:
-            heads.append("tissue")
+        if "cell" in self.mask_perc and epoch >= self.mask_learn_task_warmup_perc.get("cell", np.inf) * self.epoch_num:
+            heads.append("cell")
         print(f'--> Activate heads: {heads}')
         return heads
     
@@ -140,11 +140,11 @@ class PretrainingTrainer:
         'seq_embeddings', 'count_embeddings', 'masked_embedding', 'pad_mask', 'pred_mask'
         return Tensor values
         """
-        # batch elements: (tissue_idx, cds_start, motif_occs, seq_emb, count_emb, coding_emb)
-        tissue_idxs, cds_starts, motif_occs, seq_embs, count_embs, coding_embs = zip(*batch)
+        # batch elements: (cell_idx, cds_start, motif_occs, seq_emb, count_emb, coding_emb)
+        cell_idxs, cds_starts, motif_occs, seq_embs, count_embs, coding_embs = zip(*batch)
 
         # 1. pad sequence for [:, seq_len, :]
-        tissue_idxs = torch.tensor(tissue_idxs, dtype=torch.long) # int
+        cell_idxs = torch.tensor(cell_idxs, dtype=torch.long) # int
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
         # coding_embs_padded = pad_sequence(coding_embs, batch_first=True, padding_value=-1)
@@ -179,23 +179,23 @@ class PretrainingTrainer:
         else:
             count_embs_masked = count_embs_padded.clone()
         
-        # 5. tissue masking
-        tissue_mask = torch.zeros(B, dtype=torch.bool)  # True indicate the tissue idx of this sample was masked
-        if "tissue" in active_heads:
-            # randomly mask tissue type of some samples
+        # 5. cell type masking
+        cell_mask = torch.zeros(B, dtype=torch.bool)  # True indicate the cell idx of this sample was masked
+        if "cell" in active_heads:
+            # randomly mask cell type of some samples
             probs = torch.rand(B)
-            tissue_mask = probs < self.mask_perc.get("tissue", 0)
-            # replace true tissue idx as mask_idx
+            cell_mask = probs < self.mask_perc.get("cell", 0)
+            # replace true cell idx as mask_idx
             mask_idx = self.model.module.num_tissues if hasattr(self.model, "module") else self.model.num_tissues
-            tissue_idxs_masked = tissue_idxs.clone()
-            tissue_idxs_masked[tissue_mask] = mask_idx
+            cell_idxs_masked = cell_idxs.clone()
+            cell_idxs_masked[cell_mask] = mask_idx
         else:
-            tissue_idxs_masked = tissue_idxs.clone()
+            cell_idxs_masked = cell_idxs.clone()
 
         return (
-            tissue_idxs,               # original tissue idx (ground truth) for loss calculation
-            tissue_idxs_masked,        # use masked tissue idx for prompt construction
-            tissue_mask,               # bool: which samples were masked (for tissue loss)
+            cell_idxs,               # original cell idx (ground truth) for loss calculation
+            cell_idxs_masked,        # use masked cell idx for prompt construction
+            cell_mask,               # bool: which samples were masked (for cell loss)
             seq_embs_padded, 
             seq_embs_masked,
             seq_emb_masks,
@@ -209,20 +209,20 @@ class PretrainingTrainer:
     def multi_task_criterion(self, active_heads, result: list,
                    seq_raw_emb: torch.Tensor, seq_emb_masks: torch.Tensor,
                    count_raw_emb: torch.Tensor, count_emb_masks: torch.Tensor,
-                   tissue_idx: torch.Tensor, tissue_mask: torch.Tensor,
+                   cell_idx: torch.Tensor, cell_mask: torch.Tensor,
                    eps=1e-6):
         """
-        result: dictionary mapping result to active_heads, e.g. {"seq","count","tissue" -> seq_pred, count_pred, tissue_logits}
-        tissue_idx: original tissue labels (bs,)
-        tissue_mask: bool (bs,) True means this sample's tissue was masked and should be predicted
-        Returns: tensor([seq_loss, count_loss, tissue_loss])  length == self.num_losses
+        result: dictionary mapping result to active_heads, e.g. {"seq","count","cell" -> seq_pred, count_pred, cell_logits}
+        cell_idx: original cell labels (bs,)
+        cell_mask: bool (bs,) True means this sample's cell was masked and should be predicted
+        Returns: tensor([seq_loss, count_loss, cell_loss])  length == self.num_losses
         """
         # get outputs by name mapping: map result list to names using active_heads available in scope.
         # but simpler: the trainer when calling this function will pass the outputs in fixed order:
-        # assume order [seq_pred, count_pred, tissue_logits] when all active. We'll do safe extraction.
+        # assume order [seq_pred, count_pred, cell_logits] when all active. We'll do safe extraction.
 
         # find seq and count outputs
-        seq_pred = None; count_pred = None; tissue_logits = None
+        seq_pred = None; count_pred = None; cell_logits = None
         # length-based approach: if result[0] is tensor with same last dim as seq_raw_emb dim -> seq
 
         # seq loss (same as you had)
@@ -243,21 +243,21 @@ class PretrainingTrainer:
         else:
             count_loss = torch.tensor(0.0, device=seq_raw_emb.device)
 
-        # tissue loss (only for masked samples)
-        if "tissue" in active_heads:
-            tissue_logits = result["tissue"]  # (bs, num_tissues)
-            mask_idx = tissue_mask.nonzero(as_tuple=False).view(-1)
+        # cell loss (only for masked samples)
+        if "cell" in active_heads:
+            cell_logits = result["cell"]  # (bs, num_cells)
+            mask_idx = cell_mask.nonzero(as_tuple=False).view(-1)
             if mask_idx.numel() == 0:
-                tissue_loss = torch.tensor(0.0, device=seq_raw_emb.device)
+                cell_loss = torch.tensor(0.0, device=seq_raw_emb.device)
             else:
                 # select logits and true labels
-                sel_logits = tissue_logits[mask_idx]  # (n_mask, num_tissues)
-                sel_labels = tissue_idx[mask_idx].to(torch.long)
-                tissue_loss = self.classify_criterion(sel_logits, sel_labels)
+                sel_logits = cell_logits[mask_idx]  # (n_mask, num_cells)
+                sel_labels = cell_idx[mask_idx].to(torch.long)
+                cell_loss = self.classify_criterion(sel_logits, sel_labels)
         else:
-            tissue_loss = torch.tensor(0.0, device=seq_raw_emb.device)
+            cell_loss = torch.tensor(0.0, device=seq_raw_emb.device)
 
-        return torch.stack([seq_loss, count_loss, tissue_loss], dim=0)
+        return torch.stack([seq_loss, count_loss, cell_loss], dim=0)
 
     
     def dynamic_weight_average(self, epoch, T = 2.0, eps = 1e-8):
@@ -273,9 +273,9 @@ class PretrainingTrainer:
                 dtype=torch.float32, device=device
             )
             w_i = prev / (prev2 + eps)
-            loss_weight = torch.tensor([3, 1, 1], device=device) * F.softmax(w_i / T, dim=-1) # default weight for seq, count and tissue is 5, 1
+            loss_weight = torch.tensor([5, 2, 1], device=device) * F.softmax(w_i / T, dim=-1) # default weight for seq, count and cell is 5, 1
         else:
-            loss_weight = torch.tensor([3, 1, 1], device=device)  # torch.ones(self.num_losses, device=device) # torch.ones_like(losses).cuda()
+            loss_weight = torch.tensor([5, 2, 1], device=device)  # torch.ones(self.num_losses, device=device) # torch.ones_like(losses).cuda()
         
         if self.rank == 0:
             print("loss_weight: ", loss_weight)
@@ -317,19 +317,19 @@ class PretrainingTrainer:
             pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} for training")
 
         for batch_idx, batch_data in enumerate(dataloader):
-            tissue_idxs, tissue_idxs_masked, tissue_mask, \
+            cell_idxs, cell_idxs_masked, cell_mask, \
                 seq_embs_padded, seq_embs_masked, seq_emb_masks, \
                     count_embs_padded, count_embs_masked, count_emb_masks,\
                         pad_masks = [data.cuda(non_blocking=True) for data in batch_data]
 
             # run the forward pass with autocasting
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                output = self.model(seq_embs_masked, count_embs_masked, tissue_idxs_masked, pad_masks, active_heads)
+                output = self.model(seq_embs_masked, count_embs_masked, cell_idxs_masked, pad_masks, active_heads)
                 # multi-task learning losses
                 losses = self.multi_task_criterion(active_heads, output,
                                                    seq_embs_padded, seq_emb_masks, 
                                                    count_embs_padded, count_emb_masks,
-                                                   tissue_idxs, tissue_mask)
+                                                   cell_idxs, cell_mask)
                 ## mean loss (dynamic weight average) for accumulation
                 acc_losses = losses / self.ac_steps
 
@@ -400,19 +400,19 @@ class PretrainingTrainer:
                 pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} for evaluating")
 
             for batch_idx, batch_data in enumerate(val_loader):
-                tissue_idxs, tissue_idxs_masked, tissue_mask, \
+                cell_idxs, cell_idxs_masked, cell_mask, \
                 seq_embs_padded, seq_embs_masked, seq_emb_masks, \
                     count_embs_padded, count_embs_masked, count_emb_masks,\
                         pad_masks = [data.cuda(non_blocking=True) for data in batch_data]
 
                  # run the forward pass with autocasting
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    output = self.model(seq_embs_masked, count_embs_masked, tissue_idxs_masked, pad_masks, active_heads)
+                    output = self.model(seq_embs_masked, count_embs_masked, cell_idxs_masked, pad_masks, active_heads)
                     # multi-task learning losses
                     losses = self.multi_task_criterion(active_heads, output,
                                                     seq_embs_padded, seq_emb_masks, 
                                                     count_embs_padded, count_emb_masks,
-                                                    tissue_idxs, tissue_mask)
+                                                    cell_idxs, cell_mask)
 
                 total_losses += losses.detach()
                 local_losses.append([l.item() for l in losses])

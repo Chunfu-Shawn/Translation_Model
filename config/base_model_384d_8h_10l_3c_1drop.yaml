@@ -1,0 +1,10 @@
+d_seq: 4
+d_count: 10
+d_model: 384
+n_heads: 8
+number_of_layers: 10
+pmt_len: 3
+all_cell_types: ["human_retinal_pigment_epithelial_cell", "brain_thalamus", "SW480"]
+d_ff: 1024
+p_drop: 0.1
+model_name: "base_model_384d_8h_10l_3c"

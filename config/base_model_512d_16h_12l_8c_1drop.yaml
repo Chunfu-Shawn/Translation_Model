@@ -1,0 +1,10 @@
+d_seq: 4
+d_count: 10
+d_model: 512
+n_heads: 16
+number_of_layers: 12
+pmt_len: 3
+all_cell_types: ['human_retinal_pigment_epithelial_cell', 'brain_thalamus', 'SW480', 'WTC_iPSC_cardiomyocyte', 'human_aortic_endothelial_cell', 'OSCC', 'SUM159PT', 'WTC_iPSC']
+d_ff: 2048
+p_drop: 0.1
+model_name: "ribomodel_16h_512.max_2000.DTL"

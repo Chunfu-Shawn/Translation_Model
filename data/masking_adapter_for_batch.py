@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 
 class BatchMaskingAdapter:
     def __init__(self, 
-                 mask_value: float = -1.0,
+                 mask_value: float = 0,
                  mask_token_vec: Optional[torch.Tensor] = None):
         self.mask_value = mask_value
         self.mask_token_vec = mask_token_vec  # 1-D tensor of size D or None

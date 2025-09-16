@@ -102,21 +102,26 @@ def create_optimized_index(gtf_file, db_file):
                       key=lambda x: x.start, reverse=(strand == '-')) # 1-based
         cds_regions = sorted(db.children(transcript, featuretype='CDS'), 
                       key=lambda x: x.start, reverse=(strand == '-')) # 1-based
+        start_codons = sorted(db.children(transcript, featuretype='start_codon'), 
+                      key=lambda x: x.start, reverse=(strand == '-')) # 1-based
+        stop_codons = sorted(db.children(transcript, featuretype='stop_codon'), 
+                      key=lambda x: x.start, reverse=(strand == '-')) # 1-based
 
         print("--- " + tid + " ---")
+        print(len(start_codons), len(stop_codons))
         # exon starts < exon ends
         exon_starts = np.array([e.start for e in exons], dtype=int) # 1-based
         exon_ends = np.array([e.end for e in exons], dtype=int) # 1-based
         exon_starts0_sorted, exon_ends0_sorted = build_exon_index_np(exon_starts, exon_ends, strand) # 0-based
-        cds_starts = np.array([c.start for c in cds_regions], dtype=int) # 1-based
-        cds_ends = np.array([c.end for c in cds_regions], dtype=int) # 1-based
-        cds_frames = np.array([c.frame for c in cds_regions], dtype=int) # 0, 1, 2 frame
+        cds_starts = [c.start for c in cds_regions] # 1-based
+        cds_ends = [c.end for c in cds_regions] # 1-based
+        cds_frames = [c.frame for c in cds_regions] # 0, 1, 2 frame
         
         tx_pos = np.cumsum([0] + [e.end - e.start + 1 for e in exons])[:-1] # 0-based
         tx_starts = tx_pos + 1 # 1-based
         tx_ends = tx_pos + (exon_ends - exon_starts + 1) # 1-based
 
-        if cds_starts.size == 0:
+        if len(cds_starts) == 0:
             cds_start_pos = -1
             cds_end_pos = -1
         elif strand == "+":
@@ -125,15 +130,14 @@ def create_optimized_index(gtf_file, db_file):
         elif strand == "-":
             cds_start_pos = convert_position(cds_ends[0], exon_starts, exon_ends, tx_starts, tx_ends, strand) # 1-based
             cds_end_pos = convert_position(cds_starts[-1], exon_starts, exon_ends, tx_starts, tx_ends, strand) # 1-based
-        
 
         transcript_meta_dict[tid] = {
             'chrom': chrom,
             'strand': strand,
-            'exon_starts': exon_starts,
-            'exon_starts0_sorted': exon_starts0_sorted,
-            'exon_ends': exon_ends,
-            'exon_ends0_sorted': exon_ends0_sorted,
+            'exon_starts': list(exon_starts),
+            'exon_starts0_sorted': list(exon_starts0_sorted),
+            'exon_ends': list(exon_ends),
+            'exon_ends0_sorted': list(exon_ends0_sorted),
             'tx_starts': tx_starts,
             'tx_ends': tx_ends
         }
@@ -142,7 +146,9 @@ def create_optimized_index(gtf_file, db_file):
             'cds_ends': cds_ends, # tx location (1-based) of last nt of CDS
             'cds_frames': cds_frames,
             'cds_start_pos': cds_start_pos, # tx pos (1-based) of first nt of start codon
-            'cds_end_pos': cds_end_pos # tx pos (1-based) of last nt of CDS
+            'cds_end_pos': cds_end_pos, # tx pos (1-based) of last nt of CDS
+            'start_codon': len(start_codons) != 0, # whether containing a defined start codon
+            'stop_codon': len(stop_codons) != 0 # whether containing a defined stop codon
         }
 
         # constrcut genome and exons index

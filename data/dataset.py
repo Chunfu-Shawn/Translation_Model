@@ -20,19 +20,19 @@ __credits__ = []
 __license__ = ""
 __version__="1.1.0"
 __maintainer__ = "Chunfu Xiao"
-__email__ = "chunfushawn@126.com"
+__email__ = "xiaochunfu@126.com"
 
 class TranslationDataset(Dataset):
     """
     Support two mothods to create:
-    - 直接传 dataset_dict (from memory)
+    - directly provide dataset_dict (from memory)
     - 使用类方法 from_pickle / from_h5 从磁盘加载
     """
     def __init__(self, dataset_dict):
         # 期望 dataset_dict 含 keys:
-        # "tids","embs","masked_embs","emb_masks","coding_embs","tissue_idxs"
+        # "tids","embs","masked_embs","emb_masks","coding_embs","cell_type_idxs"
         self.uuids = dataset_dict["uuids"]
-        self.tissue_idxs = dataset_dict["tissue_idxs"]
+        self.cell_type_idxs = dataset_dict["cell_type_idxs"]
         self.cds_starts = dataset_dict["cds_starts"]
         self.motif_occs = dataset_dict["motif_occs"]
         self.seq_embs = dataset_dict["seq_embs"]     # list of (L, 4)
@@ -60,7 +60,7 @@ class TranslationDataset(Dataset):
             # 读取所有样本到内存（safe but memory heavy）
             data = {
                 "uuids": [],
-                "tissue_idxs": [],
+                "cell_type_idxs": [],
                 "cds_starts": [],
                 "motif_occs": [],
                 "seq_embs": [],
@@ -71,12 +71,13 @@ class TranslationDataset(Dataset):
                 with h5py.File(path, "r") as f:
                     for uuid in f["samples"].keys():
                         grp = f["samples"][uuid]
+                        tid = grp.attrs.get("tid", -1)
                         # [:] is requested, data eager
                         data["uuids"].append(uuid)
-                        data["tissue_idxs"].append(np.int16(grp.attrs.get("tissue_idx", -1)))
+                        data["cell_type_idxs"].append(np.int16(grp.attrs.get("cell_type_idx", -1)))
                         data["cds_starts"].append(np.int16(grp.attrs.get("cds_start", -1)))
                         data["motif_occs"].append(list(grp.attrs.get("motif_occ", -1)))
-                        data["seq_embs"].append(grp["seq_emb"][:]) # (L, 4)
+                        data["seq_embs"].append(f["sequences"][tid][:]) # (L, 4)
                         data["count_embs"].append(grp["count_emb"][:]) # (L, 10)
                         data["coding_embs"].append(grp["coding_emb"][:])
                 return cls(data)
@@ -97,7 +98,7 @@ class TranslationDataset(Dataset):
                     n_samples = f.attrs.get("n_samples", -1)
                     for uuid in f["samples"].keys():
                         uuids.append(uuid)
-                        lengths.append(int(f["samples"][uuid]["seq_emb"].shape[0]))
+                        lengths.append(int(f["samples"][uuid]["count_emb"].shape[0]))
             except FileNotFoundError:
                 print(f"### Error: No such file: {path} ! ###")
             obj.uuids = uuids
@@ -108,7 +109,7 @@ class TranslationDataset(Dataset):
             obj.masked_embs = None
             obj.emb_masks = None
             obj.coding_embs = None
-            obj.tissue_idxs = None
+            obj.cell_type_idxs = None
             return obj
 
     def _open_h5(self):
@@ -127,24 +128,25 @@ class TranslationDataset(Dataset):
             self._open_h5()
             uuid = self.uuids[idx]
             grp = self._h5_handle["samples"][uuid]
-            tissue_idx = torch.tensor(int(grp.attrs.get('tissue_idx', -1)), dtype=torch.long)
+            tid = grp.attrs.get("tid", -1)
+            cell_type_idx = torch.tensor(int(grp.attrs.get('cell_type_idx', -1)), dtype=torch.long)
             cds_start = int(grp.attrs.get('cds_start', -1))
             motif_occ = list(grp.attrs.get('motif_occ', -1))
-            seq_emb = torch.from_numpy(grp["seq_emb"][:]).float()
-            count_emb = torch.from_numpy(grp["count_emb"][:]).float()
+            seq_emb = torch.from_numpy(self._h5_handle["sequences"][tid][:]).float() # (L, 4)
+            count_emb = torch.from_numpy(grp["count_emb"][:]).float() # (L, 10)
             coding_emb = torch.from_numpy(grp["coding_emb"][:]).float()
 
-            return tissue_idx, cds_start, motif_occ, seq_emb, count_emb, coding_emb
+            return cell_type_idx, cds_start, motif_occ, seq_emb, count_emb, coding_emb
 
         # otherwise load from memory（self.dataset）
-        tissue_idx = torch.tensor(int(self.tissue_idxs[idx]), dtype=torch.long)
+        cell_type_idx = torch.tensor(int(self.cell_type_idxs[idx]), dtype=torch.long)
         cds_start = int(self.cds_starts[idx])
         motif_occ = list(self.motif_occs[idx])
         seq_emb = torch.from_numpy(self.seq_embs[idx]).float()
         count_emb = torch.from_numpy(self.count_embs[idx]).float()
         coding_emb = torch.from_numpy(self.coding_embs[idx]).float()
 
-        return tissue_idx, cds_start, motif_occ, seq_emb, count_emb, coding_emb
+        return cell_type_idx, cds_start, motif_occ, seq_emb, count_emb, coding_emb
     
     def get_identifier(self, idx):
         return self.uuids[idx]
