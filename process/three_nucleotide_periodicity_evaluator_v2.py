@@ -1,5 +1,5 @@
 import sys, time
-sys.path.append("/home/user/data3/rbase/translation_pred/models/src")
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
 import numpy as np
 import pickle
 from numba import njit
@@ -120,9 +120,9 @@ class PeriodicityEvaluator:
 
 
 if __name__=="__main__":
-    ORF_info_dict_file = '/home/user/data3/rbase/translation_pred/models/lib/ORF/candidate_ORFs/candidateORF.60nt.longest.tx_pos.pkl'
+    ORF_info_dict_file = '/home/user/data3/rbase/translation_model/models/lib/ORF/candidate_ORFs/candidateORF.60nt.longest.tx_pos.pkl'
     RPF_count_file = '/home/user/data3/yaoc/translation_model/model/SRR15513148_49_50_51_52.read_count.pkl'
-    result_file = '/home/user/data3/rbase/translation_pred/models/lib/ORF/SRR15513148_49_50_51_52.ORF_period_rrs.pkl'
+    result_file = '/home/user/data3/rbase/translation_model/models/lib/ORF/SRR15513148_49_50_51_52.ORF_period_rrs.pkl'
     chroms = ["chr17", "chr19", "chr11"] + \
         [f'chr{i}' for i in range(1, 11)] + \
         [f'chr{i}' for i in range(12, 17)] + \

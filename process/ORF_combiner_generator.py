@@ -1,5 +1,5 @@
 import copy, sys, os, json
-sys.path.append("/home/user/data3/rbase/translation_pred/models/src")
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
 import csv, argparse
 import pickle
 from collections import defaultdict
@@ -23,7 +23,7 @@ parser.add_argument("--orf_fasta_file", type=str,
                     help="(Required) Fasta file of ORFs")
 parser.add_argument("--out_dir", type=str, 
                     help="(Required) Directory of output files", 
-                    default="/home/user/data3/rbase/translation_pred/models/lib/ORF/candidate_ORFs")
+                    default="/home/user/data3/rbase/translation_model/models/lib/ORF/candidate_ORFs")
 args = parser.parse_args()
 
 

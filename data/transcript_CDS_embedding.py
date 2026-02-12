@@ -74,9 +74,9 @@ class CDS_Embedding:
 
 
 if __name__=="__main__":
-    tx_seq_file = '/home/user/data3/rbase/translation_pred/models/lib/tx_seq.v48.pkl'
-    tx_cds_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_cds.pkl'
-    tx_coding_emb_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_coding_embedding.pkl'
+    tx_seq_file = '/home/user/data3/rbase/translation_model/models/lib/tx_seq.v48.pkl'
+    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.pkl'
+    tx_coding_emb_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_coding_embedding.pkl'
 
     # generate CDS embedding
     cds_embedding = CDS_Embedding(tx_cds_file, tx_seq_file)

@@ -1,5 +1,5 @@
 import sys, time
-sys.path.append("/home/user/data3/rbase/translation_pred/models/src")
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
 import multiprocessing
 import numpy as np
 import pickle
@@ -30,7 +30,7 @@ def double_nested_zero_defaultdict():
     return defaultdict(nested_zero_defaultdict)
 
 
-@njit
+@njit(cache=True)
 def is_compatible(starts, ends, exon_starts0, exon_ends0, tol=2):
     """
     Junction_reads evaluation 边界兼容性检查：
@@ -89,7 +89,13 @@ def is_compatible(starts, ends, exon_starts0, exon_ends0, tol=2):
 
 
 class RPF_Counter:
-    def __init__(self, chroms, tree_index_file, tx_meta_file, min_readlen = 25, max_readlen = 34, tol = 2):
+    def __init__(self, 
+                 chroms: list, 
+                 tree_index_file: str, 
+                 tx_meta_file: str, 
+                 min_readlen: int = 25, 
+                 max_readlen: int = 34, 
+                 tol: int = 2):
         # load optimized index
         self.chroms = chroms
         self.tree_index_file = tree_index_file
@@ -97,14 +103,14 @@ class RPF_Counter:
         with open(self.tx_meta_file, 'rb') as f:
             tx_meta = pickle.load(f)
 
-        # 预计算染色体长度
+        # length of chrom
         self.chrom_lengths = {
             chrom: max(meta['exon_ends0_sorted'][-1] for meta in tx_meta.values() if meta['chrom']==chrom)
             for chrom in self.chroms
         }
-        self.min_readlen = min_readlen
-        self.max_readlen = max_readlen
-        self.tol = tol
+        self.min_readlen = int(min_readlen)
+        self.max_readlen = int(max_readlen)
+        self.tol = int(tol)
 
     def save_count(self, final_counts, count_file):
         ''' save count data as .pkl file'''
@@ -121,8 +127,15 @@ class RPF_Counter:
         # load data
         with open(self.tree_index_file, 'rb') as f:
             tree_index = pickle.load(f)
-        filterd_tree_index = tree_index[chrom] if not tid_list \
-                else IntervalTree([iv for iv in tree_index[chrom] if iv.data in tid_list])
+            
+        # strand-specific
+        if not tid_list:
+            filterd_tree_index = tree_index[chrom]
+        else:
+            filterd_tree_index = {
+                "+": IntervalTree([iv for iv in tree_index[chrom]["+"] if iv.data in tid_list]),
+                "-": IntervalTree([iv for iv in tree_index[chrom]["-"] if iv.data in tid_list])
+            }
 
         with open(self.tx_meta_file, 'rb') as f:
             tx_meta = pickle.load(f)
@@ -136,8 +149,10 @@ class RPF_Counter:
             blk = np.array(read.get_blocks(), dtype=int)
             if blk.size == 0:
                 return False
+            
             # reasonable RPF length
             read_len = read.query_length
+            read_strand = "-" if read.is_reverse else "+"
             if read_len < self.min_readlen or read_len > self.max_readlen:
                 continue
             
@@ -146,30 +161,31 @@ class RPF_Counter:
             ends   = blk[:,1]
             left_prime = starts[0] + 1
             right_prime = ends[-1]
+            five_prime = right_prime if read.is_reverse else left_prime
 
             # find all transcripts overlapping reads
-            ## both left and right prime of read located in the transcript
-            cand = set(iv.data for iv in filterd_tree_index[left_prime]) & \
-                set(iv.data for iv in filterd_tree_index[right_prime])
+            cand = set(iv.data for iv in filterd_tree_index[read_strand][five_prime]) 
+            # & set(iv.data for iv in filterd_tree_index[right_prime])
     
             # transfer genomic position to tx position
             for tid in cand:
                 meta = tx_meta[tid]
                 # compatible with transcript exon structure ?
                 if not is_compatible(starts, ends, 
-                                     meta['exon_starts0_sorted'], meta['exon_ends0_sorted'], 
+                                     meta['exon_starts0_sorted'],
+                                     meta['exon_ends0_sorted'], 
                                      self.tol):
                     continue
                 # transfer to transcript position (input 1-based)
                 pos = convert_position(
-                    left_prime if meta['strand'] == "+" else right_prime,
+                    five_prime,
                     meta['exon_starts'], meta['exon_ends'],
                     meta['tx_starts'], meta['tx_ends'],
                     meta['strand']
                 )
                 # count the read
                 if pos >= 1:
-                    counts[tid][read_len][pos] += 1
+                    counts[tid][pos][read_len] += 1
                         
         print(f'Executor {chrom}:{start}-{end} end time: {time.time() - start_time} seconds')
         return counts
@@ -207,17 +223,16 @@ class RPF_Counter:
 
 
 if __name__=="__main__":
-    tree_index_file = '/home/user/data3/rbase/translation_pred/models/lib/genome_index_tree.pkl'
-    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
-    bam_file = '/home/user/data3/rbase/translation_pred/models/test/SRR15513158.uniq.sorted.pc.bam'
-    RPF_count_file = '/home/user/data3/rbase/translation_pred/models/test/SRR15513158.read_count.pkl'
+    tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
+    bam_file = '/home/user/data3/rbase/translation_model/models/test/SRR15513158.uniq.sorted.pc.bam'
+    RPF_count_file = '/home/user/data3/rbase/translation_model/models/test/SRR15513158.read_count.pkl'
     chroms = ["chr17", "chr19", "chr11"] + \
         [f'chr{i}' for i in range(1, 11)] + \
         [f'chr{i}' for i in range(12, 17)] + \
         ['chr18', 'chr20', 'chr21', 'chr22', 'chrX', 'chrY']
 
     # count parallelly
-    counter = RPF_Counter(chroms, tree_index_file, tx_meta_file, 25, 34, 3)
-    # final_counts = counter.parallel_count_by_chrom(bam_file, max_workers=24)
+    counter = RPF_Counter(chroms, tree_strand_index_file, tx_meta_file, 21, 40, 3)
     final_counts = counter.parallel_count_by_windows(bam_file, [], window_size=83000000, max_workers=20)
     counter.save_count(final_counts, RPF_count_file)

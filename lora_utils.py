@@ -144,17 +144,6 @@ def assert_all_replaced(model: nn.Module) -> None:
     print("✅ All nn.Linear modules have been replaced (or none existed).")
 
 
-def print_param_counts(model: nn.Module) -> None:
-    """
-    Print total parameter count and number of trainable parameters.
-    Useful to verify replacement and trainability settings after freezing/unfreezing.
-    """
-    model = unwrap_model(model)
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: trainable {trainable:,} / total {total:,} ({100.0 * trainable / total:.2f}% trainable)")
-
-
 def set_trainable_base_and_lora(model: nn.Module, train_base: bool, train_lora: bool):
     """
     set requires_grad for each module in model

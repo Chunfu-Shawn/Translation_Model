@@ -1,8 +1,10 @@
 import sys, os
-sys.path.append("/home/user/data3/rbase/translation_pred/models/src")
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
 import numpy as np
+import math
 import ahocorasick
 from tqdm import tqdm
+from typing import Literal
 from data.RPF_counter_v3 import *
 
 # 可选：如果想用 h5 存储
@@ -76,7 +78,8 @@ class DatasetGenerator():
         self.cell_type_mapping = dict(
             zip(
                 self.all_cell_types, 
-                range(len(self.all_cell_types))
+                range(1, len(self.all_cell_types) + 1) # Total embeddings needed = N + 1
+                # mapping: token string -> index [1 .. num_classes]
                 )
             )
         self.motifs_list = load_motifs_from_file(motif_file_path)
@@ -111,20 +114,39 @@ class DatasetGenerator():
         seq2 = [self.nt_mapping[i] for i in seq]
         onehot = np.eye(5)[seq2, :4] # [0, 0, 0, 0] indicates N
         return onehot
-        
 
-    def count_normalize_transcript(self, counts: np.ndarray, method="lower_quantile", eps=1):
+    def data_quality_eval(self, seq, counts):
+        seq_l = len(seq)
+        n_put_codon = math.ceil(seq_l / 3)
+        total_reads = 0
+        cov_put_codon = [0] * n_put_codon
+        for pos, dict in counts.items():
+            if pos <= seq_l:
+                for _, cnt in dict.items():
+                    total_reads += cnt
+                    cov_put_codon[(pos-1)//3] = 1
+
+        depth = total_reads/seq_l
+        coverage = cov_put_codon.count(1)
+
+        return depth, coverage
+
+    def count_normalize_transcript(self, 
+                                   counts: np.ndarray, 
+                                   method = Literal["median", "mean", "lower_quantile"],
+                                   non_zero: bool = False,
+                                   eps = 1):
         # non-zero counts
         nz = counts[counts > 0]
 
         # median or mean of non-zero counts
         if nz.size > 0:
-            if method == "lower_quantile":
-                dm = np.quantile(nz, 0.25)
+            if method == "mean":
+                dm = np.mean(nz) if non_zero else np.mean(counts) + eps
             elif method == "median":
-                dm = np.median(nz)
-            elif method == "mean":
-                dm = np.mean(nz)
+                dm = np.median(nz) if non_zero else np.median(counts) + eps
+            elif method == "lower_quantile":
+                dm = np.quantile(nz, 0.25) if non_zero else np.quantile(counts, 0.25) + eps
             else:
                 return counts
         else:
@@ -137,26 +159,44 @@ class DatasetGenerator():
         # normlize by lower quantile, median or mean value
         return log_counts / np.log1p(dm)
     
-    def count_embedding(self, count_dict, tid, read_len=False, offset=12):
-        # add general offset of 12 to align RPF footprint and sequence
-
-        seq = self.seq_dict[tid]
+    def count_embedding(
+            self, seq, counts, read_len=True, 
+            nor_method = Literal["median", "mean", "lower_quantile"],
+            non_zero : bool = False
+            ):
+        seq_l = len(seq)
         # extend to shape (len(seq), 10)
-        raw_count = np.zeros((len(seq), 10)) if read_len else np.zeros((len(seq), 1))
-        if tid in count_dict:
-            count = count_dict[tid]
-            for read_l in count:
-                for pos in count[read_l]:
-                    raw_count[pos-1, read_l-25] = count[read_l][pos]
+        if read_len:
+            raw_count = np.zeros((seq_l, 10))
+            for pos, dict in counts.items():
+                if pos < seq_l:
+                    for read_l, cnt in dict.items():
+                        raw_count[pos-1, read_l-25] = cnt
             # normalize in a transcript
-            norm_count = self.count_normalize_transcript(raw_count, method="median")
-
-            # shift backrward for 12 nt
-            return np.concatenate((np.zeros((offset, 10)), norm_count[:-offset,:]), axis=0)
+            norm_count = self.count_normalize_transcript(raw_count, nor_method, non_zero)
         else:
-            return raw_count
+            raw_count = np.zeros((seq_l, 1))
+            for pos, dict in counts.items():
+                if pos < seq_l:
+                    for read_l, cnt in dict.items():
+                        raw_count[pos-1, 0] = cnt
+            # normalize in a transcript
+            norm_count = self.count_normalize_transcript(raw_count, nor_method, non_zero)
+        
+        return norm_count
     
-    def generate_save_dataset(self, count_files=[], coding_files=[], cell_types=[], out_path="dataset.pkl", fmt="pickle"):
+    def generate_save_dataset(
+            self, 
+            count_files: list = [], 
+            coding_files: list = [], 
+            cell_types: list = [],
+            coverage: float = 0.1,
+            depth: float = 0.1,
+            keep_read_len: bool = False,
+            nor_method = Literal["median", "mean", "lower_quantile"],
+            nor_non_zero : bool = False,
+            out_path="dataset.pkl", 
+            fmt="pickle"):
         """
         Generate and save dataset prepared for model from multiple samples
         """
@@ -167,8 +207,11 @@ class DatasetGenerator():
                 "tids": [],
                 "seq_embs": {},
                 "count_embs": [],
+                "depth": [],
+                "coverage": [],
                 "coding_embs" : [],
-                "cds_starts": [],
+                "cds_start_pos": [],
+                "cds_end_pos": [],
                 "motif_occs": [],
                 "cell_type_idxs" : []
             } for group in self.chrom_groups
@@ -183,14 +226,12 @@ class DatasetGenerator():
             datasets[group]["seq_embs"]= {tid: np.float32(seq_emb) for tid, seq_emb in self._base_seq_emb[group].items()} #  [L, 4]
         
         for i in range(len(count_files)):
-            count_dict, name = self.load_pickle_file(count_files[i])
+            count_dict, _ = self.load_pickle_file(count_files[i])
             coding_dict, _ = self.load_pickle_file(coding_files[i])
             cell_type = cell_types[i]
 
             if not cell_type in self.cell_type_mapping:
-                print(f"### Cell type of dataset is not in list ###")
-                print(f"==> Exclude dataset: {count_files[i]}")
-                return False
+                print(f"### Cell type of dataset {count_files[i]} is not in list ###")
 
             # for target transcripts
             print(f"--- Processing dataset: {count_files[i]} ---")
@@ -200,25 +241,39 @@ class DatasetGenerator():
                     if tid not in count_dict.keys():
                         continue
                     
-                    count_emb = self.count_embedding(count_dict, tid, True, 12)
+                    # exclude tx with only start or stop codon
+                    if tid not in coding_dict.keys():
+                        continue
+
+                    seq_upper = self.seq_dict[tid].upper()
+                    counts = count_dict[tid]
+
+                    # retain informative tx
+                    d, c = self.data_quality_eval(seq_upper, counts)
+                    if d < depth or c < coverage:
+                        continue
+
+                    count_emb = self.count_embedding(seq_upper, counts, keep_read_len, nor_method, nor_non_zero)
 
                     # motif positions
-                    seq_upper = self.seq_dict[tid].upper()
                     motif_occs = []
                     for end_idx, motif in self.motif_automaton.iter_long(seq_upper):
                         start_idx = end_idx - len(motif) + 1
                         motif_occs.append((start_idx, end_idx + 1))  # (start, end) where end is exclusive 0-based
 
                     # cell type index
-                    cell_type_idx = self.cell_type_mapping[cell_type]
+                    cell_type_idx = self.cell_type_mapping.get(cell_type, 0)
 
                     # add data
-                    datasets[group]["uuids"].append("-".join([tid, name]))
+                    datasets[group]["uuids"].append("-".join([tid, cell_type, str(i)]))
                     datasets[group]["tids"].append(tid)
-                    datasets[group]["count_embs"].append(np.float32(count_emb)) #  [L, 10]
+                    datasets[group]["count_embs"].append(np.float32(count_emb)) #  [L, 10/1]
+                    datasets[group]["depth"].append(np.float16(d))
+                    datasets[group]["coverage"].append(np.float16(c))
                     datasets[group]["coding_embs"].append(np.float32(coding_dict[tid]))
-                    datasets[group]["cds_starts"].append(np.int16(self.tx_cds[tid]["cds_start_pos"]))
-                    datasets[group]["motif_occs"].append(motif_occs)
+                    datasets[group]["cds_start_pos"].append(np.int16(self.tx_cds[tid]["cds_start_pos"]))
+                    datasets[group]["cds_end_pos"].append(np.int16(self.tx_cds[tid]["cds_end_pos"]))
+                    datasets[group]["motif_occs"].append(list(motif_occs))
                     datasets[group]["cell_type_idxs"].append(np.int16(cell_type_idx))
     
         # save all datasets
@@ -240,9 +295,12 @@ class DatasetGenerator():
                     for i, uuid in enumerate(dataset["uuids"]):
                         g = grp_root.create_group(uuid)
                         g.attrs["tid"] = dataset["tids"][i]
-                        g.attrs['cell_type_idx'] = int(dataset["cell_type_idxs"][i])
-                        g.attrs['cds_start'] = int(dataset["cds_starts"][i])
-                        g.attrs['motif_occ'] = list(dataset["motif_occs"][i])
+                        g.attrs['cell_type_idx'] = dataset["cell_type_idxs"][i]
+                        g.attrs['cds_start_pos'] = dataset["cds_start_pos"][i]
+                        g.attrs['cds_end_pos'] = dataset["cds_end_pos"][i]
+                        g.attrs['motif_occ'] = dataset["motif_occs"][i]
+                        g.attrs['depth'] = dataset["depth"][i]
+                        g.attrs['coverage'] = dataset["coverage"][i]
                         g.create_dataset("count_emb", data=dataset["count_embs"][i], compression="gzip")
                         g.create_dataset("coding_emb", data=dataset["coding_embs"][i], compression="gzip")
                     # sequence embedding
@@ -255,3 +313,4 @@ class DatasetGenerator():
                 print(f"Saved [{group}] dataset to {file_path} (h5).")
         else:
             raise ValueError("Unknown format. Use 'pickle' or 'h5'.")
+        

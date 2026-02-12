@@ -96,10 +96,10 @@ def plot_heatmap_RPF_along_tx(RPF_count, tx_info, cds_info, output_file, log_y=F
 
 
 if __name__=="__main__":
-    RPF_count_file = '/home/user/data3/rbase/translation_pred/models/test/SRR15513158.v48.read_count.pkl'
-    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
-    tx_cds_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_cds.pkl'
-    output_dir = '/home/user/data3/rbase/translation_pred/models/test/figures'
+    RPF_count_file = '/home/user/data3/rbase/translation_model/models/test/SRR15513158.v48.read_count.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
+    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.pkl'
+    output_dir = '/home/user/data3/rbase/translation_model/models/test/figures'
     tx_ids = ['ENST00000382361.8']
     # load results
     with open(RPF_count_file, 'rb') as f_RPF:

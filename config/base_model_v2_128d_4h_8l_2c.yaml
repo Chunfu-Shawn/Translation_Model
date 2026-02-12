@@ -1,0 +1,10 @@
+d_seq: 4
+d_count: 1
+d_model: 128
+n_heads: 4
+number_of_layers: 8
+pmt_len: 3
+all_cell_types: ["aortic_endothelial_cell", "vascular_smooth_muscle_cell"]
+d_ff: 256
+p_drop: 0.1
+model_name: "base_model_v2_128d_4h_8l_2c"

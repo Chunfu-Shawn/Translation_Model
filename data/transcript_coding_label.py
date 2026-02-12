@@ -29,12 +29,12 @@ class CodingLabeler:
  
         start_tx_pos = self.tx_cds[tid]['cds_start_pos'] # 1-based
         end_tx_pos = self.tx_cds[tid]['cds_end_pos'] # 1-based
-        start_codon_exist = self.tx_cds[tid]['start_codon'] # 1-based
-        stop_codon_exist = self.tx_cds[tid]['stop_codon'] # 1-based
+        start_codon_exist = self.tx_cds[tid]['start_codon']
+        stop_codon_exist = self.tx_cds[tid]['stop_codon']
         print(start_tx_pos, end_tx_pos)
 
         # Cautious:
-        ## cds_starts or cds_ends don't represent the real start or end of in-frame coding ORF  especially in case of lacking star/stop codon annotation
+        ## cds_starts or cds_ends don't represent the real start or end of in-frame coding ORF especially in case of lacking star/stop codon annotation
         if start_codon_exist:
             # for tis in start_tx_pos:
             start_stop_embs[start_tx_pos - 1, 0] = vaild_value
@@ -85,15 +85,19 @@ class CodingLabeler:
         coding_emb_dict = {}
         for tid in self.tx_cds:
             print(f"--- generate coding embedding of {tid} ---")
-            coding_emb_dict[tid] = self._start_stop_position_embedding(tid)
+            ## only keep transcript containing intact CDS with start and stop codons
+            start_codon_exist = self.tx_cds[tid]['start_codon']
+            stop_codon_exist = self.tx_cds[tid]['stop_codon']
+            if start_codon_exist == stop_codon_exist:
+                coding_emb_dict[tid] = self._start_stop_position_embedding(tid)
 
         return coding_emb_dict
 
 
 if __name__=="__main__":
-    tx_seq_file = '/home/user/data3/rbase/translation_pred/models/lib/tx_seq.v48.pkl'
-    tx_cds_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_cds.pkl'
-    tx_coding_emb_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_start_stop_embedding.pkl'
+    tx_seq_file = '/home/user/data3/rbase/translation_model/models/lib/tx_seq.v48.pkl'
+    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.pkl'
+    tx_coding_emb_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_start_stop_embedding.pkl'
 
     # generate CDS embedding
     np.set_printoptions(threshold=np.inf)

@@ -1,5 +1,5 @@
 import sys
-sys.path.append("/home/user/data3/rbase/translation_pred/models/src")
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -33,8 +33,7 @@ class TranslationDataset(Dataset):
         # "tids","embs","masked_embs","emb_masks","coding_embs","cell_type_idxs"
         self.uuids = dataset_dict["uuids"]
         self.cell_type_idxs = dataset_dict["cell_type_idxs"]
-        self.cds_starts = dataset_dict["cds_starts"]
-        self.motif_occs = dataset_dict["motif_occs"]
+        self.meta_info = dataset_dict["meta_info"]
         self.seq_embs = dataset_dict["seq_embs"]     # list of (L, 4)
         self.count_embs = dataset_dict["count_embs"] # list of (L, 10)
         self.coding_embs = dataset_dict["coding_embs"] # list of (L//3, 3)
@@ -61,8 +60,7 @@ class TranslationDataset(Dataset):
             data = {
                 "uuids": [],
                 "cell_type_idxs": [],
-                "cds_starts": [],
-                "motif_occs": [],
+                "meta_info": [],
                 "seq_embs": [],
                 "count_embs": [],
                 "coding_embs": []
@@ -73,10 +71,16 @@ class TranslationDataset(Dataset):
                         grp = f["samples"][uuid]
                         tid = grp.attrs.get("tid", -1)
                         # [:] is requested, data eager
-                        data["uuids"].append(uuid)
+                        data["uuids"].append(str(uuid))
                         data["cell_type_idxs"].append(np.int16(grp.attrs.get("cell_type_idx", -1)))
-                        data["cds_starts"].append(np.int16(grp.attrs.get("cds_start", -1)))
-                        data["motif_occs"].append(list(grp.attrs.get("motif_occ", -1)))
+                        data["meta_info"].append(
+                            {
+                                "cds_start_pos": np.int16(grp.attrs.get("cds_start_pos", -1)),
+                                "cds_end_pos": np.int16(grp.attrs.get("cds_end_pos", -1)),
+                                "motif_occ": list(grp.attrs.get("motif_occ", None)),
+                                "depth": np.float16(grp.attrs.get("depth", -1)),
+                                "coverage": np.float16(grp.attrs.get("coverage", -1)),
+                            })
                         data["seq_embs"].append(f["sequences"][tid][:]) # (L, 4)
                         data["count_embs"].append(grp["count_emb"][:]) # (L, 10)
                         data["coding_embs"].append(grp["coding_emb"][:])
@@ -97,7 +101,7 @@ class TranslationDataset(Dataset):
                 with h5py.File(path, "r") as f:
                     n_samples = f.attrs.get("n_samples", -1)
                     for uuid in f["samples"].keys():
-                        uuids.append(uuid)
+                        uuids.append(str(uuid))
                         lengths.append(int(f["samples"][uuid]["count_emb"].shape[0]))
             except FileNotFoundError:
                 print(f"### Error: No such file: {path} ! ###")
@@ -130,23 +134,28 @@ class TranslationDataset(Dataset):
             grp = self._h5_handle["samples"][uuid]
             tid = grp.attrs.get("tid", -1)
             cell_type_idx = torch.tensor(int(grp.attrs.get('cell_type_idx', -1)), dtype=torch.long)
-            cds_start = int(grp.attrs.get('cds_start', -1))
-            motif_occ = list(grp.attrs.get('motif_occ', -1))
+            meta_info = {
+                "cds_start_pos": np.int16(grp.attrs.get("cds_start_pos", -1)),
+                "cds_end_pos": np.int16(grp.attrs.get("cds_end_pos", -1)),
+                "motif_occ": list(grp.attrs.get("motif_occ", None)),
+                "depth": np.float16(grp.attrs.get("depth", -1)),
+                "coverage": np.float16(grp.attrs.get("coverage", -1))
+                }
             seq_emb = torch.from_numpy(self._h5_handle["sequences"][tid][:]).float() # (L, 4)
             count_emb = torch.from_numpy(grp["count_emb"][:]).float() # (L, 10)
             coding_emb = torch.from_numpy(grp["coding_emb"][:]).float()
+                                   
+            return uuid, cell_type_idx, meta_info, seq_emb, count_emb, coding_emb
 
-            return cell_type_idx, cds_start, motif_occ, seq_emb, count_emb, coding_emb
-
-        # otherwise load from memory（self.dataset）
+        # otherwise load from memory（self.dataset)
+        uuid = str(self.uuids[idx])
         cell_type_idx = torch.tensor(int(self.cell_type_idxs[idx]), dtype=torch.long)
-        cds_start = int(self.cds_starts[idx])
-        motif_occ = list(self.motif_occs[idx])
+        meta_info = dict(self.meta_info[idx])
         seq_emb = torch.from_numpy(self.seq_embs[idx]).float()
         count_emb = torch.from_numpy(self.count_embs[idx]).float()
         coding_emb = torch.from_numpy(self.coding_embs[idx]).float()
 
-        return cell_type_idx, cds_start, motif_occ, seq_emb, count_emb, coding_emb
+        return uuid, cell_type_idx, meta_info, seq_emb, count_emb, coding_emb
     
     def get_identifier(self, idx):
         return self.uuids[idx]

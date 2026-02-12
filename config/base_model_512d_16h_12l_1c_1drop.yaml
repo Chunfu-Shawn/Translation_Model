@@ -1,0 +1,10 @@
+d_seq: 4
+d_count: 10
+d_model: 512
+n_heads: 16
+number_of_layers: 12
+pmt_len: 3
+all_cell_types: ["human_retinal_pigment_epithelial_cell"]
+d_ff: 1024
+p_drop: 0.1
+model_name: "base_model_512d_16h_12l_1c_1drop"

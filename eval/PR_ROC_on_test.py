@@ -45,13 +45,15 @@ def collect_test_coding_predictions(model, dataloader, device=None, predict_meth
             # unpack batch adaptively (match your collate)
             # expected: (cell_idxs, seq_embs_padded, count_embs_padded, coding_embs_padded, pad_masks)
             # but be tolerant: user may have other ordering — adjust if necessary
-            cell_idxs, seq_embs_padded, count_embs_padded, coding_embs_padded, pad_masks = [b.to(device) for b in batch]
+            cell_idxs, seq_embs_padded, count_embs_padded, \
+                coding_embs_padded, coding_targets, pad_masks = [b.to(device) for b in batch]
 
             # get model outputs: either dict {start,stop,in_orf} with logits or a single tensor (bs,L,3)
             try:
                 if predict_method == "predict":
-                    out = model.predict(seq_embs_padded, count_embs_padded, cell_idxs, pad_masks, 
-                                        head_names=["coding"], move_inputs_to_device=False, return_numpy=False)
+                    out = model(seq_embs_padded, count_embs_padded, cell_idxs, pad_masks,
+                                    head_names=["coding"],
+                                    head_inputs={"coding": {"trg_inputs": coding_embs_padded}})
                 else:
                     out = model(seq_embs_padded, count_embs_padded, cell_idxs, pad_masks, 
                                         head_names=["coding"])

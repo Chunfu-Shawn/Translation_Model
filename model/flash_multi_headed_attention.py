@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 import torch
 import torch.nn as nn
 from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
@@ -7,7 +8,7 @@ from model.rotary_position_embedding import LlamaRotaryEmbeddingExt
 
 
 class FlashMultiHeadedAttention(nn.Module):
-    def __init__(self, d_model: int, heads: int, p_drop: float = 0.1, causal: bool = False):
+    def __init__(self, d_model: int, n_heads: int, p_drop: float = 0.1, causal: bool = False):
         """
         Flash attention wrapper that supports:
         - training / parallel path: flash_attn_varlen_qkvpacked_func (fast for full-seq)
@@ -22,10 +23,10 @@ class FlashMultiHeadedAttention(nn.Module):
         causal: if causal attention
         """
         super().__init__()
-        assert d_model % heads == 0, "d_model must be divisible by heads"
+        assert d_model % n_heads == 0, "d_model must be divisible by heads"
         self.d_model = d_model
-        self.heads = heads
-        self.head_dim = d_model // heads
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
         self.RoPE = LlamaRotaryEmbeddingExt(self.head_dim) # for head dim
         self.causal = causal
         self.p_drop = p_drop
@@ -41,45 +42,42 @@ class FlashMultiHeadedAttention(nn.Module):
         self.register_buffer('softmax_scale', torch.tensor(default_scale, dtype=torch.float32))
         
 
-    def forward(self, x, attention_mask, softmax_scale=None):
+    def forward(self, 
+                queries: torch.Tensor,  # (bs, seq_len, d_model) — here seq_len same as kv
+                kv: torch.Tensor,       # (bs, seq_len, d_model)
+                attention_mask: Optional[torch.Tensor] = None,  # (bs, seq_len) 1=valid  
+                softmax_scale: Optional[float] = None) -> torch.Tensor:
         """
+        Self- or Cross-attention computed by flash varlen kernel
         x: shape (bs, seq_len, d_model) after positional embedding
         attention_mask: a bool (1/0) tensor of shape (bs, seq_len)
-        returns: out (bs, seq_len, d_model)
+        Returns: (bs, seq_len, d_model)  -- outputs for each query position.
+        Precondition: queries and kv have same seq_len (or you've padded them to same length)
         """
-        bs, seq_len = x.shape[0:2]
+        bs, seq_len = queries.shape[0], queries.shape[1]
+        # 1) project to head space: (bs, seq_len, n_heads, head_dim) -> transpose -> (bs, n_heads, seq_len, head_dim)
+        query = self.toqueries(queries).view(bs, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        key   = self.tokeys(kv).view(bs, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        value = self.tovalues(kv).view(bs, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # project to q/k/v using LoRA-wrapped linears (these act like nn.Linear)
-        # x shape: (bs, seq_len, n_heads*head_dim)
-        # head_dim * n_heads = d_model
-        # .view(bs, seq_len, n_heads, head_dim) split d_model to [n_heads, head_dim]
-        # .transpose(1,2) -> (bs, n_heads, seq_len, head_dim) for calculating parallelly in muti-heads
-        # be careful for attention_mask shape
-        query = self.toqueries(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
-        key = self.tokeys(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
-        value = self.tovalues(x).view(bs, seq_len, self.heads, self.head_dim).transpose(1, 2)
-
-        # RoPE: expect shape (bs, n_heads, seq_len, head_dim)
+        # 2) apply RoPE to q/k if you use rotary; ensure positions align (absolute positions)
+        #    If your RoPE expects explicit positions, pass them; otherwise RoPE() may use implicit 0..L-1.
         query = self.RoPE(query)
-        key = self.RoPE(key)
+        key   = self.RoPE(key)
 
-        # 1. pack q,k,v into the expected qkv layout for the varlen kernel
-        #    qkv: (bs, n_heads, 3, seq_len, head_dim) -> transpose to (bs, seq_len, 3, n_heads, head_dim)
-        qkv = torch.stack([query, key, value], dim=2).transpose(1, 3)
+        # 3) pack q,k,v into the layout expected by varlen kernel (matches your training forward)
+        #    In your earlier code you used: qkv = torch.stack([query, key, value], dim=2).transpose(1, 3)
+        qkv = torch.stack([query, key, value], dim=2).transpose(1, 3)  # -> (bs, seq_len, 3, n_heads, head_dim) or kernel-specific layout
 
-        # 2. remove pad
-        #    qkv_unpad: (sum_bs(seq_lens), 3, n_heads, head_dim)
-        #    attention_mask: a bool (1/0) tensor of shape (bs, seq_len), 1 means valid and 0 means not valid.
-        #    indices: for recover pad
-        qkv_unpad, indices, cu_seqlens, max_seqlen, seqused = unpad_input(qkv, attention_mask.to(torch.int))
-        
-        # decide softmax_scale to pass to the kernel
-        if softmax_scale is None:
-            softmax_scale_val = float(self.softmax_scale.item())
-        else:
-            softmax_scale_val = float(softmax_scale)
+        # 4) unpad (remove padding positions for speed). kernel expects int mask
+        if attention_mask is None:
+            attention_mask = torch.ones((bs, seq_len), dtype=torch.int, device=queries.device)
+        #   qkv_unpad: (sum_bs(seq_lens), 3, n_heads, head_dim)
+        #   attention_mask: a bool (1/0) tensor of shape (bs, seq_len), 1 means valid and 0 means not valid.
+        #   indices: for recover pad
+        qkv_unpad, indices, cu_seqlens, max_seqlen, _ = unpad_input(qkv, attention_mask.to(torch.int))
 
-        # 3. call flash-attn varlen kernel
+        # 5) call flash-attn varlen kernel
         # NOTE: keep dtype choices consistent with what flash-attn expects on your HW (e.g. bfloat16)
         #       1) qkv_unpad -> bfloat16
         #       2) kernel return bfloat16/float16 -> cast to float32
@@ -90,16 +88,14 @@ class FlashMultiHeadedAttention(nn.Module):
             max_seqlen,
             dropout_p = self.p_drop,
             causal = self.causal,
-            softmax_scale = softmax_scale_val
+            softmax_scale = (float(softmax_scale) if softmax_scale is not None else None)
         ).to(torch.float32)
 
-        # 4. recover padded layout: (bs, seq_len, heads, head_dim)
+        # 6) recover padded layout: (bs, seq_len, n_heads, head_dim)
         attention_qkv = pad_input(attention_qkv_unpad, indices, bs, seq_len)
 
-        # 5. reshape output of multi-heads to (bs, seq_len, n_heads, head_dim) -> (bs, seq_len, n_heads*head_dim)
-        attention_qkv = attention_qkv.reshape(bs, seq_len, self.heads * self.head_dim)
-
-        # 6. final linear to project back to d_model
+        # 7) reshape to (bs, seq_len, d_model) and project back
+        attention_qkv = attention_qkv.reshape(bs, seq_len, self.n_heads * self.head_dim)
         representations_batch = self.unifyheads(attention_qkv)
 
         return representations_batch

@@ -1,6 +1,7 @@
 import copy
 import torch
 import torch.nn as nn
+from typing import Optional
 from model.rotary_position_embedding import LlamaRotaryEmbeddingExt
 from model.flash_multi_headed_attention import FlashMultiHeadedAttention
 
@@ -30,7 +31,33 @@ def replicate_module(module, copies):
     # deepcopy for independent parameters in different layers
     return nn.ModuleList([copy.deepcopy(module) for _ in range(copies)]) # Module list
 
+class HeadAdapter(nn.Module):
+    """
+    Wrap an existing head-like module and present canonical signature:
+      forward(src_reps, src_mask=None, trg_inputs=None, **kwargs)
+    `call_style` controls how to call wrapped module:
+      - "src_only": call module(src_reps, src_mask, **kwargs)
+      - "decoder_like": call module(src_reps, trg_inputs, src_mask, **kwargs)
+      - "custom": use user-supplied callable adapter_fn(src_reps, src_mask, trg_inputs, **kwargs)
+    """
+    def __init__(self, module: nn.Module, requires_trg_inputs: bool = False, name: Optional[str] = None, adapter_fn=None):
+        super().__init__()
+        self.module = module
+        self.requires_trg_inputs = bool(requires_trg_inputs)
+        self.adapter_fn = adapter_fn
+        self.name = name or getattr(module, "name", "BaseHead")
 
+    def forward(self, src_reps, src_mask=None, trg_inputs=None, **kwargs):
+        if self.adapter_fn is not None:
+            return self.adapter_fn(src_reps, src_mask, trg_inputs, **kwargs)
+
+        if self.requires_trg_inputs:
+            # assume wrapped module expects (src_reps, src_mask, trg_inputs, ...)
+            return self.module(src_reps, src_mask, trg_inputs, **kwargs)
+        else:
+            # assume wrapped module expects (src_reps, src_mask, ...)
+            return self.module(src_reps, src_mask, **kwargs)
+        
 class Attention(nn.Module):
     def __init__(self, input_dim, output_dim):
         # for single-head, input_dim is equal to output_dim
@@ -103,6 +130,57 @@ class MultiHeadedAttention(Attention):
         return reps_batch
 
 
+class AddPromptEmbedding(nn.Module):
+    """
+    Prompt = prompt_base (pmt_len x d_model, shared) + cell_embed (d_model, per-cell).
+    - Saves parameters vs storing pmt_len * d_model per cell.
+    - Supports a special mask index = num_cells (i.e. embedding table size = num_cells + 1).
+    """
+    def __init__(self, pmt_len: int, num_cells: int, d_model: int, prompt_scale: float = 1.0):
+        super().__init__()
+        self.pmt_len = pmt_len
+        self.d_model = d_model
+        self.num_cells = num_cells
+        self.mask_idx = num_cells  # reserved index for [MASK]
+        # shared prompt base (learned, shape pmt_len x d_model)
+        self.prompt_base = nn.Parameter(torch.randn(pmt_len, d_model) * 0.02)
+        # per-cell vector (num_cells + 1 for mask slot)
+        self.cell_embed = nn.Embedding(num_cells + 1, d_model) # cell_idx == num_cells is [MASK]
+        # optional scale (small scalar) to control magnitude
+        self.prompt_scale = prompt_scale
+
+        # init
+        nn.init.normal_(self.cell_embed.weight, mean=0.0, std=0.02)
+
+    def forward(self, src_embs: torch.Tensor, src_mask: torch.Tensor, cell_idx: torch.Tensor):
+        """
+        src_embs: (bs, seq_len, d_model)
+        src_mask: (bs, seq_len)  boolean (True=valid)
+        cell_idx: (bs,) long with values in [0, num_cells] where num_cells = mask idx.
+        returns:
+            x: (bs, pmt_len + seq_len, d_model)
+            new_mask: (bs, pmt_len + seq_len) bool
+        """
+        bs = src_embs.size(0)
+        device = src_embs.device
+
+        # cell embedding: (bs, d_model)
+        cell_vec = self.cell_embed(cell_idx.to(device))    # (bs, d_model)
+
+        # prompt_base: (pmt_len, d_model) -> expand to (bs, pmt_len, d_model)
+        prompt_base = self.prompt_base.unsqueeze(0).expand(bs, -1, -1)  # (bs, pmt_len, d_model)
+        # add cell vector to each prompt token (broadcast)
+        prompt_tokens = prompt_base + cell_vec.unsqueeze(1) * self.prompt_scale  # (bs, pmt_len, d_model)
+
+        # prepend prompts and update mask
+        x = torch.cat([prompt_tokens, src_embs], dim=1)
+
+        # prompt_mask True (valid tokens)
+        prompt_mask = torch.ones((bs, self.pmt_len), dtype=src_mask.dtype, device=device)
+        new_mask = torch.cat([prompt_mask, src_mask.to(device)], dim=1)
+
+        return x, new_mask
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, p_drop=None, max_seq_length=20000, pos_nor=False):
         super().__init__()
@@ -173,6 +251,59 @@ class AddNormLayer(nn.Module):
             ) # (bs, seq_len, d_model)
 
 
+class AddAdaLayerNorm(nn.Module):
+    """
+    Adaptive Layer Normalization with Gating (adaLN-Zero).
+    Replaces AddNormLayer.
+    Structure: Residual + alpha * Dropout(Sublayer(gamma * LN(x) + beta))
+    """
+    def __init__(self, d_model, p_drop, num_classes):
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(p=p_drop)
+        
+        # Standard LayerNorm without learnable parameters (elementwise_affine=False)
+        self.LN = nn.LayerNorm(d_model, elementwise_affine=False)
+        
+        # Embedding to generate gamma (scale), beta (shift) and alpha (scale for ResNet)
+        # Input: cell_id -> Output: 3 * d_model (split into gamma, beta and alpha)
+        self.embed = nn.Embedding(num_classes, d_model * 3) 
+        
+        # Initialize embedding weights
+        # Zero-centered initialization for stability (adaLN-Zero)
+        nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
+        # Initialize alpha to 0 (last part of d_model)
+        with torch.no_grad():
+            self.embed.weight.data[:, 2*d_model:] = 0.0
+
+    def forward(self, reps_batch, sublayer_module, cell_id):
+        """
+        Args:
+            reps_batch: (bs, seq_len, d_model)
+            sublayer_module: lambda function or module (e.g., MHA or FFN)
+            cell_id: (bs,) Tensor containing cell type indices
+        """
+        # 1. Generate adaptive parameters
+        style = self.embed(cell_id) # [Batch, 3*Dim]
+        # Split into 3 parts
+        gamma, beta, alpha = style.chunk(3, dim=-1) # Each is [Batch, Dim]
+        
+        # Expand dimensions for broadcasting: (Batch, 1, Dim)
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+        alpha = alpha.unsqueeze(1)
+        
+        # 2. Apply Adaptive Norm (Pre-Norm)
+        # norm = gamma * LN(x) + beta
+        normed = gamma * self.LN(reps_batch) + beta
+        
+        # 3. Apply Sublayer -> Dropout -> Gating -> Residual
+        # Note: alpha scales the entire residual branch
+        output = self.dropout(sublayer_module(normed))
+        
+        return reps_batch + (alpha * output)
+    
+    
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, d_ff, heads, p_drop):
         super().__init__()
@@ -186,7 +317,7 @@ class EncoderLayer(nn.Module):
     def forward(self, src_reps, src_mask):
         # Define anonymous (lambda) function which only takes src_reps (srb) as input,
         # this way we have a uniform interface for the sublayer logic.
-        encoder_self_attention = lambda srb: self.multi_headed_attention(srb, attention_mask=src_mask)
+        encoder_self_attention = lambda srb: self.multi_headed_attention(srb, srb, attention_mask=src_mask)
 
         # Self-attention MHA sublayer followed by point-wise feed forward net sublayer
         ## pre-normalization before MHA and feedforward net sublayer
@@ -195,56 +326,93 @@ class EncoderLayer(nn.Module):
 
         return src_reps
 
-class AddPromptEmbedding(nn.Module):
+class InterleavedEncoderLayer(nn.Module):
     """
-    Prompt = prompt_base (pmt_len x d_model, shared) + cell_embed (d_model, per-cell).
-    - Saves parameters vs storing pmt_len * d_model per cell.
-    - Supports a special mask index = num_cells (i.e. embedding table size = num_cells + 1).
+    A single layer of the deeply interleaved encoder.
+    Implements the logic from Blueprint B:
+    1. P-site stream: Self-Attention -> Cross-Attention (querying RNA stream) -> FFN
+    2. RNA stream: Self-Attention -> FFN
     """
-    def __init__(self, pmt_len: int, num_cells: int, d_model: int, prompt_scale: float = 1.0):
+    def __init__(self, d_model, d_ff, heads, p_drop):
         super().__init__()
-        self.pmt_len = pmt_len
         self.d_model = d_model
-        self.num_cells = num_cells
-        self.mask_idx = num_cells  # reserved index for [MASK]
-        # shared prompt base (learned, shape pmt_len x d_model)
-        self.prompt_base = nn.Parameter(torch.randn(pmt_len, d_model) * 0.02)
-        # per-cell vector (num_cells + 1 for mask slot)
-        self.cell_embed = nn.Embedding(num_cells + 1, d_model) # cell_idx == num_cells is [MASK]
-        # optional scale (small scalar) to control magnitude
-        self.prompt_scale = prompt_scale
 
-        # init
-        nn.init.normal_(self.cell_embed.weight, mean=0.0, std=0.02)
+        # Attention modules
+        self.rna_self_attn = FlashMultiHeadedAttention(d_model, heads, p_drop)
+        self.psite_self_attn = FlashMultiHeadedAttention(d_model, heads, p_drop)
+        self.cross_attn = FlashMultiHeadedAttention(d_model, heads, p_drop)
 
-    def forward(self, src_embs: torch.Tensor, src_mask: torch.Tensor, cell_idx: torch.Tensor):
+        # Feed-forward networks
+        self.rna_ffn = PositionwiseFeedForward(d_model, d_ff)
+        self.psite_ffn = PositionwiseFeedForward(d_model, d_ff)
+
+        # Sublayer connections (Add & Norm)
+        # 2 for RNA stream (self-attn, ffn)
+        self.sublayers_rna = replicate_module(AddNormLayer(d_model, p_drop), 2)
+        # 3 for P-site stream (self-attn, cross-attn, ffn)
+        self.sublayers_psite = replicate_module(AddNormLayer(d_model, p_drop), 3)
+
+    def forward(self, rna_reps, psite_reps, rna_mask, psite_mask):
         """
-        src_embs: (bs, seq_len, d_model)
-        src_mask: (bs, seq_len)  boolean (True=valid)
-        cell_idx: (bs,) long with values in [0, num_cells] where num_cells = mask idx.
-        returns:
-            x: (bs, pmt_len + seq_len, d_model)
-            new_mask: (bs, pmt_len + seq_len) bool
+        Processes both RNA and P-site streams for one layer.
+        
+        Args:
+            rna_reps (torch.Tensor): Representations for the RNA modality.
+            psite_reps (torch.Tensor): Representations for the P-site modality.
+            rna_mask (torch.Tensor): Attention mask for the RNA modality.
+            psite_mask (torch.Tensor): Attention mask for the P-site modality.
+
+        Returns:
+            Tuple: Updated representations for RNA and P-site.
         """
-        bs = src_embs.size(0)
-        device = src_embs.device
+        # --- 1. RNA Stream Update ---
+        # RNA stream updates its own context via self-attention.
+        rna_reps_updated = self.sublayers_rna[0](rna_reps, lambda x: self.rna_self_attn(x, x, attention_mask=rna_mask))
+        rna_out = self.sublayers_rna[1](rna_reps_updated, self.rna_ffn)
 
-        # cell embedding: (bs, d_model)
-        cell_vec = self.cell_embed(cell_idx.to(device))    # (bs, d_model)
+        # --- 2. P-site Stream Update ---
+        # a) P-site stream first updates its own context via self-attention.
+        psite_reps_self_attended = self.sublayers_psite[0](psite_reps, lambda x: self.psite_self_attn(x, x, attention_mask=psite_mask))
 
-        # prompt_base: (pmt_len, d_model) -> expand to (bs, pmt_len, d_model)
-        prompt_base = self.prompt_base.unsqueeze(0).expand(bs, -1, -1)  # (bs, pmt_len, d_model)
-        # add cell vector to each prompt token (broadcast)
-        prompt_tokens = prompt_base + cell_vec.unsqueeze(1) * self.prompt_scale  # (bs, pmt_len, d_model)
+        # b) Then, it queries the RNA stream using cross-attention.
+        # RNA is the query, P-site is the key and value.
+        cross_attention_func = lambda q: self.cross_attn(rna_reps_updated, q, attention_mask=rna_mask)
+        psite_reps_fused = self.sublayers_psite[1](psite_reps_self_attended, cross_attention_func)
 
-        # prepend prompts and update mask
-        x = torch.cat([prompt_tokens, src_embs], dim=1)
+        # c) Finally, it passes through its feed-forward network.
+        psite_out = self.sublayers_psite[2](psite_reps_fused, self.psite_ffn)
 
-        # prompt_mask True (valid tokens)
-        prompt_mask = torch.ones((bs, self.pmt_len), dtype=src_mask.dtype, device=device)
-        new_mask = torch.cat([prompt_mask, src_mask.to(device)], dim=1)
+        return rna_out, psite_out
 
-        return x, new_mask
+class AdaEncoderLayer(nn.Module):
+    """
+    Encoder Layer using Adaptive Layer Normalization.
+    """
+    def __init__(self, d_model, d_ff, heads, p_drop, num_classes):
+        super().__init__()
+        # Use ModuleList for correct parameter registration
+        # Layer 0: For Self-Attention wrapper
+        # Layer 1: For FFN wrapper
+        self.sublayers = replicate_module(AddAdaLayerNorm(d_model, p_drop, num_classes), 2)
+        self.multi_headed_attention = FlashMultiHeadedAttention(d_model, heads, p_drop)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff)
+        self.d_model = d_model
+
+    def forward(self, src_reps, src_mask, cell_id):
+        """
+        Added cell_id argument.
+        """
+        # Define anonymous function for self-attention
+        encoder_self_attention = lambda srb: self.multi_headed_attention(srb, srb, attention_mask=src_mask)
+
+        # 1. Self-Attention Block with AdaLN
+        # Note: We pass cell_id to sublayer
+        src_reps = self.sublayers[0](src_reps, encoder_self_attention, cell_id)
+        
+        # 2. FFN Block with AdaLN
+        src_reps = self.sublayers[1](src_reps, self.ffn, cell_id)
+
+        return src_reps
     
 
 # Part2: =================== Encoder ======================
@@ -263,149 +431,53 @@ class Encoder(nn.Module):
             src_reps = encoder_layer(src_reps, src_mask)
         return self.LN(src_reps) # Using LN. not mentioned explicitly in the paper.
 
-# Part3: =================== Output Heads ======================
-    
-class MaskedEncoderPredictorHead(nn.Module):
-    def __init__(self, d_model, d_seq, d_count, d_ff, heads, num_layers, d_pred_h, p_drop=0.1):
+class InterleavedEncoder(nn.Module):
+    """
+    A stack of InterleavedEncoderLayers to form the complete encoder.
+    """
+    def __init__(self, encoder_layer, number_of_layers):
         super().__init__()
-        # separate transformer blocks
-        self.regress_layers = nn.ModuleList([
-            EncoderLayer(d_model, d_ff, heads, p_drop)
-            for _ in range(num_layers)
-        ])
-        self.classify_layers = nn.ModuleList([
-            EncoderLayer(d_model, d_ff, heads, p_drop)
-            for _ in range(num_layers)
-        ])
+        self.encoder_layers = replicate_module(encoder_layer, number_of_layers)
+        self.LN = nn.LayerNorm(encoder_layer.d_model)
 
-        # count shape: (bs, seq_len, d_count)
-        self.regress_mlp = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_pred_h),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_pred_h, d_model),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_model, d_count),
-            nn.ReLU(),
-        )
-        # class output shape: (bs, seq_len, d_seq)
-        self.classify_mlp = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_pred_h),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_pred_h, d_model),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_model, d_seq)
-        )
-
-class MaskedSeqPredictorHead(nn.Module):
-    def __init__(self, pmt_len, d_model, d_seq, d_pred_h, p_drop=0.1):
-        super().__init__()
-        self.pmt_len = pmt_len
-        # class output shape: (bs, seq_len, d_seq)
-        self.classify_mlp = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_pred_h),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_pred_h, d_model),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_model, d_seq)
-        )
+    def forward(self, rna_reps, psite_reps, rna_mask, psite_mask):
+        """
+        Passes both RNA and P-site streams through all layers.
+        """
+        for layer in self.encoder_layers:
+            rna_reps, psite_reps = layer(rna_reps, psite_reps, rna_mask, psite_mask)
         
-        # initialize parameters (Xavier for weight tensors by default)
-        self.init_params()
-
-    def init_params(self, default_initialization=False):
-        """
-        Initialize parameters. By default uses Xavier uniform for parameters that have dim > 1.
-        If `default_initialization` is True, skip custom initialization (use PyTorch defaults).
-        """
-        if default_initialization:
-            return
-        for name, p in self.named_parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def forward(self, src_reps):
-        # src_reps: [bs, pmt_len + seq_len, d_model], src_mask: [bs, pmt_len + seq_len]
-        src_reps = src_reps[:, self.pmt_len:, :] # -> [bs, seq_len, d_model]
-
-        return self.classify_mlp(src_reps) # [bs, seq_len, d_seq]
-
-class MaskedCountPredictorHead(nn.Module):
-    def __init__(self, pmt_len, d_model, d_count, d_pred_h, p_drop=0.1):
-        super().__init__()
-        self.pmt_len = pmt_len
-        # count shape: (bs, seq_len, d_count)
-        self.regress_mlp = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_pred_h),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_pred_h, d_model),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_model, d_count),
-            nn.ReLU(),
-        )
-
-    def forward(self, src_reps):
-        # src_reps: [bs, pmt_len + seq_len, d_model], src_mask: [bs, pmt_len + seq_len]
-        src_reps = src_reps[:, self.pmt_len:, :] # -> [bs, seq_len, d_model]
-
-        return self.regress_mlp(src_reps)  # [bs, seq_len, d_count]
+        # The final output is the refined P-site representation, which has gathered
+        # information from the RNA stream throughout the layers.
+        return self.LN(psite_reps)
 
 
-class CellClassificationHead(nn.Module):
+class AdaEncoder(nn.Module):
     """
-    Reduce prompt tokens by scalar-weighted pooling and classify into num_cells categories.
-    - Uses (num_cells) logits (no softmax).
-    - This head is compact: uses mean pooling -> linear -> optional hidden -> output.
+    Stack of AdaEncoderLayers.
     """
-    def __init__(self, pmt_len: int, d_model: int, num_cells: int, d_pred_h: int = None, p_drop: float = 0.1):
+    def __init__(self, encoder_layer, number_of_layers, num_classes):
         super().__init__()
-        self.pmt_len = pmt_len
-        self.d_model = d_model
-        self.num_cells = num_cells
-        self.score = nn.Linear(d_model, 1)
-        if d_pred_h is None:
-            d_pred_h = d_model
+        self.encoder_layers = replicate_module(encoder_layer, number_of_layers)
+        
+        # Final normalization also needs to be adaptive to maintain cell context
+        self.final_ln = nn.LayerNorm(encoder_layer.d_model, elementwise_affine=False)
+        self.final_embed = nn.Embedding(num_classes, encoder_layer.d_model * 2)
+        nn.init.normal_(self.final_embed.weight, mean=0.0, std=0.02)
 
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_pred_h),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_pred_h, num_cells)  # logits
-        )
-
-        # init
-        for m in self.net:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-
-    def forward(self, encoder_outputs: torch.Tensor, src_mask: torch.Tensor = None, return_weights = False):
+    def forward(self, src_embs, src_mask, cell_id):
         """
-        encoder_outputs: (bs, pmt_len + seq_len, d_model)
-        src_mask: optional bool mask (bs, pmt_len + seq_len) -> used to weigh prompt tokens if provided.
-        returns logits: (bs, num_cells) with scalar-weight pooling
+        Added cell_id argument.
         """
-        prompt_reps = encoder_outputs[:, :self.pmt_len, :]    # (bs, pmt_len, d_model)
-        scores = self.score(prompt_reps).squeeze(-1)          # (bs, pmt_len)
-
-        if src_mask is not None:
-            # mask for prompt positions (True=valid)
-            prompt_mask = src_mask[:, :self.pmt_len]
-            scores = scores.masked_fill(~prompt_mask, float('-inf'))
-
-        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)   # (bs, pmt_len, 1)
-        pooled = (weights * prompt_reps).sum(dim=1)             # (bs, d)
-        logits = self.net(pooled)
-        if return_weights:
-            return logits, weights.squeeze(-1)                # weights (bs, pmt_len)
-        return logits
+        src_reps = src_embs
+        
+        for encoder_layer in self.encoder_layers:
+            src_reps = encoder_layer(src_reps, src_mask, cell_id)
+            
+        # Final Adaptive Normalization
+        style = self.final_embed(cell_id) # [Batch, 2*Dim]
+        gamma, beta = style.chunk(2, dim=-1)
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+        
+        return gamma * self.final_ln(src_reps) + beta

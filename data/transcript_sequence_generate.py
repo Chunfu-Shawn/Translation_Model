@@ -26,9 +26,9 @@ def fasta_iter(fasta_file):
             yield header, seq
 
 if __name__=="__main__":
-    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
     fasta_tx_file = '/home/user/data3/rbase/genome_ref/Homo_sapiens/hg38/fasta/transcripts/gencode.v48.transcripts.fa'
-    tx_seq_file = '/home/user/data3/rbase/translation_pred/models/lib/tx_seq.v48.pkl'
+    tx_seq_file = '/home/user/data3/rbase/translation_model/models/lib/tx_seq.v48.pkl'
 
     # load tx index
     with open(tx_meta_file, 'rb') as f:

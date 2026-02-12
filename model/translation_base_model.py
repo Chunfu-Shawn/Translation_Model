@@ -4,15 +4,43 @@ import yaml
 import torch
 import torch.nn as nn
 import numpy as np
+import inspect
 from typing import Optional, List, Union, Tuple, Dict, Any
 from config.model_config import ModelConfig
 from model.model_modules import LinearEmbedding, AddPromptEmbedding, Encoder, EncoderLayer
 
 __author__ = "Chunfu Xiao"
-__version__="1.3.0"
+__version__="1.1.0"
 __email__ = "chunfushawn@gmail.com"
 
-        
+
+class HeadAdapter(nn.Module):
+    """
+    Wrap an existing head-like module and present canonical signature:
+      forward(src_reps, src_mask=None, trg_inputs=None, **kwargs)
+    `call_style` controls how to call wrapped module:
+      - "src_only": call module(src_reps, src_mask, **kwargs)
+      - "decoder_like": call module(src_reps, trg_inputs, src_mask, **kwargs)
+      - "custom": use user-supplied callable adapter_fn(src_reps, src_mask, trg_inputs, **kwargs)
+    """
+    def __init__(self, module: nn.Module, requires_trg_inputs: bool = False, name: Optional[str] = None, adapter_fn=None):
+        super().__init__()
+        self.module = module
+        self.requires_trg_inputs = bool(requires_trg_inputs)
+        self.adapter_fn = adapter_fn
+        self.name = name or getattr(module, "name", "BaseHead")
+
+    def forward(self, src_reps, src_mask=None, trg_inputs=None, **kwargs):
+        if self.adapter_fn is not None:
+            return self.adapter_fn(src_reps, src_mask, trg_inputs, **kwargs)
+
+        if self.requires_trg_inputs:
+            # assume wrapped module expects (src_reps, src_mask, trg_inputs, ...)
+            return self.module(src_reps, src_mask, trg_inputs, **kwargs)
+        else:
+            # assume wrapped module expects (src_reps, src_mask, ...)
+            return self.module(src_reps, src_mask, **kwargs)
+
 class TranslationBaseModel(nn.Module):
     """
     TranslationBaseModel: encoder-based model with pluggable heads and robust input handling.
@@ -31,7 +59,7 @@ class TranslationBaseModel(nn.Module):
         pmt_len: int,
         all_cell_types: List[str],
         n_heads: int = 8,
-        number_of_layers: int = 6,
+        number_of_layers: int = 12,
         d_ff: int = 2048,
         p_drop: float = 0.1,
         model_name: str = "base_model",
@@ -58,7 +86,7 @@ class TranslationBaseModel(nn.Module):
         self.n_heads = n_heads
 
         # embeds source data into high-dimensional potent embedding vectors
-        self.src_emb = LinearEmbedding(d_seq, d_count, d_model)
+        self.src_emb = LinearEmbedding(self.d_seq, self.d_count, self.d_model)
         self.pmt_len = pmt_len
 
         # cell type handling
@@ -103,9 +131,22 @@ class TranslationBaseModel(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
+    @property
+    def device(self):
+        """
+        方便地获取模型当前所在的设备。
+        原理是获取第一个参数的 device。
+        """
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            # 如果模型没有任何参数（极其少见），默认返回 cpu
+            return torch.device('cpu')
+
     # -------------------------
     # Config helpers
     # -------------------------
+
     @classmethod
     def _load_config_from_file(cls, path: str) -> Dict[str, Any]:
         """
@@ -250,7 +291,7 @@ class TranslationBaseModel(nn.Module):
         """
         Ensure inputs have a batch dimension. Accepts:
           - seq_batch shape (bs, seq_len, d_seq) or (seq_len, d_seq) for single sample.
-          - count_batch shape (bs, seq_len, d_count) or (seq_len, d_count).
+          - count_batch shape (bs, seq_len, d_count), (seq_len, d_count) or None.
           - src_mask shape (bs, seq_len) or (seq_len,) or None.
           - If `device` provided, tensors are moved to that device before return
 
@@ -259,10 +300,19 @@ class TranslationBaseModel(nn.Module):
             where was_squeezed=True means original inputs were single-sample and we added batch dim.
         """
         was_squeezed = False
-
+        
         # If input is numpy or list, convert first (safe to call _ensure_tensor)
         if not isinstance(seq_batch, torch.Tensor):
             seq_batch = self._ensure_tensor(seq_batch)
+
+        # if count_batch is None，generate Tensor full of 0
+        if count_batch is None:
+            shape = list(seq_batch.shape)
+            d_count = getattr(self, 'd_count', 1)
+            shape[-1] = d_count
+            count_batch = torch.zeros(shape, dtype=seq_batch.dtype)
+
+        # if count_batch is not None
         if not isinstance(count_batch, torch.Tensor):
             count_batch = self._ensure_tensor(count_batch)
 
@@ -383,7 +433,8 @@ class TranslationBaseModel(nn.Module):
         count_batch: torch.Tensor,
         cell_type_idx: torch.LongTensor,
         src_mask: Optional[torch.Tensor] = None,
-        head_names: Optional[List[str]] = None,
+        head_names: Optional[List[str]] = None, 
+        head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
         **kwargs
     ):
         """
@@ -448,11 +499,28 @@ class TranslationBaseModel(nn.Module):
 
         # run requested heads
         outputs = {}
+        head_inputs = head_inputs or {}  # map: head_name -> dict of kwargs for that head
+
         for name in head_names:
             if name not in self.heads:
                 raise KeyError(f"Head {name} not found. Available: {list(self.heads.keys())}")
             head = self.heads[name]
-            outputs[name] = head(src_reps, **kwargs) if callable(head.forward) else head(src_reps)
+            # per-head explicit inputs (highest priority)
+            per_head_kwargs = dict(head_inputs.get(name, {}))
+
+            # if head needs trg_inputs, look in per_head_kwargs or fallback to top-level kwargs e.g., kwargs.get('trg_inputs')
+            if getattr(head, "requires_trg_inputs", False):
+                if "trg_inputs" not in per_head_kwargs:
+                    # fallback to common key
+                    if "trg_inputs" in kwargs:
+                        per_head_kwargs["trg_inputs"] = kwargs["trg_inputs"]
+                    elif "coding_embeddings" in kwargs:
+                        per_head_kwargs["trg_inputs"] = kwargs["coding_embeddings"]
+                    else:
+                        raise ValueError(f"Head '{name}' requires trg_inputs but none provided. Pass in head_inputs['{name}']['trg_inputs']=... or kwargs['trg_inputs']")
+
+            # finally call the head with canonical signature
+            outputs[name] = head(src_reps, src_mask=src_mask, **per_head_kwargs)
 
         return outputs
     
@@ -462,10 +530,11 @@ class TranslationBaseModel(nn.Module):
     def predict(
         self,
         seq_batch: Union[torch.Tensor, np.ndarray, list, tuple],
-        count_batch: Union[torch.Tensor, np.ndarray, list, tuple],
+        count_batch: Union[torch.Tensor, np.ndarray, list, tuple] = None,
         cell_type: Any = None,
         src_mask: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         head_names: Optional[List[str]] = None,
+        head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
         move_inputs_to_device: bool = True,
         return_numpy: bool = False,
     ):
@@ -479,7 +548,7 @@ class TranslationBaseModel(nn.Module):
         # 1) set model to eval and disable grad
         self.eval()
         # Decide device from model parameters (first param) or default device
-        model_device = next(self.parameters()).device
+        model_device = self.device
 
         # 2). normalize inputs and preserve whether user passed a single sample
         seq_batch, count_batch, src_mask, was_squeezed = self._ensure_batch_dim_input(seq_batch, count_batch, src_mask)
@@ -501,7 +570,7 @@ class TranslationBaseModel(nn.Module):
 
         # 4) run forward under no_grad
         with torch.no_grad():
-            outputs = self.forward(seq_batch, count_batch, cell_type_idx, src_mask, head_names=head_names)
+            outputs = self.forward(seq_batch, count_batch, cell_type_idx, src_mask, head_names, head_inputs)
 
         # 5) If forward produced batched outputs but input was single-sample,
         #    forward() should already support returning batched output consistently.
@@ -524,7 +593,11 @@ class TranslationBaseModel(nn.Module):
     # head management helpers
     # -------------------------
     
-    def add_head(self, name: str, head_module: nn.Module, overwrite: bool = False, move_to_model_device: bool = True) -> None:
+    def add_head(self, name: str, 
+                 head_module: nn.Module, 
+                 overwrite: bool = False, 
+                 move_to_model_device: bool = True, 
+                 requires_trg_inputs: Optional[bool] = None) -> None:
         """
         Register a new head module into self.heads and optionally move it to the same device as the base model.
 
@@ -548,12 +621,30 @@ class TranslationBaseModel(nn.Module):
         if move_to_model_device:
             # try to determine device of the model by inspecting its parameters
             try:
-                model_device = next(self.parameters()).device
+                model_device = self.device
             except StopIteration:
                 # model has no parameters? fallback to CPU
                 model_device = torch.device("cpu")
             # move the head module (this moves parameters and buffers)
             head_module.to(model_device)
+
+        # autodetect requires_trg_inputs if not provided
+        if requires_trg_inputs is None:
+            # check attribute on module
+            if hasattr(head_module, "requires_trg_inputs"):
+                requires_trg_inputs = bool(getattr(head_module, "requires_trg_inputs"))
+            else:
+                # inspect signature as fallback
+                try:
+                    sig = inspect.signature(head_module.forward)
+                    requires_trg_inputs = "trg_inputs" in sig.parameters
+                except (ValueError, TypeError):
+                    requires_trg_inputs = False
+
+        # if head_module not following HeadAdapter interface, wrap it
+        if not isinstance(head_module, HeadAdapter):
+            head_module = HeadAdapter(head_module, requires_trg_inputs=requires_trg_inputs, name=getattr(head_module, "name", name))
+
 
         # register the head into ModuleDict (this makes it a tracked submodule)
         self.heads[name] = head_module

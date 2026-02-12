@@ -40,12 +40,12 @@ def plot_transcript_coding(prediction,
                            dpi=200,
                            show: bool = True):
     """
-    Plot per-base scores (start/stop/in_orf) and targets for one transcript.
+    Plot per-base scores (start/stop/other) and targets for one transcript.
 
     Args:
       prediction: either
-         - dict with keys 'start','stop','in_orf' each shape (L,) logits or probs
-         - or ndarray shape (L,3) where columns order is [start, stop, in_orf] (logits or probs)
+         - dict with keys 'start','stop','other' each shape (L,) logits or probs
+         - or ndarray shape (L,3) where columns order is [start, stop, other] (logits or probs)
       targets: same layout as prediction but values 0/1 (either dict or ndarray (L,3))
       seq_id: optional title or filename tag
       savepath: if provided, save the image to this path
@@ -59,22 +59,22 @@ def plot_transcript_coding(prediction,
     if isinstance(prediction, dict):
         start_pred = _to_numpy(prediction['start'])
         stop_pred = _to_numpy(prediction['stop'])
-        inorf_pred = _to_numpy(prediction['in_orf'])
+        inorf_pred = _to_numpy(prediction['other'])
     else:
         arr = _to_numpy(prediction)
         if arr.ndim != 2 or arr.shape[1] != 3:
-            raise ValueError("prediction ndarray must have shape (L,3) with columns [start,stop,in_orf]")
+            raise ValueError("prediction ndarray must have shape (L,3) with columns [start,stop,other]")
         start_pred, stop_pred, inorf_pred = arr[:,0], arr[:,1], arr[:,2]
 
     # targets
     if isinstance(targets, dict):
         start_t = _to_numpy(targets['start']).astype(bool)
         stop_t = _to_numpy(targets['stop']).astype(bool)
-        inorf_t = _to_numpy(targets['in_orf']).astype(bool)
+        inorf_t = _to_numpy(targets['other']).astype(bool)
     else:
         targ_arr = _to_numpy(targets)
         if targ_arr.ndim != 2 or targ_arr.shape[1] != 3:
-            raise ValueError("targets ndarray must have shape (L,3) with columns [start,stop,in_orf]")
+            raise ValueError("targets ndarray must have shape (L,3) with columns [start,stop,other]")
         start_t, stop_t, inorf_t = targ_arr[:,0].astype(bool), targ_arr[:,1].astype(bool), targ_arr[:,2].astype(bool)
 
     # ensure same length
@@ -115,8 +115,8 @@ def plot_transcript_coding(prediction,
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
 
-    # Plot order: in_orf (bottom), then start, then stop so they are not obscured by in_orf.
-    ax.bar(x, inorf_score, width=1.0, color=color_inorf, alpha=0.6, align='edge', label='in_orf score')
+    # Plot order: other (bottom), then start, then stop so they are not obscured by other.
+    ax.bar(x, inorf_score, width=1.0, color=color_inorf, alpha=0.6, align='edge', label='other score')
     ax.bar(x, start_score, width=1.0, color=color_start, alpha=0.6, align='edge', label='start score')
     ax.bar(x, stop_score,  width=1.0, color=color_stop,  alpha=0.6, align='edge', label='stop score')
 
@@ -127,7 +127,7 @@ def plot_transcript_coding(prediction,
     # baseline for first target row below y=0
     y_base = - (row_height + spacing) * 3  # leave room for three rows
 
-    # In_orf targets: lowest row
+    # other targets: lowest row
     for (s, ln) in _find_runs(inorf_t):
         rect = patches.Rectangle((s, y_base), ln, row_height, linewidth=0, facecolor=color_inorf_t, alpha=1.0)
         ax.add_patch(rect)

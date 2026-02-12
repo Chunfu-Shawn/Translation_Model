@@ -1,6 +1,6 @@
 import sys, time
 import csv
-sys.path.append("/home/user/data3/rbase/translation_pred/models/src")
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
 import multiprocessing
 import numpy as np
 import pickle
@@ -142,9 +142,9 @@ class PeriodicityEvaluator:
 
 
 if __name__=="__main__":
-    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
-    ORF_info_tsv_file = '/home/user/data3/rbase/translation_pred/models/lib/ORF/candidate_ORFs/candidateORF.60nt.filtered.tx_pos.txt'
-    ORF_info_dict_file = '/home/user/data3/rbase/translation_pred/models/lib/ORF/candidate_ORFs/candidateORF.60nt.filtered.tx_pos.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
+    ORF_info_tsv_file = '/home/user/data3/rbase/translation_model/models/lib/ORF/candidate_ORFs/candidateORF.60nt.filtered.tx_pos.txt'
+    ORF_info_dict_file = '/home/user/data3/rbase/translation_model/models/lib/ORF/candidate_ORFs/candidateORF.60nt.filtered.tx_pos.pkl'
     RPF_count_file = '/home/user/data3/yaoc/translation_model/model/SRR15513148_49_50_51_52.read_count.pkl'
     chroms = ["chr17", "chr19", "chr11"] + \
         [f'chr{i}' for i in range(1, 11)] + \

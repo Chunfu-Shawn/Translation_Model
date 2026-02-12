@@ -126,13 +126,24 @@ class DepthwiseSeparableConv1D(nn.Module):
         self.act = nn.GELU()
         self.dropout = nn.Dropout(p_drop)
 
-    def forward(self, x):
-        # x: (bs, channels, L)
-        return self.dropout(
-            self.act(
-                self.pw(
-                    self.dw(x)
-                    )))
+    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None):
+        """
+        x: (bs, channels, L)
+        pad_mask: optional bool or float tensor (bs, L) where True/1 = valid, False/0 = pad
+        """
+
+        out = self.dw(x)
+        out = self.pw(out)
+        out = self.act(out)
+        out = self.dropout(out)
+
+        if pad_mask is not None:
+            # pad_mask might be bool; convert to float and move to same device/dtype
+            m = pad_mask.to(x.device).unsqueeze(1)  # (bs,1,L)
+            # zero-out padded outputs so they don't leak into next layer
+            out = out * m
+            
+        return out
 
 # -------------------------
 # Depthwise separable convolution (lighter)
@@ -224,40 +235,6 @@ class DSConvCodingHead(nn.Module):
         return cls(pmt_len=pmt_len, d_model=d_model, d_pred_h=d_pred_h, p_drop=p_drop, init_xavier=init_xavier)
 
 
-class DepthwiseSeparableDilatedBlock(nn.Module):
-    """
-    One block: depthwise dilated conv -> pointwise conv -> activation -> dropout
-    Input/Output shapes for conv1d: (bs, channels, L)
-    depthwise: groups=in_ch, keeps channels
-    pointwise: kernel=1, maps channels -> channels
-    """
-    def __init__(self, in_ch, out_ch: int, kernel_size: int = 3, dilation: int = 1, p_drop: float = 0.1):
-        super().__init__()
-        pad = (kernel_size - 1) // 2 * dilation
-        # depthwise
-        self.dw = nn.Conv1d(
-            in_ch,
-            in_ch,
-            kernel_size=kernel_size, 
-            stride=1,
-            padding=pad,
-            dilation=dilation,
-            groups=out_ch,
-            bias=False
-        )
-        # pointwise
-        self.pw = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=1, bias=True)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(p_drop)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (bs, channels, L)
-        out = self.dw(x)
-        out = self.pw(out)
-        out = self.act(out)
-        out = self.dropout(out)
-        return out
-
 # -------------------------
 # Depthwise separable dilated convolutions
 # -------------------------
@@ -284,22 +261,23 @@ class DSDilatedConvCodingHead(nn.Module):
         self.ln = nn.LayerNorm(d_model)
 
         # Build shared trunk (dilated conv stack)
-        trunk_layers_list = []
+        trunk_blocks = []
         in_ch = d_model
-        for i in range(trunk_layers):
-            dil = 2 ** i
-            trunk_layers_list.append(DepthwiseSeparableConv1D(in_ch, d_pred_h, kernel_size=kernel_size, dilation=dil, p_drop=p_drop))
+        dil = 1
+        for _ in range(trunk_layers):
+            dil = dil * 2
+            trunk_blocks.append(DepthwiseSeparableConv1D(in_ch, d_pred_h, kernel_size=kernel_size, dilation=dil, p_drop=p_drop))
             in_ch = d_pred_h
-        self.trunk = nn.Sequential(*trunk_layers_list)
+        self.trunk = nn.ModuleList(trunk_blocks)
 
         # task conv for smaller dimension
         # local_stack: used to produce representations suitable for start/stop (local detection)
-        local_layers = []
-        for j in range(task_layers):
+        local_blocks = []
+        for _ in range(task_layers):
             # smaller dilation for boundary detection (more local)
-            dil = 1 if j == 0 else 2 ** j
-            local_layers.append(DepthwiseSeparableConv1D(d_pred_h, d_pred_h, kernel_size=kernel_size, dilation=dil, p_drop=p_drop))
-        self.local_stack = nn.Sequential(*local_layers)
+            dil = dil * 2
+            local_blocks.append(DepthwiseSeparableConv1D(d_pred_h, d_pred_h, kernel_size=kernel_size, dilation=dil, p_drop=p_drop))
+        self.local_stack = nn.ModuleList(local_blocks)
 
         # region stack: for in_orf (needs smoother/larger receptive field)
         # region_layers = []
@@ -325,21 +303,45 @@ class DSDilatedConvCodingHead(nn.Module):
                 if m.weight is not None: nn.init.ones_(m.weight)
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
-    def forward(self, src_reps: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, src_reps: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         src_reps: (bs, pmt_len + L, d_model)
-        returns logits dict with tensors (bs, L, 3)
+        pad_mask: (bs, L) bool, True=valid token, False=pad
+        disable_last_k: int, number of last positions to disable per sequence
+        returns logits: (bs, L, 3)
         """
         # LayerNorm over last dim, then permute to (bs, channels, L)
-        x = self.ln(src_reps[:, self.pmt_len:, :]).permute(0,2,1)  # (bs, d_model, L)
-        shared = self.trunk(x)  # -> (bs, d_pred_h, L)
-        local = self.local_stack(shared)  # -> (bs, d_pred_h, L)
-        # region = self.region_stack(shared)  # -> (bs, d_pred_h, L)
+        x = src_reps[:, self.pmt_len:, :]
+        bs, L, _ = x.shape
+
+        # If pad_mask provided, zero-out padded embeddings (so LN/Conv won't see garbage)
+        if pad_mask is not None:
+            pad_mask = pad_mask[:, self.pmt_len:] # (bs, L)
+        else:
+            pad_mask = torch.ones((bs, L), dtype=torch.bool, device=src_reps.device)
+
+        # zero-out padded token embeddings BEFORE LayerNorm so LN statistics are not polluted
+        mask_float = pad_mask.to(dtype=x.dtype, device=x.device).unsqueeze(-1)  # (bs, L, 1)
+        x = x * mask_float
+
+        # apply LayerNorm on last dim (masked positions are zeros), permute to conv format (bs, channels, L)
+        x = self.ln(x).permute(0,2,1).contiguous()  # (bs, d_model, L)
+
+        # trunk: iterate blocks and pass mask to each
+        out = x
+        for block in self.trunk:
+            out = block(out, pad_mask=pad_mask)  # each block zeros pad pre/post
+
+        # local stack
+        local = out
+        for block in self.local_stack:
+            local = block(local, pad_mask=pad_mask)
 
         start_stop_logits = self.start_stop_head(local) # (bs, d_pred_h, L) -> (bs, 3, L)
         # inorf_logits = self.inorf_head(region)
 
-        return start_stop_logits # torch.cat((start_stop_logits, inorf_logits), dim=1).permute(0,2,1)  # (bs, L, 3)
+        # (bs, L, 3)
+        return start_stop_logits.permute(0, 2, 1).contiguous() # torch.cat((start_stop_logits, inorf_logits), dim=1).permute(0,2,1)
     
     @classmethod
     def create_from_model(

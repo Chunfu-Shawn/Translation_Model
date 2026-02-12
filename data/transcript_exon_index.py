@@ -55,7 +55,8 @@ def convert_position(
     exon_ends: np.ndarray,
     tx_starts: np.ndarray,
     tx_ends: np.ndarray,
-    strand):
+    strand
+    ):
     # all input need 1-based
     # return: pos [1, tx_len] 1-based
     if strand == '+':
@@ -90,6 +91,8 @@ def create_optimized_index(gtf_file, db_file):
 
     for transcript in db.features_of_type('transcript'):
         tid = transcript.id
+        # print(transcript)
+        gene_id = transcript.attributes['gene_id'][0]
         chrom = transcript.chrom
         strand = transcript.strand
 
@@ -108,10 +111,10 @@ def create_optimized_index(gtf_file, db_file):
                       key=lambda x: x.start, reverse=(strand == '-')) # 1-based
 
         print("--- " + tid + " ---")
-        print(len(start_codons), len(stop_codons))
+        print(gene_id, len(start_codons), len(stop_codons))
         # exon starts < exon ends
-        exon_starts = np.array([e.start for e in exons], dtype=int) # 1-based
-        exon_ends = np.array([e.end for e in exons], dtype=int) # 1-based
+        exon_starts = np.array([e.start for e in exons], dtype=np.int32) # 1-based
+        exon_ends = np.array([e.end for e in exons], dtype=np.int32) # 1-based
         exon_starts0_sorted, exon_ends0_sorted = build_exon_index_np(exon_starts, exon_ends, strand) # 0-based
         cds_starts = [c.start for c in cds_regions] # 1-based
         cds_ends = [c.end for c in cds_regions] # 1-based
@@ -132,12 +135,13 @@ def create_optimized_index(gtf_file, db_file):
             cds_end_pos = convert_position(cds_starts[-1], exon_starts, exon_ends, tx_starts, tx_ends, strand) # 1-based
 
         transcript_meta_dict[tid] = {
+            'gene_id': gene_id,
             'chrom': chrom,
             'strand': strand,
-            'exon_starts': list(exon_starts),
-            'exon_starts0_sorted': list(exon_starts0_sorted),
-            'exon_ends': list(exon_ends),
-            'exon_ends0_sorted': list(exon_ends0_sorted),
+            'exon_starts': exon_starts,
+            'exon_starts0_sorted': exon_starts0_sorted,
+            'exon_ends': exon_ends,
+            'exon_ends0_sorted': exon_ends0_sorted,
             'tx_starts': tx_starts,
             'tx_ends': tx_ends
         }
@@ -221,9 +225,10 @@ def load_index(filename):
 
 if __name__=="__main__":
     gtf_file = '/home/user/data3/rbase/genome_ref/Homo_sapiens/hg38/gencode.v48.comp_annotation_chro.gtf'
-    tree_index_file = '/home/user/data3/rbase/translation_pred/models/lib/genome_index_tree.pkl'
-    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
-    tx_cds_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_cds.pkl'
+    tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.pkl'
+    tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
+    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.pkl'
     
     # build index
     tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.db')
@@ -231,16 +236,14 @@ if __name__=="__main__":
     # save
     with open(tree_index_file, 'wb') as f:
         pickle.dump(tree_index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(tree_strand_index_file, 'wb') as f:
+        pickle.dump(tree_strand_index, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(tx_meta_file, 'wb') as f:
         pickle.dump(tx_meta, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(tx_cds_file, 'wb') as f:
         pickle.dump(tx_cds, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     # load
-    with open(tree_index_file, 'rb') as f:
-        loaded_tree_index = pickle.load(f)
-    with open(tx_meta_file, 'rb') as f:
-        loaded_tx_meta = pickle.load(f)
     with open(tx_cds_file, 'rb') as f:
         loaded_tx_cds = pickle.load(f)
 

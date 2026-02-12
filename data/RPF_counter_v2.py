@@ -1,5 +1,5 @@
 import sys, time
-sys.path.append("/home/user/data3/rbase/translation_pred/models/src")
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
 import mmap, contextlib
 import multiprocessing
 import numpy as np
@@ -277,10 +277,10 @@ class RPF_Counter:
 
 
 if __name__=="__main__":
-    tree_index_file = '/home/user/data3/rbase/translation_pred/models/lib/genome_index_tree.pkl'
-    tx_meta_file = '/home/user/data3/rbase/translation_pred/models/lib/transcript_meta.pkl'
-    bam_file = '/home/user/data3/rbase/translation_pred/models/test/SRR15513158.uniq.sorted.pc.bam'
-    RPF_count_file = '/home/user/data3/rbase/translation_pred/models/test/SRR15513158.read_count.pkl'
+    tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
+    bam_file = '/home/user/data3/rbase/translation_model/models/test/SRR15513158.uniq.sorted.pc.bam'
+    RPF_count_file = '/home/user/data3/rbase/translation_model/models/test/SRR15513158.read_count.pkl'
     chroms = ["chr17", "chr19", "chr11"] + \
         [f'chr{i}' for i in range(1, 11)] + \
         [f'chr{i}' for i in range(12, 17)] + \
