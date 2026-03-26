@@ -63,6 +63,8 @@ def build_lora_model_from_pretrained(base_model, r=4, lora_alpha=16):
     2) return replaced model
     """
     replace_linear_with_lora(base_model, r=r, lora_alpha=lora_alpha)
+    # add LoRA tag
+    base_model.model_name += f".r{r}_alpha{lora_alpha}"
     return base_model
 
 

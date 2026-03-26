@@ -7,17 +7,16 @@ __license__ = ""
 __version__="1.0.0"
 __email__ = "chunfushawn@gmail.com"
 
-class CodingNetHead(nn.Module):
+class NetCodingHead(nn.Module):
     """
-    Shared trunk + three binary heads: start / stop / in_orf.
+    Shared trunk + two binary heads: start / stop
     Input:
       - src_reps: (bs, L, d_model)
     Output:
-      - dict of logits (not probs): keys 'start', 'stop', 'in_orf' -> tensors (bs, L)
+      - dict of logits: tensor of shape (bs, L, 2)
     """
     def __init__(
             self, 
-            pmt_len: int, 
             d_model: int, 
             d_pred_h: int = 256,
             p_drop: float = 0.1, 
@@ -25,9 +24,10 @@ class CodingNetHead(nn.Module):
             use_ln: bool = True
         ):
         super().__init__()
+        self.name = "FFNHead"
         self.use_ln = use_ln
-        self.pmt_len = int(pmt_len)
         self.ln = nn.LayerNorm(d_model) if use_ln else nn.Identity()
+
         self.trunk = nn.Sequential(
             nn.Linear(d_model, d_pred_h),
             nn.GELU(),
@@ -37,10 +37,9 @@ class CodingNetHead(nn.Module):
             nn.Dropout(p_drop),
         )
 
-        # three heads -> scalar logit per position
+        # two heads -> scalar logit per position
         self.start_head = nn.Linear(d_pred_h, 1)
         self.stop_head  = nn.Linear(d_pred_h, 1)
-        self.inorf_head = nn.Linear(d_pred_h, 1)
 
         # init
         if init_xavier:
@@ -59,43 +58,43 @@ class CodingNetHead(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, src_reps: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, src_reps: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         src_reps: (bs, L, d_model)
         returns logits dict with each (bs, L)
         """
-        x = self.ln(src_reps[:, self.pmt_len:, :])  # (bs, L, d_model)
+        x = self.ln(src_reps)  # (bs, L, d_model)
         x = self.trunk(x)      # (bs, L, d_pred_h)
+
         start_logits = self.start_head(x).squeeze(-1)  # (bs, L)
         stop_logits  = self.stop_head(x).squeeze(-1)
-        inorf_logits = self.inorf_head(x).squeeze(-1)
-        return torch.stack((start_logits, stop_logits, inorf_logits), dim=2)  # (bs, L, 3)
-        # {'start': start_logits, 'stop': stop_logits, 'in_orf': inorf_logits}
+
+        coding_logits = torch.stack((start_logits, stop_logits), dim=2)  # (bs, L, 2)
+        
+        # 应用 mask，将 Padding 区域的 Logits 归零，防止干扰后续计算
+        if src_mask is not None:
+            src_mask = src_mask.to(coding_logits.device).unsqueeze(-1) # (bs, L, 1)
+            coding_logits = coding_logits * src_mask.float()
+
+        return coding_logits  # (bs, L, 2)
     
     @classmethod
     def create_from_model(
         cls,
         parent_model: object,
-        pmt_len: Optional[int] = None,
         d_model: Optional[int] = None,
         d_pred_h: Optional[int] = None,
         p_drop: float = 0.1,
         init_xavier: bool = True,
-    ) -> "CodingNetHead":
+    ) -> "NetCodingHead":
         """
-        Create a CodingNetHead by inferring missing dimensions from `parent_model`.
+        Create a NetCodingHead by inferring missing dimensions from `parent_model`.
 
         parent_model is expected to expose attributes:
           - d_model (model hidden size)
 
         Parameters: the same as __init__, but any None will be inferred where possible.
         """
-        # infer pmt_len
-        if pmt_len is None:
-            if hasattr(parent_model, "pmt_len"):
-                pmt_len = int(getattr(parent_model, "pmt_len"))
-            else:
-                raise ValueError("pmt_len not provided and parent_model has no attribute 'pmt_len'")
             
         # infer d_model
         if d_model is None:
@@ -105,7 +104,7 @@ class CodingNetHead(nn.Module):
                 raise ValueError("d_model not provided and parent_model has no attribute 'd_model'")
 
         # now construct
-        return cls(pmt_len=pmt_len, d_model=d_model, d_pred_h=d_pred_h, p_drop=p_drop, init_xavier=init_xavier)
+        return cls(d_model=d_model, d_pred_h=d_pred_h, p_drop=p_drop, init_xavier=init_xavier)
 
 
 # Depthwise separable conv 1D
@@ -118,9 +117,10 @@ class DepthwiseSeparableConv1D(nn.Module):
     """
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, dilation: int = 1, p_drop: float = 0.1):
         super().__init__()
-        pad = (kernel_size - 1) // 2 * dilation
+        # pad = (kernel_size - 1) // 2 * dilation
         # depthwise
-        self.dw = nn.Conv1d(in_ch, in_ch, kernel_size, stride=1, padding=pad, dilation=dilation, groups=in_ch, bias=False)
+        self.dw = nn.Conv1d(in_ch, in_ch, kernel_size, stride=1, 
+                            padding="same", dilation=dilation, groups=in_ch, bias=False)
         # pointwise
         self.pw = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=1, bias=True)
         self.act = nn.GELU()
@@ -140,6 +140,11 @@ class DepthwiseSeparableConv1D(nn.Module):
         if pad_mask is not None:
             # pad_mask might be bool; convert to float and move to same device/dtype
             m = pad_mask.to(x.device).unsqueeze(1)  # (bs,1,L)
+            
+            # 这里动态裁剪 mask 以匹配实际输出的长度
+            if m.shape[-1] != out.shape[-1]:
+                m = m[:, :, :out.shape[-1]]
+
             # zero-out padded outputs so they don't leak into next layer
             out = out * m
             
@@ -151,7 +156,6 @@ class DepthwiseSeparableConv1D(nn.Module):
 class DSConvCodingHead(nn.Module):
     def __init__(
             self,
-            pmt_len: int,
             d_model: int, 
             d_pred_h: int = 256,
             kernel_sizes: List[int] = [3,3],
@@ -160,17 +164,23 @@ class DSConvCodingHead(nn.Module):
         ):
         super().__init__()
         self.name = "SepConv"
-        self.pmt_len = int(pmt_len)
         self.ln = nn.LayerNorm(d_model)
-        layers = []
+        
+        self.conv_stack = nn.ModuleList()
         in_ch = d_model
         for k in kernel_sizes:
-            layers.append(DepthwiseSeparableConv1D(in_ch, d_pred_h, kernel_size=k, p_drop=p_drop))
+            self.conv_stack.append(DepthwiseSeparableConv1D(in_ch, d_pred_h, kernel_size=k, p_drop=p_drop))
             in_ch = d_pred_h
-        self.conv_stack = nn.Sequential(*layers)
-        self.start_head = nn.Conv1d(d_pred_h, 1, kernel_size=1)
-        self.stop_head  = nn.Conv1d(d_pred_h, 1, kernel_size=1)
-        self.inorf_head = nn.Conv1d(d_pred_h, 1, kernel_size=1)
+            
+        # 卷积完成后将特征映射回 (bs, L, C) 进行全连接计算
+        self.ffn = nn.Sequential(
+            nn.Linear(d_pred_h, d_pred_h),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+        )
+
+        self.start_head = nn.Linear(d_pred_h, 1)
+        self.stop_head  = nn.Linear(d_pred_h, 1)
 
         if init_xavier:
             self._init_parameters()
@@ -184,28 +194,36 @@ class DSConvCodingHead(nn.Module):
                 if m.weight is not None: nn.init.ones_(m.weight)
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
-    def forward(self, src_reps: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, src_reps: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        src_reps: (bs, pmt_len + L, d_model)
+        src_reps: (bs,  L, d_model)
+        src_mask: (bs, L)
         returns logits dict with tensors (bs, L, 3)
         """
         # LayerNorm over last dim, then permute to (bs, channels, L)
-        x = self.ln(src_reps[:, self.pmt_len:, :]).permute(0,2,1)  # (bs, d_model, L)
-        h = self.conv_stack(x)  # -> (bs, d_pred_h, L)
+        x = self.ln(src_reps).permute(0,2,1)  # (bs, d_model, L)
+        h = x
+        for layer in self.conv_stack:
+            h = layer(h, src_mask)  # -> (bs, d_pred_h, L)
 
-        start_logits = self.start_head(h).squeeze(1) # (bs, 1, L) -> (bs, L)
-        stop_logits = self.stop_head(h).squeeze(1)
-        inorf_logits = self.inorf_head(h).squeeze(1)
+        h = h.permute(0, 2, 1)
+        start_logits = self.start_head(h).squeeze(-1) # (bs, 1, L) -> (bs, L)
+        stop_logits = self.stop_head(h).squeeze(-1)
+        coding_logits = torch.stack((start_logits, stop_logits), dim=2)  
 
-        return torch.stack((start_logits, stop_logits, inorf_logits), dim=2)  # (bs, L, 3)
+        if src_mask is not None:
+            mask_expanded = src_mask.to(coding_logits.device).unsqueeze(-1) # (bs, L, 1)
+            coding_logits = coding_logits * mask_expanded.float()
+
+        return coding_logits  # (bs, L, 3)
     
     @classmethod
     def create_from_model(
         cls,
         parent_model: object,
-        pmt_len: Optional[int] = None,
         d_model: Optional[int] = None,
         d_pred_h: Optional[int] = None,
+        kernel_sizes: Optional[list] = None,
         p_drop: float = 0.1,
         init_xavier: bool = True,
     ) -> "DSConvCodingHead":
@@ -217,12 +235,6 @@ class DSConvCodingHead(nn.Module):
 
         Parameters: the same as __init__, but any None will be inferred where possible.
         """
-        # infer pmt_len
-        if pmt_len is None:
-            if hasattr(parent_model, "pmt_len"):
-                pmt_len = int(getattr(parent_model, "pmt_len"))
-            else:
-                raise ValueError("pmt_len not provided and parent_model has no attribute 'pmt_len'")
             
         # infer d_model
         if d_model is None:
@@ -230,9 +242,20 @@ class DSConvCodingHead(nn.Module):
                 d_model = int(getattr(parent_model, "d_model"))
             else:
                 raise ValueError("d_model not provided and parent_model has no attribute 'd_model'")
+            
+        # 使用字典传参，防止 None 值覆盖 __init__ 中的默认值
+        kwargs = {
+            "d_model": d_model,
+            "p_drop": p_drop,
+            "init_xavier": init_xavier
+        }
+        if d_pred_h is not None:
+            kwargs["d_pred_h"] = d_pred_h
+        if kernel_sizes is not None:
+            kwargs["kernel_sizes"] = kernel_sizes
 
         # now construct
-        return cls(pmt_len=pmt_len, d_model=d_model, d_pred_h=d_pred_h, p_drop=p_drop, init_xavier=init_xavier)
+        return cls(**kwargs)
 
 
 # -------------------------

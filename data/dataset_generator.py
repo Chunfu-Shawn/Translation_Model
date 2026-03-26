@@ -126,7 +126,7 @@ class DatasetGenerator():
                     total_reads += cnt
                     cov_put_codon[(pos-1)//3] = 1
 
-        depth = total_reads/seq_l
+        depth = total_reads / seq_l
         coverage = cov_put_codon.count(1)
 
         return depth, coverage
@@ -142,11 +142,11 @@ class DatasetGenerator():
         # median or mean of non-zero counts
         if nz.size > 0:
             if method == "mean":
-                dm = np.mean(nz) if non_zero else np.mean(counts) + eps
+                dm = np.mean(nz) + eps if non_zero else np.mean(counts) + eps
             elif method == "median":
-                dm = np.median(nz) if non_zero else np.median(counts) + eps
+                dm = np.median(nz) + eps if non_zero else np.median(counts) + eps
             elif method == "lower_quantile":
-                dm = np.quantile(nz, 0.25) if non_zero else np.quantile(counts, 0.25) + eps
+                dm = np.quantile(nz, 0.25) + eps if non_zero else np.quantile(counts, 0.25) + eps
             else:
                 return counts
         else:

@@ -2,6 +2,7 @@ import os
 import time
 import json
 import math
+import random  # 导入 random 用于数据增强
 import contextlib
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -15,7 +16,7 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 from utils import unwrap_model
-from distributed_bucket_sampler import DistributedBucketSampler
+from train.distributed_bucket_sampler import DistributedBucketSampler
 
 
 def create_lr_lambda(total_steps: int, warmup_steps: int = 0, min_eta: float = 1e-4):
@@ -52,10 +53,10 @@ def collate_pad_batch_to_cuda(batch):
           (cell_idx, cds_start, motif_occs, seq_emb, count_emb, coding_emb)
         Returns many tensors; calling code is responsible to move them to device.
         """
-        cell_idxs, _, _, seq_embs, count_embs, coding_embs = zip(*batch)
+        _, cell_types, seq_embs, count_embs, coding_embs = zip(*batch)
 
         # convert cell indices
-        cell_idxs = torch.tensor(cell_idxs, dtype=torch.long)
+        cell_types = list(cell_types)
 
         # pad sequences
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
@@ -65,10 +66,10 @@ def collate_pad_batch_to_cuda(batch):
         # pad mask where True means valid token
         pad_masks = (seq_embs_padded != -1)[:, :, 0].squeeze(-1)
 
-        # print(seq_embs_padded.shape, coding_embs_padded.shape)
+        # print(seq_embs_padded.shape, count_embs_padded.shape, coding_embs_padded.shape)
 
         return (
-            cell_idxs, 
+            cell_types, 
             seq_embs_padded,
             count_embs_padded,
             coding_embs_padded,
@@ -177,8 +178,8 @@ class FineTuningTrainer:
         self._total_steps = max(1, int(self.epoch_num * self.steps_per_epoch // max(1, self.ac_steps)))
 
         # loss criterions
-        self.bceloss_in_orf = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor(20))
-        self.alpha = 0.5
+        # self.bceloss_in_orf = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor(20))
+        self.pos_weight = 50.0
         self.gamma = 2.0
 
         # build optimizer & scheduler & scaler
@@ -209,6 +210,7 @@ class FineTuningTrainer:
                 print(f"[Trainer] Train from scratch")
 
         if self.rank == 0:
+            print(f"[Trainer] model_trainer_name={self.model_full_name}")
             print(f"[Trainer] device={self.device}, steps_per_epoch={self.steps_per_epoch}, total_steps={self._total_steps}")
     
     # -------------------------
@@ -351,85 +353,74 @@ class FineTuningTrainer:
     # -------------------------
     @staticmethod
     def focal_loss_multi_channel_from_logits(
-            logits: torch.Tensor,   # (bs, L, C)  C=2 for start+stop
-            targets: torch.Tensor,  # (bs, L, C)
+            logits: torch.Tensor,   # (bs, L, 2)
+            targets: torch.Tensor,  # (bs, L, 2)
             mask: torch.Tensor,     # (bs, L) bool
-            alpha: Optional[float] = 0.25,
+            pos_weight: float = 50.0, 
             gamma: float = 2.0,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Vectorized focal loss over channels (bs, L, C).
-        NOTE: Do NOT pass pos_weight into binary_cross_entropy_with_logits here,
-              because we rely on p_t = exp(-bce) trick. Use alpha (per-class scalar) instead.
-        Returns scalar (mean over masked positions and channels, normalized).
+        使用 pos_weight 放大正样本的 Loss，同时使用 Focal 机制抑制易分类的背景负样本。
         """
         bs, L, C = logits.shape
-        # cast once
-        mask_f = mask.float()  # (bs, L)
-        # compute bce per-element for all channels in one call
-        # flatten last dim to let function treat it elementwise
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')   # (bs, L, C)
-        # p_t = exp(-bce) trick (valid when no pos_weight used)
-        p_t = torch.exp(-bce)  # (bs, L, C)
+        mask_f = mask.float().unsqueeze(-1)  # (bs, L, 1)
 
-        modulating_factor = (1.0 - p_t) ** gamma  # (bs, L, C)
+        # 1. 内部手动计算 probabilities，仅用于 Focal 调节因子 (安全运算)
+        probs = torch.sigmoid(logits)
 
-        alpha_factor = targets * alpha + (1.0 - targets) * (1.0 - alpha)  # (bs, L, C)
-        loss = alpha_factor * modulating_factor * bce  # (bs, L, C)
-
-        # apply mask -> expand mask to channels
-        loss = loss * mask_f.unsqueeze(-1)  # (bs, L, C)
-        denom = mask_f.sum().clamp_min(1.0) * C  # normalize by tokens * channels
-        # return start and stop loss seperately
-        return loss[:, :, 0].sum() / denom, loss[:, :, 1].sum() / denom
+        # 2. 计算 p_t (模型对真实标签的预测置信度)
+        p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
+        
+        # 3. 计算 Focal 调制因子 (1 - p_t)^gamma
+        modulating_factor = (1.0 - p_t) ** gamma
+        
+        # 4. 计算非对称权重：正样本权重为 pos_weight，负样本权重为 1.0
+        weight_matrix = targets * pos_weight + (1.0 - targets) * 1.0
+        
+        # 5. 计算基础的 BCE Loss (不做 reduction)
+        bce_unweighted = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        
+        # 6. 组合最终的 Loss： 权重 * Focal因子 * BCE
+        loss = weight_matrix * modulating_factor * bce_unweighted
+        
+        # 7. 应用 Mask 去除 Padding 区域的 Loss
+        loss = loss * mask_f
+        
+        # 8. 计算有效 token 数量进行归一化
+        denom = mask_f.sum().clamp_min(1.0)
+        
+        # 分别返回 Start (Channel 0) 和 Stop (Channel 1) 的 Loss
+        start_loss = loss[:, :, 0].sum() / denom
+        stop_loss = loss[:, :, 1].sum() / denom
+        
+        return start_loss, stop_loss
         
         
-    def binary_loss_with_mask(self,
-                              logits: torch.Tensor,
-                              targets: torch.Tensor,
-                              mask: torch.Tensor) -> torch.Tensor:
-        """
-        Compute BCEWithLogitsLoss per-element, apply mask (bool, same shape) and normalize by mask.sum()
-        logits, targets, mask: (bs, L)
-        """
-        per_elem = self.bceloss_in_orf(logits, targets)  # (bs, L)
-        # apply mask: mask is bool where True = valid token
-        per_elem = per_elem * mask.float()
-        total = per_elem.sum()
-        denom = mask.sum().float().clamp_min(1.0)
-        return total / denom  # normalized mean over valid tokens
-    
-
     def compute_coding_loss(self,
                             outputs: torch.Tensor,
                             targets: torch.Tensor,
                             pad_mask: torch.Tensor,
                             w_start: float = 1.0,
-                            w_stop: float = 1.0,
-                            w_inorf: float = 1.0) -> Tuple[torch.Tensor, list[torch.Tensor]]:
+                            w_stop: float = 1.0) -> Tuple[torch.Tensor, list[torch.Tensor]]:
         """
-        logits_dict: {'start','stop','in_orf'} logits (bs,L)
-        targets_dict: same keys but targets in {0,1} float tensors (bs,L)
-        pad_mask: bool tensor (bs,L) True = valid token
-        pos_weight: should be equal to (positive examples) / (negative examples). > 1 increase recall, < 1 increase precision
-        returns: total_loss, dict of component losses
+        预测 TIS 和 TTS 两个通道。
         """
-        output_logits = outputs["coding"]
+        # 取出模型的预测结果 (bs, L, 2)
+        output_logits  = outputs["coding"][:, :, 0:2]
+        target_labels = targets[:, :, 0:2]
 
-        # combined focal for start+stop (no pos_weight here; use alpha instead)
         start_loss, stop_loss = self.focal_loss_multi_channel_from_logits(
-            logits = output_logits[:,:,0:2],
-            targets = targets[:,:,0:2],
+            logits = output_logits,
+            targets = target_labels,
             mask = pad_mask,
-            alpha = self.alpha,
+            pos_weight = self.pos_weight,
             gamma = self.gamma
         )
-        # start_loss = self.focal_loss_from_logits(output_logits[:,:,0], targets[:,:,0], pad_mask, alpha=0.25, gamma=2)
-        # stop_loss  = self.focal_loss_from_logits(output_logits[:,:,1], targets[:,:,1], pad_mask, alpha=0.25, gamma=2)
-        inorf_loss = self.binary_loss_with_mask(output_logits[:,:,2], targets[:,:,2], pad_mask)
 
-        total = w_start * start_loss + w_stop * stop_loss + w_inorf * inorf_loss
-        return total, [w_start * start_loss, w_stop * stop_loss, w_inorf * inorf_loss]
+        total = w_start * start_loss + w_stop * stop_loss
+        
+        # 返回 total loss 供反向传播，返回列表供日志打印
+        return total, [w_start * start_loss, w_stop * stop_loss]
 
     
     # -------------------------
@@ -455,19 +446,39 @@ class FineTuningTrainer:
         batch_num = len(dataloader)
         start_time = time.time()
         self.sampler.set_epoch(epoch) # DDP
+        # 获取模型内置的 cell type 映射表，默认 Unknown 映射为 0
+        cell_mapping = unwrap_model(self.model).cell_type_mapping
 
         if self.rank == 0:
             pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} train")
 
         for batch_idx, batch_data in enumerate(dataloader):
             # move tensors to device
-            cell_idxs, seq_embs_padded, count_embs_padded, \
-                coding_embs_padded, pad_masks = [data.cuda(non_blocking=True) for data in batch_data]
+            cell_types, seq_embs_padded, count_embs_padded, coding_embs_padded, pad_masks = batch_data
+            
+            # [CHANGE] 15% 随机概率 Mask cell_type 为 "Unknown"
+            aug_cell_types = [
+                "Unknown" if random.random() < 0.15 else ct 
+                for ct in cell_types
+            ]
+            
+            # [CHANGE] 将字符串列表映射为模型可读的 LongTensor 索引
+            cell_idxs = torch.tensor(
+                [cell_mapping.get(ct, 0) for ct in aug_cell_types], 
+                dtype=torch.long, device=self.device
+            )
+
+            # 手动将其余张量移至 GPU
+            seq_embs_padded = seq_embs_padded.cuda(non_blocking=True)
+            count_embs_padded = count_embs_padded.cuda(non_blocking=True)
+            count_embs_padded = torch.zeros_like(count_embs_padded) # no Ribo-seq counts
+            coding_embs_padded = coding_embs_padded.cuda(non_blocking=True)
+            pad_masks = pad_masks.cuda(non_blocking=True)
 
             # run the forward pass with autocasting
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 outputs = self.model(seq_embs_padded, count_embs_padded, cell_idxs, pad_masks, ["coding"])
-                # three labels learning losses
+                # learning losses
                 loss, losses = self.compute_coding_loss(outputs, coding_embs_padded, pad_masks)
                 ## mean loss (dynamic weight average) for accumulation
                 acc_losses = loss / self.ac_steps
@@ -497,7 +508,7 @@ class FineTuningTrainer:
 
             if self.rank == 0 and (batch_idx + 1) % self._print_progress_every == 0:
                 pbar.update(self._print_progress_every)
-                print(f"loss: {losses}")
+                print(f"Loss: [Start: {losses[0]:.4f}, Stop: {losses[1]:.4f}]")
 
         if self.rank == 0:
             pbar.close()
@@ -534,14 +545,27 @@ class FineTuningTrainer:
         batch_num = len(val_loader)
         start_time = time.time()
         self.val_sampler.set_epoch(epoch) # DDP
+
+        # 获取 mapping
+        cell_mapping = unwrap_model(self.model).cell_type_mapping
     
         if self.rank == 0:
-                pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} evaluate")
+            pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} evaluate")
 
         for batch_idx, batch_data in enumerate(val_loader):
             # move tensors to device
-            cell_idxs, seq_embs_padded, count_embs_padded, \
-                coding_embs_padded, pad_masks = [data.cuda(non_blocking=True) for data in batch_data]
+            cell_types, seq_embs_padded, count_embs_padded, coding_embs_padded, pad_masks = batch_data
+            
+            cell_idxs = torch.tensor(
+                [cell_mapping.get(ct, 0) for ct in cell_types], 
+                dtype=torch.long, device=self.device
+            )
+
+            seq_embs_padded = seq_embs_padded.cuda(non_blocking=True)
+            count_embs_padded = count_embs_padded.cuda(non_blocking=True)
+            count_embs_padded = torch.zeros_like(count_embs_padded) # no Ribo-seq counts
+            coding_embs_padded = coding_embs_padded.cuda(non_blocking=True)
+            pad_masks = pad_masks.cuda(non_blocking=True)
 
             # run the forward pass with autocasting
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
@@ -554,7 +578,7 @@ class FineTuningTrainer:
 
             if self.rank == 0 and (batch_idx + 1) % self._print_progress_every == 0:
                 pbar.update(self._print_progress_every)
-                print(f"loss: {losses}") 
+                print(f"Loss: [Start: {losses[0]:.4f}, Stop: {losses[1]:.4f}]")
 
         if self.rank == 0:
             pbar.close()
@@ -595,7 +619,7 @@ class FineTuningTrainer:
 
             self.training_epoch_data.append({"epoch": epoch+1, "train_loss": float(train_loss), "valid_loss": float(val_loss)})
             self.training_batch_data.append({"epoch": epoch+1, 
-                                             "train_batch_loss": [x for proc in train_batch_loss for x in proc], 
+                                             "train_loss": [x for proc in train_batch_loss for x in proc], 
                                              "valid_loss": [x for proc in val_batch_loss for x in proc]})
 
             # save on master periodically

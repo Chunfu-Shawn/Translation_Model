@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from plotnine import *
-from eval.calculate_te import calculate_morf_efficiency, calculate_morf_mean_density 
+from eval.calculate_te import *
 
 class CCC_Motif_Evaluator:
     def __init__(self, model, out_dir="."):

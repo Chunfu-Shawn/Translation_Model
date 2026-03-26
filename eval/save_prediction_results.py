@@ -6,162 +6,248 @@ from tqdm import tqdm
 from typing import Union, List, Optional, Dict
 from torch.utils.data import DataLoader, Subset
 from torch.nn.utils.rnn import pad_sequence
-from utils import clean_up_memory
+from utils import clean_up_memory, unwrap_model
 from train.distributed_bucket_sampler import DistributedBucketSampler 
 
-def save_prediction_results(
-    model, 
+def _prepare_prediction_dataloader(
     dataset, 
-    num_samples: int = 200, 
-    batch_size: int = 16,
-    out_dir: str = "./results", 
-    suffix: str = "",
-    rank: Optional[int] = None,
+    collate_fn, 
+    num_samples: Optional[int], 
+    batch_size: int, 
+    rank: Optional[int] = None, 
     world_size: Optional[int] = None
 ):
     """
-    运行模型预测并保存结果 (兼容单机和分布式环境)。
+    处理单机/分布式环境判定、随机子集采样和 DataLoader 构建。
     """
-    os.makedirs(out_dir, exist_ok=True)
-    model.eval()
-
-    # --- 0. 自动处理分布式参数 ---
-    # 如果用户没有显式传入 rank/world_size，则根据当前环境自动判断
+    # --- 1. 自动处理分布式参数 ---
     if torch.distributed.is_initialized():
-        if rank is None:
-            rank = torch.distributed.get_rank()
-        if world_size is None:
-            world_size = torch.distributed.get_world_size()
+        rank = rank if rank is not None else torch.distributed.get_rank()
+        world_size = world_size if world_size is not None else torch.distributed.get_world_size()
     else:
-        # 非分布式环境 (Notebook 或 单卡脚本)
-        print("Distributed environment not detected. Running in single-process mode.")
-        if rank is None:
-            rank = 0
-        if world_size is None:
-            world_size = 1
+        rank = rank if rank is not None else 0
+        world_size = world_size if world_size is not None else 1
 
-    # --- 1. Determine file name ---
-    if world_size > 1:
-        file_name = f"predictions_seq.{model.model_name}.{suffix}.rank{rank}.pkl"
-    else:
-        file_name = f"predictions_seq.{model.model_name}.{suffix}.pkl"
-        
-    save_path = os.path.join(out_dir, file_name)
-    print(f"[Rank {rank}] Predictions will be saved to: {save_path}")
-
-    # --- 2. Select samples ---
+    # --- 2. 样本子集选择 ---
     all_indices = np.arange(len(dataset))
-    
     if num_samples is not None and len(all_indices) > num_samples:
         np.random.seed(42) 
         target_indices = np.random.choice(all_indices, num_samples, replace=False)
     else:
         target_indices = all_indices
         
-    print(f"[Rank {rank}] Selected {len(target_indices)} samples.")
-    
-    # Create Subset
+    print(f"[Rank {rank}] Selected {len(target_indices)} samples for inference.")
     subset = Subset(dataset, target_indices)
 
-    # --- 3. Prepare Bucket Sampler ---
-    # 获取 Subset 对应的长度
+    # --- 3. 准备 Bucket Sampler ---
     if hasattr(dataset, "lengths"):
         subset_lengths = [dataset.lengths[i] for i in target_indices]
     else:
-        # Fallback: 手动计算长度
-        print("Calculating lengths manually...")
-        subset_lengths = [len(dataset[i][3]) for i in target_indices]
+        # Fallback: 在两种 dataset 中，seq_emb 都在索引 3 的位置
+        print(f"[Rank {rank}] Calculating lengths manually...")
+        subset_lengths = [dataset[i][3].shape[0] for i in target_indices]
 
-    # 初始化 Sampler (关键：显式传入 num_replicas 和 rank)
     sampler = DistributedBucketSampler(
         lengths=subset_lengths,
         batch_size=batch_size,
-        num_replicas=world_size,  # 这里的 world_size 现在保证不是 None
-        rank=rank,                # 这里的 rank 现在保证不是 None
+        num_replicas=world_size, 
+        rank=rank,               
         shuffle=False, 
         drop_last=False
     )
 
-    # --- 4. Define Collate Function with UUID ---
-    def collate_fn(batch):
-        # 提取 UUID (假设 item[0] 是 UUID 字符串)
-        uuids = [item[0] for item in batch] 
-        cell_types = [str(item[0].split("-")[1]) if "-" in str(item[0]) else "Unknown" for item in batch]
-        
-        # 提取 Meta Info
-        cds_starts = [item[2].get("cds_start_pos", -1) for item in batch]
-        cds_ends = [item[2].get("cds_end_pos", -1) for item in batch]
-        depths = [item[2].get("depth", None) for item in batch]
-        coverages = [item[2].get("coverage", None) for item in batch]
-
-        # 提取 Tensors
-        seq_embs = [item[3] for item in batch]
-        count_embs = [item[4] for item in batch]
-        
-        lengths = [s.shape[0] for s in seq_embs]
-        
-        # Padding
-        seq_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
-        count_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
-        
-        return uuids, cell_types, seq_padded, count_padded, lengths, cds_starts, cds_ends, depths, coverages
-
-    # --- 5. DataLoader ---
+    # --- 4. 构建 DataLoader ---
     dataloader = DataLoader(
         subset, 
-        batch_sampler=sampler, # 使用 sampler
+        batch_sampler=sampler,
         collate_fn=collate_fn,
         num_workers=4,
         prefetch_factor=4,
         persistent_workers=True,
         pin_memory=True
     )
-
-    # --- 6. Inference Loop ---
-    saved_data = {} 
     
-    # 如果是 rank 0 且单机运行，显示进度条；多机环境下避免打印混乱可根据需要调整
-    iterator = tqdm(dataloader, desc=f"[Rank {rank}] Inferencing") if (rank == 0 or world_size == 1) else dataloader
+    return dataloader, rank, world_size
 
+
+# ==============================================================================
+# 预测函数 1: 专门用于 Count Head (P-site / 翻译动态性)
+# ==============================================================================
+def save_count_predictions(
+    model, 
+    dataset, 
+    num_samples: int = 200, 
+    batch_size: int = 16,
+    out_dir: str = "./results", 
+    suffix: str = "count",
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None
+):
+    os.makedirs(out_dir, exist_ok=True)
+    model.eval()
+    base_model = unwrap_model(model)
+
+    # --- Collate Function for Translation Dataset ---
+    def collate_fn_count(batch):
+        # 解包: uuid, cell_type_idx, meta_info, seq_emb, count_emb
+        uuids, cell_idxs, meta_infos, seq_embs, count_embs = zip(*batch)
+        lengths = [s.shape[0] for s in seq_embs]
+        
+        seq_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
+        count_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
+        cell_idxs = torch.stack(cell_idxs)
+        
+        return uuids, cell_idxs, meta_infos, seq_padded, count_padded, lengths
+
+    # 获取 DataLoader
+    dataloader, run_rank, run_world_size = _prepare_prediction_dataloader(
+        dataset, collate_fn_count, num_samples, batch_size, rank, world_size
+    )
+
+    # 确定文件名
+    model_name = getattr(base_model, "model_name", "model")
+    file_name = f"predictions_count.{model_name}.{suffix}"
+    file_name += f".rank{run_rank}.pkl" if run_world_size > 1 else ".pkl"
+    save_path = os.path.join(out_dir, file_name)
+
+    saved_data = {} 
+    iterator = tqdm(dataloader, desc=f"[Rank {run_rank}] Infer Count") if (run_rank == 0 or run_world_size == 1) else dataloader
+
+    # --- Inference Loop ---
     for batch_data in iterator:
-        b_uuids, b_cell_types, b_seq, b_count, b_lengths, b_cds_starts, b_cds_ends, b_depths, b_coverages = batch_data
+        b_uuids, b_cell_idxs, b_meta, b_seq, b_count, b_lengths = batch_data
         
-        b_seq = b_seq.to(model.device)
-        b_count = b_count.to(model.device)
+        b_seq = b_seq.to(base_model.device)
+        b_cell_idxs = b_cell_idxs.to(base_model.device)
         
-        masked_batch = torch.zeros_like(b_count)
+        # Count head 推理通常需要全零的 count 输入作为占位符
+        masked_batch = torch.zeros_like(b_count).to(base_model.device)
         src_mask = (b_seq[:, :, 0] != -1)
         
         with torch.no_grad():
-            out = model.predict(b_seq, masked_batch, b_cell_types, src_mask, head_names=["count"])
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                out = base_model.predict(b_seq, masked_batch, b_cell_idxs, src_mask, head_names=["count"])
             pred_batch = out["count"]
 
-        # Save per sample
+        # 解析并存储 (修改为嵌套字典结构)
         for i, uuid in enumerate(b_uuids):
             valid_len = b_lengths[i]
+            # 仅提取 pred
+            pred = pred_batch[i, :valid_len].squeeze().cpu().numpy().astype(np.float16)
             
-            # Ground Truth & Pred
-            gt = b_count[i, :valid_len].cpu().numpy().astype(np.float16)
-            pred_sample = pred_batch[i, :valid_len].squeeze().cpu().numpy().astype(np.float16)
+            # 解析 UUID 获取 tid 和 cell_type (例如: "ENST00000652508.1-liver-3")
+            parts = str(uuid).split('-')
+            tid = parts[0]
+            cell_type = parts[1] if len(parts) > 1 else "unknown"
+
+            # 嵌套字典赋值
+            if cell_type not in saved_data:
+                saved_data[cell_type] = {}
+            saved_data[cell_type][tid] = pred
+
+    # 统计预测结果数量
+    total_preds = sum(len(tids) for tids in saved_data.values())
+    print(f"[Rank {run_rank}] Saving {total_preds} Count predictions across {len(saved_data)} cell types to {save_path}")
+    
+    with open(save_path, 'wb') as f:
+        pickle.dump(saved_data, f)
+    
+    clean_up_memory()
+
+    return save_path
+
+
+# ==============================================================================
+# 预测函数 2: 专门用于 Coding Head (TIS / TTS 蛋白产物概率)
+# ==============================================================================
+def save_coding_predictions(
+    model, 
+    dataset, 
+    num_samples: int = 200, 
+    batch_size: int = 16,
+    out_dir: str = "./results", 
+    suffix: str = "coding",
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None
+):
+    os.makedirs(out_dir, exist_ok=True)
+    model.eval()
+    base_model = unwrap_model(model)
+    
+    # 提取细胞类型映射表
+    cell_mapping = getattr(base_model, "cell_type_mapping", {})
+
+    # --- Collate Function for Coding Dataset ---
+    def collate_fn_coding(batch):
+        # 解包: uuid, cell_type (string), seq_emb, count_emb, coding_emb
+        uuids, cell_types, seq_embs, count_embs, coding_embs = zip(*batch)
+        lengths = [s.shape[0] for s in seq_embs]
+        
+        seq_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
+        count_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
+        coding_padded = pad_sequence(coding_embs, batch_first=True, padding_value=-1)
+        
+        return uuids, list(cell_types), seq_padded, count_padded, coding_padded, lengths
+
+    # 获取 DataLoader
+    dataloader, run_rank, run_world_size = _prepare_prediction_dataloader(
+        dataset, collate_fn_coding, num_samples, batch_size, rank, world_size
+    )
+
+    # 确定文件名
+    model_name = getattr(base_model, "model_name", "model")
+    file_name = f"predictions_coding.{model_name}.{suffix}"
+    file_name += f".rank{run_rank}.pkl" if run_world_size > 1 else ".pkl"
+    save_path = os.path.join(out_dir, file_name)
+
+    saved_data = {} 
+    iterator = tqdm(dataloader, desc=f"[Rank {run_rank}] Infer Coding") if (run_rank == 0 or run_world_size == 1) else dataloader
+
+    # --- Inference Loop ---
+    for batch_data in iterator:
+        b_uuids, b_cell_types, b_seq, b_count, b_coding, b_lengths = batch_data
+        
+        # 处理 Cell Type 字符串到 Index 的映射
+        b_cell_idxs = torch.tensor(
+            [cell_mapping.get(ct, 0) for ct in b_cell_types], 
+            dtype=torch.long, device=base_model.device
+        )
+        
+        b_seq = b_seq.to(base_model.device)
+        b_count = b_count.to(base_model.device)
+        src_mask = (b_seq[:, :, 0] != -1)
+        
+        with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                # Coding 预测时正常输入 b_count，无需 Mask 占位符
+                out = base_model.predict(b_seq, b_count, b_cell_idxs, src_mask, head_names=["coding"])
             
-            # CDS Info
-            raw_start = b_cds_starts[i]
-            raw_end = b_cds_ends[i]
-            cds_info = {'start': int(raw_start), 'end': int(raw_end)} if (raw_start != -1) else None
+            # 模型输出的是 Logits，必须应用 Sigmoid 恢复为 0~1 的概率
+            probs_batch = torch.sigmoid(out["coding"])
 
-            saved_data[uuid] = {
-                'truth': gt,
-                'pred': pred_sample,
-                'cds_info': cds_info,
-                'depth': b_depths[i],
-                'coverage': b_coverages[i]
-            }
+        # 解析并存储 (修改为嵌套字典结构)
+        for i, uuid in enumerate(b_uuids):
+            valid_len = b_lengths[i]
+            cell_type = b_cell_types[i]
+            
+            # 仅提取 pred
+            pred = probs_batch[i, :valid_len].cpu().numpy().astype(np.float16)
 
-    # --- 7. Save ---
-    print(f"[Rank {rank}] Saving {len(saved_data)} transcripts to disk...")
+            # 获取纯粹的 tid
+            tid = str(uuid).split('-')[0]
+
+            # 嵌套字典赋值
+            if cell_type not in saved_data:
+                saved_data[cell_type] = {}
+            saved_data[cell_type][tid] = pred
+
+    # 统计预测结果数量
+    total_preds = sum(len(tids) for tids in saved_data.values())
+    print(f"[Rank {run_rank}] Saving {total_preds} Coding predictions across {len(saved_data)} cell types to {save_path}")
+    
     with open(save_path, 'wb') as f:
         pickle.dump(saved_data, f)
 
     clean_up_memory()
-    print(f"[Rank {rank}] Done.")
+
     return save_path

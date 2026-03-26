@@ -10,7 +10,7 @@ __author__ = "Chunfu Xiao"
 __contributor__="..."
 __version__="1.1.0"
 __maintainer__ = "Chunfu Xiao"
-__email__ = "chunfushawn@126.com"
+__email__ = "xiaochunfu@126.com"
 
 def array_defaultdict():
     return []

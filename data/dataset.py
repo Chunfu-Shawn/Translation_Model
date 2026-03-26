@@ -35,7 +35,7 @@ class TranslationDataset(Dataset):
         self.cell_type_idxs = dataset_dict["cell_type_idxs"]
         self.meta_info = dataset_dict["meta_info"]
         self.seq_embs = dataset_dict["seq_embs"]     # list of (L, 4)
-        self.count_embs = dataset_dict["count_embs"] # list of (L, 10)
+        self.count_embs = dataset_dict["count_embs"] # list of (L, 1)
         self.coding_embs = dataset_dict["coding_embs"] # list of (L//3, 3)
         self.lengths = [int(emb.shape[0]) for emb in self.seq_embs]
         self.n_samples = len(self.lengths)
@@ -82,7 +82,7 @@ class TranslationDataset(Dataset):
                                 "coverage": np.float16(grp.attrs.get("coverage", -1)),
                             })
                         data["seq_embs"].append(f["sequences"][tid][:]) # (L, 4)
-                        data["count_embs"].append(grp["count_emb"][:]) # (L, 10)
+                        data["count_embs"].append(grp["count_emb"][:]) # (L, 1)
                         data["coding_embs"].append(grp["coding_emb"][:])
                 return cls(data)
             except FileNotFoundError:
@@ -142,7 +142,7 @@ class TranslationDataset(Dataset):
                 "coverage": np.float16(grp.attrs.get("coverage", -1))
                 }
             seq_emb = torch.from_numpy(self._h5_handle["sequences"][tid][:]).float() # (L, 4)
-            count_emb = torch.from_numpy(grp["count_emb"][:]).float() # (L, 10)
+            count_emb = torch.from_numpy(grp["count_emb"][:]).float() # (L, 1)
             coding_emb = torch.from_numpy(grp["coding_emb"][:]).float()
                                    
             return uuid, cell_type_idx, meta_info, seq_emb, count_emb, coding_emb

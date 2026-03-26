@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import torch
-from eval.calculate_te import calculate_morf_efficiency
+from eval.calculate_te import *
 
 class uORFEvaluatorEmb:
     def __init__(self, model, out_dir="."):

@@ -5,7 +5,7 @@ import os
 from tqdm import tqdm
 from plotnine import *
 from scipy.stats import spearmanr, pearsonr
-from eval.calculate_te import calculate_morf_efficiency, calculate_morf_mean_efficiency, calculate_morf_mean_density
+from eval.calculate_te import *
 
 
 # --- 2. Feature Extraction Function ---

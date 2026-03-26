@@ -1,0 +1,161 @@
+import sys
+sys.path.append("/home/user/data3/rbase/translation_model/models/src")
+import numpy as np
+import torch
+import pickle
+import json
+from torch.utils.data import Dataset
+
+# optinal
+try:
+    import h5py
+    HAS_H5 = True
+except Exception:
+    HAS_H5 = False
+
+__author__ = "Chunfu Xiao"
+__contributor__="..."
+__copyright__ = ""
+__credits__ = []
+__license__ = ""
+__version__="1.1.0"
+__maintainer__ = "Chunfu Xiao"
+__email__ = "xiaochunfu@126.com"
+
+
+class TranslationDataset(Dataset):
+    """
+    Support two mothods to create:
+    - directly provide dataset_dict (from memory)
+    - 使用类方法 from_pickle / from_h5 从磁盘加载
+    """
+    def __init__(self, dataset_dict):
+        self.uuids = dataset_dict["uuids"]
+        self.cell_type_idxs = dataset_dict["cell_type_idxs"]
+        self.meta_info = dataset_dict["meta_info"]
+        self.seq_embs = dataset_dict["seq_embs"]     # list of (L, 4)
+        self.count_embs = dataset_dict["count_embs"] # list of (L, 1)
+        self.lengths = [int(emb.shape[0]) for emb in self.seq_embs]
+        self.n_samples = len(self.uuids)
+        self.cell_type_counts = dataset_dict.get("cell_type_counts", {})
+    
+    @classmethod
+    def from_pickle(cls, path):
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            # 如果存的是 numpy arrays，就可以直接给构造函数使用
+            return cls(data)
+        except FileNotFoundError:
+            print(f"### Error: No such file: {path} ! ###")
+       
+    @classmethod
+    def from_h5(cls, path, lazy=False):
+        if not HAS_H5:
+            raise ImportError("h5py not available. Install it or use pickle format.")
+        if not lazy:
+            # 读取所有样本到内存（safe but memory heavy）
+            data = {
+                "uuids": [],
+                "cell_type_idxs": [],
+                "meta_info": [],
+                "seq_embs": [],
+                "count_embs": []
+            }
+            try:
+                with h5py.File(path, "r") as f:
+                    try:
+                        data["cell_type_counts"] = json.loads(f.attrs.get("cell_type_counts", "{}"))
+                    except:
+                        data["cell_type_counts"] = {}
+
+                    for uuid in f["samples"].keys():
+                        grp = f["samples"][uuid]
+                        tid = grp.attrs.get("tid", -1)
+                        # [:] is requested, data eager
+                        data["uuids"].append(str(uuid))
+                        data["cell_type_idxs"].append(np.int16(grp.attrs.get("cell_type_idx", -1)))
+                        data["meta_info"].append(
+                            {
+                                "cds_start_pos": np.int16(grp.attrs.get("cds_start_pos", -1)),
+                                "cds_end_pos": np.int16(grp.attrs.get("cds_end_pos", -1)),
+                                "motif_occ": list(grp.attrs.get("motif_occ", None)),
+                                "rpf_depth": np.float32(grp.attrs.get("rpf_depth", -1)),
+                                "rpf_coverage": np.float32(grp.attrs.get("rpf_coverage", -1)),
+                                "te_val": np.float32(grp.attrs.get("te_val", -1))
+                            })
+                        data["seq_embs"].append(f["sequences"][tid][:]) # (L, 4)
+                        data["count_embs"].append(grp["count_emb"][:]) # (L, 1)
+                return cls(data)
+            except FileNotFoundError:
+                print(f"### Error: No such file: {path} ! ###")
+        else:
+            # Lazy model：将 h5 文件路径记录下来，按需读取（注意：DataLoader 多 worker 时需特殊处理）
+            obj = object.__new__(cls)
+            obj._h5_path = path
+            obj._h5_handle = None
+            obj._lazy = True
+
+            # 读取索引 (idxs + lengths）到内存
+            uuids = []
+            lengths = []
+            try:
+                with h5py.File(path, "r") as f:
+                    obj.n_samples = f.attrs.get("n_samples", -1)
+                    obj.cell_type_counts = json.loads(f.attrs.get("cell_type_counts", "{}"))
+                    for uuid in f["samples"].keys():
+                        uuids.append(str(uuid))
+                        lengths.append(int(f["samples"][uuid]["count_emb"].shape[0]))
+            except FileNotFoundError:
+                print(f"### Error: No such file: {path} ! ###")
+            obj.uuids = uuids
+            obj.lengths = lengths
+            # placeholders; actual data read in __getitem__
+            obj.seq_embs = None
+            obj.count_embs = None
+            obj.meta_info = None
+            obj.cell_type_idxs = None
+            return obj
+
+    def _open_h5(self):
+        # 打开文件句柄（为 DataLoader worker-safe，可以在每个 worker 初始化时调用）
+        if getattr(self, "_lazy", False):
+            if self._h5_handle is None:
+                self._h5_handle = h5py.File(self._h5_path, "r")
+    
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        # return tensor
+        if getattr(self, "_lazy", False):
+            # lazy h5 读取
+            self._open_h5()
+            uuid = self.uuids[idx]
+            grp = self._h5_handle["samples"][uuid]
+            tid = grp.attrs.get("tid", -1)
+            cell_type_idx = torch.tensor(int(grp.attrs.get('cell_type_idx', -1)), dtype=torch.long)
+            meta_info = {
+                "cds_start_pos": np.int16(grp.attrs.get("cds_start_pos", -1)),
+                "cds_end_pos": np.int16(grp.attrs.get("cds_end_pos", -1)),
+                "motif_occ": list(grp.attrs.get("motif_occ", None)),
+                "rpf_depth": np.float32(grp.attrs.get("rpf_depth", -1)),
+                "rpf_coverage": np.float32(grp.attrs.get("rpf_coverage", -1)),
+                "te_val": np.float32(grp.attrs.get("te_val", -1))
+                }
+            seq_emb = torch.from_numpy(self._h5_handle["sequences"][tid][:]).float() # (L, 4)
+            count_emb = torch.from_numpy(grp["count_emb"][:]).float() # (L, 1)
+                                   
+            return uuid, cell_type_idx, meta_info, seq_emb, count_emb
+
+        # otherwise load from memory（self.dataset)
+        uuid = str(self.uuids[idx])
+        cell_type_idx = torch.tensor(int(self.cell_type_idxs[idx]), dtype=torch.long)
+        meta_info = dict(self.meta_info[idx])
+        seq_emb = torch.from_numpy(self.seq_embs[idx]).float()
+        count_emb = torch.from_numpy(self.count_embs[idx]).float()
+
+        return uuid, cell_type_idx, meta_info, seq_emb, count_emb
+    
+    def get_identifier(self, idx):
+        return self.uuids[idx]

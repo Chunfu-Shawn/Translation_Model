@@ -255,7 +255,7 @@ class AddAdaLayerNorm(nn.Module):
     """
     Adaptive Layer Normalization with Gating (adaLN-Zero).
     Replaces AddNormLayer.
-    Structure: Residual + alpha * Dropout(Sublayer(gamma * LN(x) + beta))
+    Structure: Residual +  Dropout(Sublayer(gamma * LN(x) + beta))
     """
     def __init__(self, d_model, p_drop, num_classes):
         super().__init__()
@@ -265,16 +265,13 @@ class AddAdaLayerNorm(nn.Module):
         # Standard LayerNorm without learnable parameters (elementwise_affine=False)
         self.LN = nn.LayerNorm(d_model, elementwise_affine=False)
         
-        # Embedding to generate gamma (scale), beta (shift) and alpha (scale for ResNet)
-        # Input: cell_id -> Output: 3 * d_model (split into gamma, beta and alpha)
-        self.embed = nn.Embedding(num_classes, d_model * 3) 
+        # Embedding to generate gamma (scale), beta (shift) 
+        # Input: cell_id -> Output: 2 * d_model (split into gamma, beta)
+        self.embed = nn.Embedding(num_classes, d_model * 2) 
         
         # Initialize embedding weights
         # Zero-centered initialization for stability (adaLN-Zero)
         nn.init.normal_(self.embed.weight, mean=0.0, std=0.02)
-        # Initialize alpha to 0 (last part of d_model)
-        with torch.no_grad():
-            self.embed.weight.data[:, 2*d_model:] = 0.0
 
     def forward(self, reps_batch, sublayer_module, cell_id):
         """
@@ -286,21 +283,77 @@ class AddAdaLayerNorm(nn.Module):
         # 1. Generate adaptive parameters
         style = self.embed(cell_id) # [Batch, 3*Dim]
         # Split into 3 parts
-        gamma, beta, alpha = style.chunk(3, dim=-1) # Each is [Batch, Dim]
+        gamma, beta = style.chunk(2, dim=-1) # Each is [Batch, Dim]
         
         # Expand dimensions for broadcasting: (Batch, 1, Dim)
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)
-        alpha = alpha.unsqueeze(1)
         
         # 2. Apply Adaptive Norm (Pre-Norm)
         # norm = gamma * LN(x) + beta
         normed = gamma * self.LN(reps_batch) + beta
         
         # 3. Apply Sublayer -> Dropout -> Gating -> Residual
-        # Note: alpha scales the entire residual branch
         output = self.dropout(sublayer_module(normed))
         
+        return reps_batch + output
+
+
+class AddAdaZeroLayerNorm(nn.Module):
+    """
+    Adaptive Layer Normalization with Gating (adaLN-Zero) with Information Bottleneck.
+    Structure: Residual + alpha * Dropout(Sublayer((1 + gamma) * LN(x) + beta))
+    """
+    def __init__(self, d_model, p_drop, num_classes, adaptive_dim=32):
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(p=p_drop)
+        
+        # Standard LayerNorm without learnable parameters
+        self.LN = nn.LayerNorm(d_model, elementwise_affine=False)
+        
+        # --- 修改点 1：引入 Information Bottleneck ---
+        # 第一步：将 Cell ID 映射到低维紧凑空间
+        self.cell_embed = nn.Embedding(num_classes, adaptive_dim)
+        
+        # 第二步：将低维特征投影回需要的调制维度 (d_model * 3)
+        # 很多现代架构 (如 DiT) 会在这里加一个非线性激活函数，增强表达能力同时保持信息压缩
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), 
+            nn.Linear(adaptive_dim, d_model * 3)
+        )
+        
+        # --- 修改点 2：更健壮的 Zero-Initialization ---
+        # 我们不再单独清零某一部分，而是直接将最后一步线性层的权重和偏置全部初始化为 0。
+        # 这样输出的 gamma, beta, alpha 初始状态全部为 0。
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def forward(self, reps_batch, sublayer_module, cell_id):
+        # 1. Generate adaptive parameters
+        compact_style = self.cell_embed(cell_id)            
+        style = self.adaLN_modulation(compact_style)        
+        
+        gamma, beta, alpha = style.chunk(3, dim=-1)         
+        
+        # ==========================================
+        # 限制 gamma 的幅度，防止特征坍塌
+        # torch.tanh 将输出限制在 (-1, 1)，乘以 0.7 后限制在 (-0.5, 0.5)
+        # 这样 1 + gamma 永远在 (0.5, 1.5) 之间，输入信号绝对不会被抹杀
+        # ==========================================
+        gamma = torch.tanh(gamma) * 0.5
+        
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
+        alpha = alpha.unsqueeze(1)
+        
+        # 2. Apply Adaptive Norm (Pre-Norm)
+        normed = (1 + gamma) * self.LN(reps_batch) + beta
+        
+        # 3. Apply Sublayer -> Dropout -> Gating -> Residual
+        output = self.dropout(sublayer_module(normed))
+        
+        # 初始化时 alpha 为 0，所以初始状态是纯净的残差连接
         return reps_batch + (alpha * output)
     
     
@@ -413,6 +466,37 @@ class AdaEncoderLayer(nn.Module):
         src_reps = self.sublayers[1](src_reps, self.ffn, cell_id)
 
         return src_reps
+
+
+class AdaZeroEncoderLayer(nn.Module):
+    """
+    Encoder Layer using Adaptive Layer Normalization.
+    """
+    def __init__(self, d_model, d_ff, heads, p_drop, num_classes, adaptive_dim):
+        super().__init__()
+        # Use ModuleList for correct parameter registration
+        # Layer 0: For Self-Attention wrapper
+        # Layer 1: For FFN wrapper
+        self.sublayers = replicate_module(AddAdaZeroLayerNorm(d_model, p_drop, num_classes, adaptive_dim), 2)
+        self.multi_headed_attention = FlashMultiHeadedAttention(d_model, heads, p_drop)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff)
+        self.d_model = d_model
+
+    def forward(self, src_reps, src_mask, cell_id):
+        """
+        Added cell_id argument.
+        """
+        # Define anonymous function for self-attention
+        encoder_self_attention = lambda srb: self.multi_headed_attention(srb, srb, attention_mask=src_mask)
+
+        # 1. Self-Attention Block with AdaLN
+        # Note: We pass cell_id to sublayer
+        src_reps = self.sublayers[0](src_reps, encoder_self_attention, cell_id)
+        
+        # 2. FFN Block with AdaLN
+        src_reps = self.sublayers[1](src_reps, self.ffn, cell_id)
+
+        return src_reps
     
 
 # Part2: =================== Encoder ======================
@@ -429,7 +513,7 @@ class Encoder(nn.Module):
         
         for encoder_layer in self.encoder_layers:
             src_reps = encoder_layer(src_reps, src_mask)
-        return self.LN(src_reps) # Using LN. not mentioned explicitly in the paper.
+        return self.LN(src_reps)
 
 class InterleavedEncoder(nn.Module):
     """
@@ -456,14 +540,11 @@ class AdaEncoder(nn.Module):
     """
     Stack of AdaEncoderLayers.
     """
-    def __init__(self, encoder_layer, number_of_layers, num_classes):
+    def __init__(self, encoder_layer, number_of_layers):
         super().__init__()
         self.encoder_layers = replicate_module(encoder_layer, number_of_layers)
-        
-        # Final normalization also needs to be adaptive to maintain cell context
-        self.final_ln = nn.LayerNorm(encoder_layer.d_model, elementwise_affine=False)
-        self.final_embed = nn.Embedding(num_classes, encoder_layer.d_model * 2)
-        nn.init.normal_(self.final_embed.weight, mean=0.0, std=0.02)
+        # Final normalization no needs to be adaptive to maintain cell context
+        self.LN = nn.LayerNorm(encoder_layer.d_model)
 
     def forward(self, src_embs, src_mask, cell_id):
         """
@@ -473,11 +554,4 @@ class AdaEncoder(nn.Module):
         
         for encoder_layer in self.encoder_layers:
             src_reps = encoder_layer(src_reps, src_mask, cell_id)
-            
-        # Final Adaptive Normalization
-        style = self.final_embed(cell_id) # [Batch, 2*Dim]
-        gamma, beta = style.chunk(2, dim=-1)
-        gamma = gamma.unsqueeze(1)
-        beta = beta.unsqueeze(1)
-        
-        return gamma * self.final_ln(src_reps) + beta
+        return self.LN(src_reps)
