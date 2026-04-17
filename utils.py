@@ -113,5 +113,53 @@ def inspect_adaln_weights(model):
         
     print("\n==============================================")
 
-# 调用方式：
-# inspect_adaln_weights(your_loaded_model)
+
+def freeze_encoder_for_finetuning(model: nn.Module, trainable_keywords: list = None):
+    """
+    冻结模型的大部分参数，仅开放匹配关键字的层。
+    
+    Args:
+        model: 你的 PyTorch 模型
+        trainable_keywords: 需要保持可训练的层名称关键字列表。
+    """
+    # 如果没有指定关键字，提供一组默认的常见命名
+    if trainable_keywords is None:
+        trainable_keywords = [
+            "adaln",           # AdaLN 相关的映射网络
+            "modulator",       # 有时 AdaLN 的网络被命名为 modulator
+            "cell_embed",      # 细胞类型的 Embedding 层
+            "cell_type",       # 细胞类型的另一种常见命名
+            "head",            # 输出预测头 (例如 seq_head, count_head)
+            "out_proj",        # 最后的线性映射层
+            "classifier"       # 分类器头
+        ]
+    
+    print("=== Stage 2: Freezing Model Parameters ===")
+    
+    # 第一步：暴力冻结模型的所有参数
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # 第二步：遍历所有参数的名称，如果包含关键字，则重新解冻
+    unfrozen_count = 0
+    frozen_count = 0
+    unfrozen_names = []
+    
+    for name, param in model.named_parameters():
+        # 转换为小写进行不区分大小写的匹配
+        name_lower = name.lower()
+        if any(keyword in name_lower for keyword in trainable_keywords):
+            param.requires_grad = True
+            unfrozen_count += param.numel()
+            unfrozen_names.append(name)
+        else:
+            frozen_count += param.numel()
+
+    # 打印冻结和解冻的统计信息，确保没有冻错
+    print(f"-> Frozen Parameters: {frozen_count:,} (Backbone)")
+    print(f"-> Trainable Parameters: {unfrozen_count:,} (AdaLN, Embeddings, Heads)")
+    print("-> Unfrozen Layers List:")
+    for name in unfrozen_names:
+        print(f"   - {name}")
+        
+    return model

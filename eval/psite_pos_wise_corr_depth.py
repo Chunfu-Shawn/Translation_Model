@@ -248,19 +248,17 @@ def calculate_correlations_multitissue(
     
     print(f"\n>>> Evaluating transcripts in the Dataset (CDS Only: {for_cds})...")
     for i in tqdm(range(len(dataset))):
-        uuid, cell_type_idx, meta_info, seq_emb, count_emb = dataset[i]
+        uuid, cell_type, cell_type_idx, meta_info, seq_emb, count_emb = dataset[i]
         uuid_str = str(uuid)
         
         parts = uuid_str.split('-')
         if len(parts) < 2:
             continue
-            
         tid = parts[0]
-        cell_type = parts[1]
         
         if cell_type not in all_predictions:
             continue
-            
+        
         predictions = all_predictions[cell_type]
         
         lookup_tid = tid
@@ -270,7 +268,7 @@ def calculate_correlations_multitissue(
                 lookup_tid = tid_no_version
             else:
                 continue
-                
+        
         # 3. Retrieve signals and flatten
         pred_signal = predictions[lookup_tid]
         gt_signal = count_emb.numpy().flatten()
@@ -368,7 +366,7 @@ def calculate_correlations_multitissue(
     
     return df
 
-def plot_depth_vs_correlation(df, out_dir, x_col="Depth", y_col="Pearson_R", suffix=".", max_points=10000):
+def plot_scatter_depth_vs_correlation(df, out_dir, x_col="Depth", y_col="Pearson_R", suffix=".", max_points=10000):
     """
     使用 plotnine 绘制 Depth vs Correlation。
     修复了 float16 indexes are not supported 报错。

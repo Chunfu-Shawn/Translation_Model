@@ -62,6 +62,18 @@ def calculate_morf_median_signal(density_array, m_start, m_end, eps=1e-6):
 
     return morf_median
 
+def calculate_sum_signal(density_array, m_start, m_end, eps=1e-6):
+    """
+    计算总翻译负载
+    """
+    if m_start >= len(density_array): 
+        return 0.0
+    valid_end = min(len(density_array), m_end)
+    if m_start >= valid_end: 
+        return 0.0
+    
+    return np.sum(density_array[m_start:valid_end]) + eps
+
 def calculate_mean_signal(density_array, eps=1e-6):
     """
     计算平均翻译效率

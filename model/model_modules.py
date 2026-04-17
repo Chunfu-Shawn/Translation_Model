@@ -304,9 +304,10 @@ class AddAdaZeroLayerNorm(nn.Module):
     Adaptive Layer Normalization with Gating (adaLN-Zero) with Information Bottleneck.
     Structure: Residual + alpha * Dropout(Sublayer((1 + gamma) * LN(x) + beta))
     """
-    def __init__(self, d_model, p_drop, num_classes, adaptive_dim=32):
+    def __init__(self, d_model, p_drop, num_classes, adaptive_dim=16, gamma_scale=0.2):
         super().__init__()
         self.d_model = d_model
+        self.gamma_scale = gamma_scale
         self.dropout = nn.Dropout(p=p_drop)
         
         # Standard LayerNorm without learnable parameters
@@ -338,10 +339,10 @@ class AddAdaZeroLayerNorm(nn.Module):
         
         # ==========================================
         # 限制 gamma 的幅度，防止特征坍塌
-        # torch.tanh 将输出限制在 (-1, 1)，乘以 0.7 后限制在 (-0.5, 0.5)
-        # 这样 1 + gamma 永远在 (0.5, 1.5) 之间，输入信号绝对不会被抹杀
+        # torch.tanh 将输出限制在 (-1, 1)，乘以 0.2 后限制在 (-0.2, 0.2)
+        # 这样 1 + gamma 永远在 (0.8, 1.2) 之间，输入信号绝对不会被抹杀
         # ==========================================
-        gamma = torch.tanh(gamma) * 0.5
+        gamma = torch.tanh(gamma) * self.gamma_scale
         
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)
@@ -355,7 +356,6 @@ class AddAdaZeroLayerNorm(nn.Module):
         
         # 初始化时 alpha 为 0，所以初始状态是纯净的残差连接
         return reps_batch + (alpha * output)
-    
     
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, d_ff, heads, p_drop):
@@ -472,12 +472,12 @@ class AdaZeroEncoderLayer(nn.Module):
     """
     Encoder Layer using Adaptive Layer Normalization.
     """
-    def __init__(self, d_model, d_ff, heads, p_drop, num_classes, adaptive_dim):
+    def __init__(self, d_model, d_ff, heads, p_drop, num_classes, adaptive_dim, gamma_scale):
         super().__init__()
         # Use ModuleList for correct parameter registration
         # Layer 0: For Self-Attention wrapper
         # Layer 1: For FFN wrapper
-        self.sublayers = replicate_module(AddAdaZeroLayerNorm(d_model, p_drop, num_classes, adaptive_dim), 2)
+        self.sublayers = replicate_module(AddAdaZeroLayerNorm(d_model, p_drop, num_classes, adaptive_dim, gamma_scale), 2)
         self.multi_headed_attention = FlashMultiHeadedAttention(d_model, heads, p_drop)
         self.ffn = PositionwiseFeedForward(d_model, d_ff)
         self.d_model = d_model

@@ -224,14 +224,43 @@ def load_index(filename):
     return index
 
 if __name__=="__main__":
-    gtf_file = '/home/user/data3/rbase/genome_ref/Homo_sapiens/hg38/gencode.v48.comp_annotation_chro.gtf'
-    tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.pkl'
-    tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.pkl'
-    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
-    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.pkl'
+    # gtf_file = '/home/user/data3/rbase/genome_ref/Homo_sapiens/hg38/gencode.v48.comp_annotation_chro.gtf'
+    # tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.pkl'
+    # tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.pkl'
+    # tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl'
+    # tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.pkl'
+    
+    # # build index
+    # tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.db')
+
+    # # save
+    # with open(tree_index_file, 'wb') as f:
+    #     pickle.dump(tree_index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tree_strand_index_file, 'wb') as f:
+    #     pickle.dump(tree_strand_index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tx_meta_file, 'wb') as f:
+    #     pickle.dump(tx_meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tx_cds_file, 'wb') as f:
+    #     pickle.dump(tx_cds, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # # load
+    # with open(tx_cds_file, 'rb') as f:
+    #     loaded_tx_cds = pickle.load(f)
+
+    # for tid in loaded_tx_cds:
+    #     print(tid)
+    #     print(loaded_tx_cds[tid])
+
+    # In-house PacBio
+
+    gtf_file = '/home/user/data3/lit/project/sORFs/08-Iso-seq-20250717/results/custom.gtf.with_orf.gtf'
+    tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.inhouse.pkl'
+    tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.inhouse.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.inhouse.pkl'
+    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.inhouse.pkl'
     
     # build index
-    tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.db')
+    tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.inhouse.db')
 
     # save
     with open(tree_index_file, 'wb') as f:
@@ -242,11 +271,3 @@ if __name__=="__main__":
         pickle.dump(tx_meta, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(tx_cds_file, 'wb') as f:
         pickle.dump(tx_cds, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    # load
-    with open(tx_cds_file, 'rb') as f:
-        loaded_tx_cds = pickle.load(f)
-
-    for tid in loaded_tx_cds:
-        print(tid)
-        print(loaded_tx_cds[tid])

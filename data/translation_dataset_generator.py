@@ -4,6 +4,7 @@ import numpy as np
 import math
 import json
 import ahocorasick
+import torch
 from tqdm import tqdm
 from typing import Literal
 from data.RPF_counter_v3 import *
@@ -17,7 +18,7 @@ except Exception:
     HAS_H5 = False
 
 __author__ = "Chunfu Xiao"
-__version__="1.1.0"
+__version__="1.2.0"
 __email__ = "xiaochunfu@126.com"
 
 def load_motifs_from_file(motif_file_path):
@@ -151,7 +152,7 @@ class DatasetGenerator():
 
         region_l = end_idx - start_idx
         if region_l <= 0:
-            return np.array([]), 0.0, 0.0
+            return np.array([]), 0.0, 0.0, 0.0, 0.0
 
         # 将 (L, 10) 压缩为 (L,) 的 1D 数组
         pos_counts_1d = arr.sum(axis=1) if arr.ndim == 2 else arr.flatten()
@@ -159,6 +160,12 @@ class DatasetGenerator():
 
         depth_full = pos_counts_1d.sum() / seq_l
         depth = region_arr.sum() / region_l
+
+        # 利用 Numpy 步长切片快速计算 Frame 0 reads 占比
+        if has_valid_cds and region_arr.sum() > 0:
+            frame0_ratio = region_arr[0::3].sum() / region_arr.sum()
+        else:
+            frame0_ratio = 0.0
 
         # 向量化 Coverage 计算 (每 3 个核苷酸一组求和，看有几个组大于0)
         n_put_codon = math.ceil(region_l / 3)
@@ -168,9 +175,9 @@ class DatasetGenerator():
         codons = region_arr_padded.reshape(-1, 3).sum(axis=1)
         coverage = np.count_nonzero(codons) / n_put_codon if n_put_codon > 0 else 0
 
-        return pos_counts_1d, depth, depth_full, coverage
+        return pos_counts_1d, depth, depth_full, coverage, frame0_ratio
     
-    def compute_sample_te(self, ribo_arr_dict, rna_count_dict, depth_threshold, coverage_threshold, rpm_threshold=1):
+    def compute_sample_te(self, ribo_arr_dict, rna_count_dict, depth_threshold, coverage_threshold, rpm_threshold=1, periodicity=0.33):
         """
         接收已经 Winsorized 过的 numpy dict, 计算 TE。
         """
@@ -198,11 +205,12 @@ class DatasetGenerator():
 
             seq_l = len(self.seq_dict[tid])
             
-            pos_1d_ribo, d_ribo, d_ribo_full, c_ribo = self.data_quality_eval(seq_l, ribo_arr, cds_s, cds_e, has_valid_cds)
+            pos_1d_ribo, d_ribo, d_ribo_full, c_ribo, f0_ratio = self.data_quality_eval(seq_l, ribo_arr, cds_s, cds_e, has_valid_cds)
 
             # 阈值过滤
             if has_valid_cds:
-                if d_ribo < min(2, depth_threshold * 3.0) or c_ribo < min(1, coverage_threshold * 3.0): 
+                # 在过滤条件中增加 f0_ratio <= 0.33 判断
+                if d_ribo < min(2, depth_threshold * 3.0) or c_ribo < min(1, coverage_threshold * 3.0) or f0_ratio <= periodicity: 
                     continue
             else:
                 if d_ribo < depth_threshold or c_ribo < coverage_threshold: 
@@ -253,12 +261,13 @@ class DatasetGenerator():
             depth: float = 0.0,
             coverage: float = 0.0,
             rpm: float = 1.0,
-            mask_cell_type: bool = False,
+            expr_dict_path: str = None,
             keep_read_len: bool = False,
-            out_path="dataset.pkl", 
-            fmt="pickle"):
+            out_path="dataset.h5"
+            ):
         """
         Generate and save dataset prepared for model from multiple samples using config dicts.
+        If `expr_dict_path` is provided, fetches the specific continuous vector for that cell_type.
         """
 
         datasets = {
@@ -266,24 +275,41 @@ class DatasetGenerator():
                 "uuids": [], "tids": [], "seq_embs": {}, "count_embs": [], 
                 "rpf_depth": [], "rpf_coverage": [], "te_val": [],
                 "cds_start_pos": [], "cds_end_pos": [],
-                "motif_occs": [], "cell_types": [], "cell_type_idxs" : []
+                "motif_occs": [], "cell_types": [], 
+                "cell_expr_dict" : {}
             } for group in self.chrom_groups
         }
         
-        # [CHANGE] Validate dataset_config
         if not dataset_config:
             print("### Dataset config is empty! ###")
             return False
 
-        # [CHANGE] Extract cell_type from config, get unique values, and PRESERVE order
-        # dict.fromkeys() keeps the insertion order, unlike set()
         raw_cell_types = [item["cell_type"] for item in dataset_config]
         all_cell_types = list(dict.fromkeys(raw_cell_types))
         
-        if mask_cell_type:
-            cell_type_mapping = dict(zip(all_cell_types, [0]*len(all_cell_types))) # all cell type idx = 0
+        # ==========================================
+        # Pre-load the Cell Expression Dictionary
+        # ==========================================
+        cell_expr_mapping = {}
+        mean_expr_vector = None
+        if expr_dict_path and os.path.exists(expr_dict_path):
+            print(f"### Loading continuous expression profiles from: {expr_dict_path} ###")
+            if expr_dict_path.endswith('.pt'):
+                # Load via PyTorch
+                loaded_dict = torch.load(expr_dict_path, map_location="cpu")
+                # Convert to fp16 numpy for lightweight saving
+                cell_expr_mapping = {k: v.numpy().astype(np.float16) for k, v in loaded_dict.items()}
+            elif expr_dict_path.endswith('.pkl'):
+                with open(expr_dict_path, 'rb') as f:
+                    cell_expr_mapping = pickle.load(f)
+            else:
+                raise ValueError("Unsupported expr_dict format. Use .pt or .pkl")
+            
+            # Calculate the mean vector for fallbacks
+            all_vecs = list(cell_expr_mapping.values())
+            mean_expr_vector = np.mean(all_vecs, axis=0).astype(np.float16) if all_vecs else None
         else:
-            cell_type_mapping = dict(zip(all_cell_types, range(1, len(all_cell_types) + 1)))
+            print("### WARNING: No expr_dict_path provided or file missing. Expression vectors will not be saved. ###")
 
         print(f"### Load count, transcriptome and coding data from {len(dataset_config)} samples ###")
         print(f"### Cell types: {all_cell_types} ###")
@@ -309,6 +335,18 @@ class DatasetGenerator():
                 ribo_arr_dict, rna_count_dict, depth, coverage, rpm
                 )
 
+            # ==========================================
+            # Resolve the expression vector for the current cell_type
+            # ==========================================
+            current_expr_vector = None
+            if cell_expr_mapping:
+                current_expr_vector = cell_expr_mapping.get(cell_type, mean_expr_vector)
+            
+            if current_expr_vector is not None:
+                for group in datasets:
+                    if cell_type not in datasets[group]["cell_expr_dict"]:
+                        datasets[group]["cell_expr_dict"][cell_type] = current_expr_vector
+
             for group in datasets:
                 for tid in tqdm(self.filtered_tids[group], desc=f"{group} [{cell_type}]"):
                     # contain translation
@@ -331,9 +369,6 @@ class DatasetGenerator():
                         start_idx = end_idx - len(motif) + 1
                         motif_occs.append((start_idx, end_idx + 1))  # (start, end) where end is exclusive 0-based
 
-                    # cell type index
-                    cell_type_idx = cell_type_mapping.get(cell_type, 0)
-
                     datasets[group]["uuids"].append("-".join([tid, cell_type, str(i)]))
                     datasets[group]["tids"].append(tid)
                     datasets[group]["count_embs"].append(np.float32(count_emb))
@@ -343,49 +378,48 @@ class DatasetGenerator():
                     datasets[group]["cds_start_pos"].append(np.int16(self.tx_cds[tid]['cds_start_pos']))
                     datasets[group]["cds_end_pos"].append(np.int16(self.tx_cds[tid]['cds_end_pos']))
                     datasets[group]["motif_occs"].append(list(motif_occs))
-                    datasets[group]["cell_types"].append(cell_type)
-                    datasets[group]["cell_type_idxs"].append(np.int16(cell_type_idx))
+                    datasets[group]["cell_types"].append(str(cell_type))
     
         # save all datasets
         print(f"--- Saving datasets ---")
-        if fmt == "pickle":
-            for group, dataset in datasets.items():
-                file_path = f"{out_path}.{group}.pkl"
-                with open(file_path, "wb") as f:
-                    pickle.dump(dataset, f, protocol=pickle.HIGHEST_PROTOCOL)
-                print(f"Saved [{group}] dataset to {file_path} (pickle).")
-        elif fmt == "h5":
-            for group, dataset in datasets.items():
-                file_path = f"{out_path}.{group}.h5"
-                if not HAS_H5:
-                    raise ImportError("h5py not available. Install h5py to use h5 format.")
-                # create h5 file，build the group by tid
-                with h5py.File(file_path, "w") as f:
-                    grp_root = f.create_group("samples")
-                    for i, uuid in enumerate(dataset["uuids"]):
-                        g = grp_root.create_group(uuid)
-                        g.attrs["tid"] = dataset["tids"][i]
-                        g.attrs['cell_type_idx'] = dataset["cell_type_idxs"][i]
-                        g.attrs['cds_start_pos'] = dataset["cds_start_pos"][i]
-                        g.attrs['cds_end_pos'] = dataset["cds_end_pos"][i]
-                        g.attrs['motif_occ'] = dataset["motif_occs"][i]
-                        g.attrs['rpf_depth'] = dataset["rpf_depth"][i]
-                        g.attrs['rpf_coverage'] = dataset["rpf_coverage"][i]
-                        g.attrs['te_val'] = dataset["te_val"][i]
-                        g.create_dataset("count_emb", data=dataset["count_embs"][i], compression="gzip")
-                    # sequence embedding
-                    grp_seq = f.create_group("sequences")
-                    for tid, seq_emb in dataset["seq_embs"].items():
-                        grp_seq.create_dataset(tid, data=seq_emb, compression="gzip")
-                    # metadata attributes
-                    cell_types_counts = {}
-                    for ct in dataset["cell_types"]:
-                        cell_types_counts[ct] = cell_types_counts.get(ct, 0) + 1
+        for group, dataset in datasets.items():
+            file_path = f"{out_path}.{group}.h5"
+            if not HAS_H5:
+                raise ImportError("h5py not available. Install h5py to use h5 format.")
+            # create h5 file，build the group by tid
+            with h5py.File(file_path, "w") as f:
+                # 1. Save Samples
+                grp_root = f.create_group("samples")
+                for i, uuid in enumerate(dataset["uuids"]):
+                    g = grp_root.create_group(uuid)
+                    g.attrs["tid"] = dataset["tids"][i]
+                    g.attrs['cell_type'] = dataset["cell_types"][i]
+                    g.attrs['cds_start_pos'] = dataset["cds_start_pos"][i]
+                    g.attrs['cds_end_pos'] = dataset["cds_end_pos"][i]
+                    g.attrs['motif_occ'] = dataset["motif_occs"][i] #json.dumps(dataset["motif_occs"][i]) 
+                    g.attrs['rpf_depth'] = dataset["rpf_depth"][i]
+                    g.attrs['rpf_coverage'] = dataset["rpf_coverage"][i]
+                    g.attrs['te_val'] = dataset["te_val"][i]
+                    g.create_dataset("count_emb", data=dataset["count_embs"][i], compression="gzip")
 
-                    f.attrs['cell_type_counts'] = json.dumps(cell_types_counts)
-                    f.attrs['n_samples'] = len(dataset["uuids"])
-                    f.attrs['notes'] = "Saved by DatasetGenerator.save_h5ad by Chunfu Xiao"
-                print(f"Saved [{group}] dataset to {file_path} (h5).")
-        else:
-            raise ValueError("Unknown format. Use 'pickle' or 'h5'.")
-        
+                # 2. save sequence embedding
+                grp_seq = f.create_group("sequences")
+                for tid, seq_emb in dataset["seq_embs"].items():
+                    grp_seq.create_dataset(tid, data=seq_emb, compression="gzip")
+                
+                # 3. Save Global Cell Expression Dict
+                if dataset["cell_expr_dict"]:
+                    grp_expr = f.create_group("cell_exprs")
+                    for ct, expr_vec in dataset["cell_expr_dict"].items():
+                        grp_expr.create_dataset(ct, data=expr_vec, compression="gzip")
+
+                # 4. metadata attributes
+                cell_types_counts = {}
+                for ct in dataset["cell_types"]:
+                    cell_types_counts[ct] = cell_types_counts.get(ct, 0) + 1
+
+                f.attrs['cell_type_counts'] = json.dumps(cell_types_counts)
+                f.attrs['n_samples'] = len(dataset["uuids"])
+                f.attrs['notes'] = "Saved by DatasetGenerator with Optimized Global cell_exprs"
+
+            print(f"Saved [{group}] dataset to {file_path} (h5).")

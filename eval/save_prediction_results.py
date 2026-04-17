@@ -45,7 +45,7 @@ def _prepare_prediction_dataloader(
     else:
         # Fallback: 在两种 dataset 中，seq_emb 都在索引 3 的位置
         print(f"[Rank {rank}] Calculating lengths manually...")
-        subset_lengths = [dataset[i][3].shape[0] for i in target_indices]
+        subset_lengths = [dataset[i][4].shape[0] for i in target_indices]
 
     sampler = DistributedBucketSampler(
         lengths=subset_lengths,
@@ -89,15 +89,16 @@ def save_count_predictions(
 
     # --- Collate Function for Translation Dataset ---
     def collate_fn_count(batch):
-        # 解包: uuid, cell_type_idx, meta_info, seq_emb, count_emb
-        uuids, cell_idxs, meta_infos, seq_embs, count_embs = zip(*batch)
+        # 解包: uuid, cell_types, cell_type_idx, meta_info, seq_emb, count_emb
+        uuids, cell_types, expr_vectors, meta_infos, seq_embs, count_embs = zip(*batch)
         lengths = [s.shape[0] for s in seq_embs]
         
         seq_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         count_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
-        cell_idxs = torch.stack(cell_idxs)
+        cell_types = list(cell_types)
+        expr_vectors = torch.stack(expr_vectors)
         
-        return uuids, cell_idxs, meta_infos, seq_padded, count_padded, lengths
+        return uuids, cell_types, expr_vectors, meta_infos, seq_padded, count_padded, lengths
 
     # 获取 DataLoader
     dataloader, run_rank, run_world_size = _prepare_prediction_dataloader(
@@ -115,10 +116,9 @@ def save_count_predictions(
 
     # --- Inference Loop ---
     for batch_data in iterator:
-        b_uuids, b_cell_idxs, b_meta, b_seq, b_count, b_lengths = batch_data
+        b_uuids, b_cell_types, b_expr_vectors, b_meta, b_seq, b_count, b_lengths = batch_data
         
         b_seq = b_seq.to(base_model.device)
-        b_cell_idxs = b_cell_idxs.to(base_model.device)
         
         # Count head 推理通常需要全零的 count 输入作为占位符
         masked_batch = torch.zeros_like(b_count).to(base_model.device)
@@ -126,7 +126,13 @@ def save_count_predictions(
         
         with torch.no_grad():
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                out = base_model.predict(b_seq, masked_batch, b_cell_idxs, src_mask, head_names=["count"])
+                out = base_model.predict(
+                    seq_batch=b_seq, 
+                    count_batch=masked_batch, 
+                    cell_type=b_cell_types, 
+                    src_mask=src_mask, 
+                    head_names=["count"]
+                    )
             pred_batch = out["count"]
 
         # 解析并存储 (修改为嵌套字典结构)

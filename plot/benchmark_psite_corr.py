@@ -153,9 +153,9 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
         # ==========================================
         + geom_jitter(data=agg_df, mapping=aes(y='Mean', shape='Cell_type', color='Cell_type'), 
                       width=0.2, size=3.5, alpha=0.8)
-        + scale_fill_manual(values=color_mapping) 
         + scale_color_manual(values=point_colors) # [NEW] 传入散点颜色配置
-        + coord_cartesian(ylim=[0, 0.7])
+        + scale_fill_manual(values=color_mapping) 
+        # + coord_cartesian(ylim=[0, 0.7])
         + theme_bw()
         + theme(
             axis_text_x=element_text(angle=45, hjust=1, color="black"), 
@@ -254,28 +254,47 @@ def prepare_length_robustness_data(
     return save_path
 
 
-def plot_length_robustness_curve(
+def plot_length_robustness_line_chart(
         data_path: str, 
         x_value: str = "Full_Length",
         out_dir="./results/robustness", 
-        suffix=""):
+        suffix="",
+        bins=None,
+        labels=None):
     """
-    Step 2: 直接读取合并后的数据表，使用自定义颜色映射绘制拟合线图。
-    并计算线性回归 (y = β * log10(x) + α) 的斜率和 p-value 标在图的右上角。
+    Step 3: 将连续的序列长度进行区间分箱 (Binning)，计算各区间相关性均值与 SEM，绘制带误差棒的折线图。
     """
-    suffix = f'{suffix}_{x_value}' if suffix else x_value
+    suffix_name = f'{suffix}_{x_value}' if suffix else x_value
     
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data table not found: {data_path}")
         
-    print(f">>> Loading data from {data_path} for plotting...")
+    print(f">>> Loading data from {data_path} for line chart plotting...")
     df_final = pd.read_csv(data_path)
     
-    # 清理数据：去除含有缺失值的行，并保证 x > 0（因为我们要取 log10）
+    # 清理数据
     df_final = df_final.dropna(subset=[x_value, 'Spearman_R']).copy()
     df_final = df_final[df_final[x_value] > 0]
     
-    # 自定义颜色映射
+    # --- 1. 动态设定分箱策略 (Binning) ---
+    if bins is None or labels is None:
+        if x_value == "Full_Length":
+            # 针对全长 RNA 的尺度
+            bins = [0, 1000, 2000, 3000, 5000, 7000, 10000, 13000, np.inf]
+            labels = ['<1k', '1k-2k', '2k-3k', '3k-5k', '5k-7k', '7k-9k', '10k-13k', '>13k']
+        else:
+            # 针对 5'UTR 或较短区域的尺度
+            bins = [0, 50, 100, 200, 500, np.inf]
+            labels = ['<50', '50-100', '100-200', '200-500', '>500']
+            
+    # 将长度划分为离散区间
+    df_final['Length_Bin'] = pd.cut(df_final[x_value], bins=bins, labels=labels)
+    df_final = df_final.dropna(subset=['Length_Bin'])
+    
+    # 转换为 Ordered Categorical 确保 X 轴顺序正确
+    df_final['Length_Bin'] = pd.Categorical(df_final['Length_Bin'], categories=labels, ordered=True)
+
+    # --- 2. 自定义颜色与模型排序 ---
     color_mapping = {
         "TRACE": "#2C6B9A",
         "Encoder": "#555555",
@@ -286,84 +305,52 @@ def plot_length_robustness_curve(
         "Cross-experiment": "#EBC67F"
     }
     
-    # 转换为 Categorical 类型以确保图例和注释的顺序一致
     valid_models = [m for m in color_mapping.keys() if m in df_final['Model'].unique()]
     df_final['Model'] = pd.Categorical(df_final['Model'], categories=valid_models, ordered=True)
     
-    # ================= 计算线性回归斜率和 P-value =================
-    stats_records = []
+    # --- 3. 聚合计算均值与 SEM ---
+    print(">>> Aggregating means and standard errors for bins...")
+    summary_df = df_final.groupby(['Model', 'Length_Bin'], observed=False).agg(
+        Mean_R=('Spearman_R', 'mean'),
+        SEM=('Spearman_R', lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0),
+        N=('Spearman_R', 'count')
+    ).reset_index()
     
-    # 获取绘图空间的极值，用于动态定位文字坐标
-    x_max = df_final[x_value].max()
-    y_max = 0.7 # df_final['Spearman_R'].max()
-    y_min = df_final['Spearman_R'].min()
-    y_range = y_max - y_min
-    
-    for i, model in enumerate(valid_models):
-        df_sub = df_final[df_final['Model'] == model]
-        if len(df_sub) < 2:
-            continue
-            
-        # 注意：因为画图用了 scale_x_log10()，为了与图中拟合的直线斜率保持一致，
-        # 我们的数学计算也必须对 X 轴取 log10。
-        x_log = np.log10(df_sub[x_value])
-        y = df_sub['Spearman_R']
-        
-        # 线性回归拟合
-        from scipy.stats import linregress
-        slope, intercept, r_val, p_val, std_err = linregress(x_log, y)
-        
-        # 格式化 p-value（极小值用科学计数法，否则保留三位小数）
-        p_str = f"{p_val:.1e}" if p_val < 0.001 else f"{p_val:.3f}"
-        label_text = f"β={slope:.3f}, P={p_str}"
-        
-        # 设置 Y 轴高度向下依次递减（基于数据量程的 6% 步长跨度）
-        y_pos = y_max - (i * y_range * 0.02)
-        
-        stats_records.append({
-            'Model': model,
-            x_value: x_max,       # 横坐标定位在图的最右侧
-            'Spearman_R': y_pos,  # 纵坐标依次往下排
-            'Label': label_text
-        })
-        
-    df_stats = pd.DataFrame(stats_records)
-    # 保持 Model 为 Categorical，确保 geom_text 的颜色分配正确
-    df_stats['Model'] = pd.Categorical(df_stats['Model'], categories=valid_models, ordered=True)
-    # ===============================================================
-    
+    # 过滤掉区间内没有数据的点，避免断线
+    summary_df = summary_df.dropna(subset=['Mean_R'])
+    summary_df['ymin'] = summary_df['Mean_R'] - summary_df['SEM']
+    summary_df['ymax'] = summary_df['Mean_R'] + summary_df['SEM']
+
     os.makedirs(out_dir, exist_ok=True)
     
-    print(">>> Plotting smoothed curve with stats...")
-    p1 = (
-        ggplot(df_final, aes(x=x_value, y='Spearman_R', color='Model', fill='Model'))
-        + geom_smooth(method='lm', size=1, alpha=0.2) 
-        # 使用 geom_text 添加斜率与 P-value 注释
-        + geom_text(
-            data=df_stats, 
-            mapping=aes(label='Label'), 
-            ha='right',   # 右对齐，配合 x=x_max 确保文字紧贴图表右边缘
-            va='top', 
-            size=10, 
-            show_legend=False # 不生成额外的图例
-        )
-        + scale_x_log10() 
-        + scale_color_manual(values=color_mapping) 
-        + scale_fill_manual(values=color_mapping)  
+    # --- 4. 绘制折线图 ---
+    print(">>> Plotting binned line chart...")
+    p_line = (
+        ggplot(summary_df, aes(x='Length_Bin', y='Mean_R', color='Model', group='Model'))
+        # 添加误差棒
+        + geom_errorbar(aes(ymin='ymin', ymax='ymax'), width=0.15, size=0.8, alpha=0.7)
+        # 添加连线
+        + geom_line(size=1.2, alpha=0.7)
+        # 添加数据点 (实心点)
+        + geom_point(size=3, fill='white', stroke=1, alpha=1) 
+        + scale_color_manual(values=color_mapping)
         + theme_bw()
         + labs(
-            x=f"RNA {'full length' if x_value == 'Full_Length' else '5-UTR length'} (log10 scale)", 
-            y="Translation profile position-wise Spearman correlation", 
+            x=f"RNA {'full length' if x_value == 'Full_Length' else '5-UTR length'} (nt)", 
+            y="Translation profile position-wise Spearman correlation (mean ± SEM)",
         )
         + theme(
             legend_position='top',
-            legend_title=element_blank()
+            legend_title=element_blank(),
+            axis_text_x=element_text(angle=30, hjust=1, color="black"),
+            axis_title_x=element_text(margin={'t': 10}),
+            panel_grid_minor=element_blank()
         )
     )
     
-    filename = f"robustness_smooth_curve.{suffix}.pdf" if suffix else "robustness_smooth_curve.pdf"
+    filename = f"robustness_line_chart.{suffix_name}.pdf" if suffix else "robustness_line_chart.pdf"
     plot_path = os.path.join(out_dir, filename)
+    p_line.save(plot_path, width=5, height=5, verbose=False)
+    print(f">>> Line chart saved to {plot_path}")
     
-    # 稍微调宽一点画布，防止文字被边缘切除
-    p1.save(plot_path, width=5, height=5.5, verbose=False)
-    print(f">>> Plot saved to {plot_path}")
+    return summary_df

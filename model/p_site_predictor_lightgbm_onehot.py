@@ -239,7 +239,7 @@ class PSitePredictor():
         # periodicity per read length
         prd_read_len = (mat.max(axis=1) + 1) / (mat.sum(axis=1) + 1)
         
-        return prd_read_len, lengths, totals
+        return prd_read_len, lengths, totals, mat
     
     def eval_p_site(
             self,
@@ -272,7 +272,7 @@ class PSitePredictor():
         # evaluate read density around TIS and TTS
         mat_starts, mat_stops, rel_pos_start, rel_pos_stop, lengths = self.evaluate_read_density(
             self.count_dict, output_dir, prefix="read")
-        prd_read_len, lengths, totals = self.evaluate_three_nucleotide_periodicity(
+        prd_read_len, lengths, totals, mat_frames = self.evaluate_three_nucleotide_periodicity(
             self.count_dict, output_dir, prefix="read")
 
         # caculate potential read-length-specific offset
@@ -295,15 +295,49 @@ class PSitePredictor():
         
         # generate offset limits or fixed value
         w = span // 2
-        self.offset_map = {
-            rl: (-pos - w, -pos + w) if train_ref == "TIS" else (-pos - 3 - w, -pos - 3 + w)
-                for rl, pos in best_pos_dict.items()
-        }
-        self.offset_fix = {
-            rl: -pos if train_ref == "TIS" else -pos - 3
-                for rl, pos in best_pos_dict.items() if prd_read_len[np.where(np.array(lengths) == rl)] >= prd_cutoff and rl in inf_read_lens
-        }
-        print(f"- Fixed offset for some read lengths: {self.offset_fix}")
+        self.offset_map = {}
+        self.offset_fix = {}
+
+        lengths_arr = np.array(lengths)
+
+        for rl, pos in best_pos_dict.items():
+            if pos is None:
+                continue
+
+            # Determine base offset based entirely on peak density
+            base_O = -pos if train_ref == "TIS" else -pos - 3
+            
+            # Find index of this read length in the mat_frames array
+            rl_idx_tuple = np.where(lengths_arr == rl)
+            if len(rl_idx_tuple[0]) == 0:
+                continue
+            rl_idx = rl_idx_tuple[0][0]
+            
+            # Get the global 5' end frame distribution for this read length
+            frame_counts = mat_frames[rl_idx]
+            
+            best_O = base_O
+            max_frame_count = -1
+            
+            # Check base_O, base_O - 1, base_O + 1. Priority is given to base_O if there is a tie.
+            for O_cand in [base_O, base_O - 1, base_O + 1]:
+                # If offset is O_cand, a 5' end at frame x maps to P-site frame (x + O_cand) % 3.
+                # To get P-site frame 0, we need x such that (x + O_cand) % 3 == 0 => x = (-O_cand) % 3
+                target_5end_frame = (-O_cand) % 3
+                cand_count = frame_counts[target_5end_frame]
+                
+                if cand_count > max_frame_count:
+                    max_frame_count = cand_count
+                    best_O = O_cand
+            
+            # Assign adjusted offset to offset_map
+            self.offset_map[rl] = (best_O - w, best_O + w)
+            
+            # Check periodicity cutoff and add to offset_fix
+            if prd_read_len[rl_idx] >= prd_cutoff and rl in inf_read_lens:
+                self.offset_fix[rl] = best_O
+
+        print(f"- Fixed offset for some read lengths (adjusted for periodicity): {self.offset_fix}")
 
         return self.offset_map, self.offset_fix
     
@@ -371,6 +405,12 @@ class PSitePredictor():
                             
         # construct feature matrix
         n_sample = len(flanking_list)
+
+        # --- ADDED: Protection for empty datasets to avoid reshape ValueError ---
+        if n_sample <= 100:
+            print("Warning: No valid reads left after filtering. Returning empty datasets.")
+            return None, None
+        # ----------------------------------------------------------------------
         X_seq = np.array(flanking_list, dtype=np.int8).reshape(n_sample, -1) # (n_reads, seq_feat)
 
         # read len one-hot
@@ -441,6 +481,13 @@ class PSitePredictor():
 
         # construct feature matrix
         n_sample = len(flanking_list)
+
+        # --- ADDED: Protection for empty datasets to avoid reshape ValueError ---
+        if n_sample <= 100:
+            print("Warning: No valid reads left after filtering. Returning empty datasets.")
+            return None, None
+        # ----------------------------------------------------------------------
+
         X_seq = np.array(flanking_list, dtype=np.int8).reshape(n_sample, -1) # (n_reads, seq_feat)
 
         # features
@@ -555,8 +602,15 @@ class PSitePredictor():
         # check data
         print("Train/Val shapes:", getattr(X_train, "shape", None), getattr(X_val, "shape", None),
           getattr(y_train, "shape", None), getattr(y_val, "shape", None))
-        if X_train is None or X_train.shape[0] == 0:
-            raise RuntimeError("No training samples found. Check count_dict and offset_limits.")
+        # if X_train is None or X_train.shape[0] == 0:
+        #     raise RuntimeError("No training samples found. Check count_dict and offset_limits.")
+
+        # --- MODIFIED: Graceful exit instead of raising RuntimeError ---
+        if X_train is None or getattr(X_train, "empty", True) or X_train.shape[0] == 0:
+            print("Warning: No training samples found (likely due to sparse data). Skipping model training.")
+            self.predictor = None
+            return
+        # ---------------------------------------------------------------
 
         # determine number of classes
         num_classes = int(np.max(y_train)) + 1
@@ -664,12 +718,15 @@ class PSitePredictor():
         
         p_site_dict = defaultdict(double_nested_zero_defaultdict)
 
-        # check predictor
+        # --- MODIFIED: Set flag instead of raising error if model is missing ---
+        use_ml_prediction = True
         if not self.predictor:
             if model_path:
                 self.load_model(model_path, offset_limits)
             else:
-                raise ModuleNotFoundError("Model not found, please train first or give a model path!")
+                print("Warning: Model not found. Bypassing ML prediction and using fix_offset exclusively.")
+                use_ml_prediction = False
+        # -----------------------------------------------------------------------
 
         print("\n--- Identify P-sites for specific read length with high periodicity ---")
 
@@ -687,112 +744,117 @@ class PSitePredictor():
                 # raw_counts already collapsed (no length info) -> skip (can't attribute length)
                 continue
 
-        print("\n--- Predicting P-sites for all transcripts ---")
-        # --- pipeline parameters 
-        producer_queue_maxsize = 2
+        # --- MODIFIED: Wrap the ML prediction block with the use_ml_prediction flag ---
+        if use_ml_prediction:
+            print("\n--- Predicting P-sites for all transcripts ---")
+            # --- pipeline parameters 
+            producer_queue_maxsize = 2
 
-        # Prepare queue and control vars
-        q = Queue(maxsize=producer_queue_maxsize)
-        producer_exc = []
+            # Prepare queue and control vars
+            q = Queue(maxsize=producer_queue_maxsize)
+            producer_exc = []
 
-        # Producer function runs in a separate process
-        def _producer(keys_iter, 
-                      batch_transcripts: int, 
-                      five_end_flanking: bool, 
-                      three_end_flanking: bool):
-            try:
+            # Producer function runs in a separate process
+            def _producer(keys_iter, 
+                          batch_transcripts: int, 
+                          five_end_flanking: bool, 
+                          three_end_flanking: bool):
+                try:
+                    while True:
+                        tids_batch = list(islice(keys_iter, batch_transcripts))
+                        if not tids_batch:
+                            break
+                        X_t, tid_list_t, pos_list_t, read_len_list_t = self._prepare_batch_datasets(
+                            tids_batch, five_end_flanking, three_end_flanking)
+                        # put in line
+                        q.put((X_t, tid_list_t, pos_list_t, read_len_list_t, len(tids_batch)))
+                    q.put(None)
+                except Exception as e: # Catch e specifically
+                    # record traceback
+                    tb = traceback.format_exc()
+                    producer_exc.append((e, tb))
+                    q.put(None)
+
+            # start producer process
+            keys_iter = iter(self.count_dict.keys())
+            total_tids = len(self.count_dict)
+            producer_thr = Thread(target=_producer, 
+                                  args=(keys_iter, batch_transcripts, five_end_flanking, three_end_flanking), 
+                                  daemon=True)
+            producer_thr.start()
+
+            # Consumer loop: get the batch in line，predict and update p_site_dict
+            with tqdm(total=total_tids, desc="Predicting P-site", mininterval=1) as pbar:
                 while True:
-                    tids_batch = list(islice(keys_iter, batch_transcripts))
-                    if not tids_batch:
+                    item = q.get()
+                    if item is None:
                         break
-                    X_t, tid_list_t, pos_list_t, read_len_list_t = self._prepare_batch_datasets(
-                        tids_batch, five_end_flanking, three_end_flanking)
-                    # put in line
-                    q.put((X_t, tid_list_t, pos_list_t, read_len_list_t, len(tids_batch)))
-                q.put(None)
-            except Exception:
-                # record traceback
-                tb = traceback.format_exc()
-                producer_exc.append((e, tb))
-                q.put(None)
 
-        # start producer process
-        keys_iter = iter(self.count_dict.keys())
-        total_tids = len(self.count_dict)
-        producer_thr = Thread(target=_producer, 
-                              args=(keys_iter, batch_transcripts, five_end_flanking, three_end_flanking), 
-                              daemon=True)
-        producer_thr.start()
+                    X, tid_list, pos_list, read_len_list, n_tids_batch = item
 
-        # Consumer loop: get the batch in line，predict and update p_site_dict
-        with tqdm(total=total_tids, desc="Predicting P-site", mininterval=1) as pbar:
-            while True:
-                item = q.get()
-                if item is None:
-                    break
+                    pbar.update(n_tids_batch)
 
-                X, tid_list, pos_list, read_len_list, n_tids_batch = item
+                    if X is None:
+                        continue
 
-                pbar.update(n_tids_batch)
-
-                if X is None:
-                    continue
-
-                # split into manageable sub-blocks to avoid OOM
-                n_samples = X.shape[0]
-                start_idx = 0
-                while start_idx < n_samples:
-                    end_idx = min(start_idx + max_reads_per_batch, n_samples)
-                    if hasattr(X, "iloc"):
-                        subX = X.iloc[start_idx:end_idx, :]
-                    else:
-                        subX = X[start_idx:end_idx, :]
-
-                    # convert to DataFrame with feature names if model was trained with names
-                    if getattr(self, "_feature_names_", None) is not None:
-                        # ensure correct feature columns
-                        if subX.shape[1] != len(self._feature_names_):
-                            try:
-                                subX = pd.DataFrame(subX, columns=self._feature_names_)
-                            except Exception:
-                                raise RuntimeError(f"Feature dimension mismatch: model expects {len(self._feature_names_)} features, got {subX.shape[1]}")
+                    # split into manageable sub-blocks to avoid OOM
+                    n_samples = X.shape[0]
+                    start_idx = 0
+                    while start_idx < n_samples:
+                        end_idx = min(start_idx + max_reads_per_batch, n_samples)
+                        if hasattr(X, "iloc"):
+                            subX = X.iloc[start_idx:end_idx, :]
                         else:
-                            # ensure DataFrame with same columns
-                            if not hasattr(subX, "columns"):
-                                subX = pd.DataFrame(subX, columns=self._feature_names_)
-                            else:
-                                subX.columns = self._feature_names_
+                            subX = X[start_idx:end_idx, :]
 
-                    # model predict
-                    pred_labels = self.predictor.predict(subX)
-                    offsets = np.array(self.offset_limits)[pred_labels]
-
-                    for i_local, global_idx in enumerate(range(start_idx, end_idx)):
-                        tid = tid_list[global_idx]
-                        read_l = read_len_list[global_idx]
-                        pos = pos_list[global_idx]
-                        offset = int(offsets[i_local])
-                        seq_len = self._base_seq_emb[tid].shape[0]
-                        p_pos = pos + offset
-                        if p_pos <= seq_len and read_l not in self.offset_fix:
-                            try:
-                                cnt = self.count_dict[tid][pos][read_l]
-                            except Exception:
+                        # convert to DataFrame with feature names if model was trained with names
+                        if getattr(self, "_feature_names_", None) is not None:
+                            # ensure correct feature columns
+                            if subX.shape[1] != len(self._feature_names_):
                                 try:
-                                    cnt = self.count_dict[tid][read_l][pos]
+                                    subX = pd.DataFrame(subX, columns=self._feature_names_)
                                 except Exception:
-                                    cnt = 1
-                            p_site_dict[tid][p_pos][read_l] += cnt
+                                    raise RuntimeError(f"Feature dimension mismatch: model expects {len(self._feature_names_)} features, got {subX.shape[1]}")
+                            else:
+                                # ensure DataFrame with same columns
+                                if not hasattr(subX, "columns"):
+                                    subX = pd.DataFrame(subX, columns=self._feature_names_)
+                                else:
+                                    subX.columns = self._feature_names_
 
-                    start_idx = end_idx
+                        # model predict
+                        pred_labels = self.predictor.predict(subX)
+                        offsets = np.array(self.offset_limits)[pred_labels]
 
-        # wait producer thread end
-        producer_thr.join()
+                        for i_local, global_idx in enumerate(range(start_idx, end_idx)):
+                            tid = tid_list[global_idx]
+                            read_l = read_len_list[global_idx]
+                            pos = pos_list[global_idx]
+                            offset = int(offsets[i_local])
+                            seq_len = self._base_seq_emb[tid].shape[0]
+                            p_pos = pos + offset
+                            if p_pos <= seq_len and read_l not in self.offset_fix:
+                                try:
+                                    cnt = self.count_dict[tid][pos][read_l]
+                                except Exception:
+                                    try:
+                                        cnt = self.count_dict[tid][read_l][pos]
+                                    except Exception:
+                                        cnt = 1
+                                    p_site_dict[tid][p_pos][read_l] += cnt
 
-        # if error in producer
-        if producer_exc:
-            e, tb = producer_exc[0]
-            raise RuntimeError(f"Producer thread failed: {e}\nTraceback:\n{tb}")
+                        start_idx = end_idx
+
+            # wait producer thread end
+            producer_thr.join()
+
+            # if error in producer
+            if producer_exc:
+                e, tb = producer_exc[0]
+                raise RuntimeError(f"Producer thread failed: {e}\nTraceback:\n{tb}")
+        else:
+            print("\n--- ML prediction skipped. Outputting results based on fix_offset. ---")
+        # -----------------------------------------------------------------------------
 
         print("\n--- Save P-site counts ---")
         out_path = os.path.join(output_dir, "p_site_count.pkl")

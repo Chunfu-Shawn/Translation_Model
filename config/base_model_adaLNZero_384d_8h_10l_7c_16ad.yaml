@@ -6,5 +6,6 @@ number_of_layers: 10
 all_cell_types: ["brain_cerebrum", "liver", "testis", "kidney", "prostate", "HEK293T", "HeLa"]
 d_ff: 768
 adaptive_dim: 16
+gamma_scale: 0.5
 p_drop: 0.1
 model_name: "base_model_adaLNZero_384d_8h_10l_7c_16ad"

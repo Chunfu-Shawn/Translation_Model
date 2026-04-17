@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 __author__ = "Chunfu Xiao"
@@ -89,6 +90,7 @@ class PsiteDensityHead(nn.Module):
             nn.Dropout(self.p_drop),
             nn.Linear(self.d_pred_h, self.d_count),
             nn.ReLU()
+            # nn.Softplus(beta=10)
         )
 
         if init_xavier:
@@ -100,7 +102,10 @@ class PsiteDensityHead(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                    if m.out_features == self.d_count: # 最后一层
+                        nn.init.constant_(m.bias, 0.1) # 初始化为微小正数防死
+                    else:
+                        nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
                 if m.weight is not None:
                     nn.init.ones_(m.weight)
@@ -176,7 +181,112 @@ class PsiteDensityHead(nn.Module):
 
         # now construct
         return cls(d_model=d_model, d_count=d_count, d_pred_h=d_pred_h, p_drop=p_drop, init_xavier=init_xavier)
+
+
+class TranslationProfileHead(nn.Module):
+    """
+    TranslationProfileHead (Optimized for both Profile Shape and Absolute TE Scale)
     
+    - Removed LayerNorm to preserve absolute Scale (TE).
+    - Added Global-Local dual stream to predict Baseline and Profile simultaneously.
+    - Uses Softplus to guarantee non-negative outputs smoothly for SmoothL1Loss.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_count: int,
+        d_pred_h: Optional[int] = None,
+        p_drop: float = 0.1,
+        init_xavier: bool = True,
+    ):
+        super().__init__()
+        self.name = "TranslationProfileHead"
+        self.d_model = int(d_model)
+        self.d_count = int(d_count)
+        self.d_pred_h = int(d_pred_h) if d_pred_h is not None else max(64, self.d_model // 2)
+        self.p_drop = float(p_drop)
+
+        # 1. Token 级别预测网络 (预测 Profile 的相对起伏)
+        self.token_mlp = nn.Sequential(
+            nn.Linear(self.d_model, self.d_pred_h),
+            nn.GELU(),
+            nn.Dropout(self.p_drop),
+            nn.Linear(self.d_pred_h, self.d_count)
+        )
+        
+        # 2. Global 级别预测网络 (预测转录本整体的 TE Baseline)
+        self.global_mlp = nn.Sequential(
+            nn.Linear(self.d_model, self.d_pred_h),
+            nn.GELU(),
+            nn.Linear(self.d_pred_h, self.d_count)
+        )
+
+        if init_xavier:
+            self._init_parameters()
+
+    def _init_parameters(self):
+        """Initialize linear weights with Xavier and biases to zero."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, src_reps: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        src_reps : (bs, seq_len, d_model)
+        pad_mask : (bs, seq_len) boolean mask, True for valid tokens
+        """
+        # --- 步骤 1：获取全局序列上下文 (Global Context) ---
+        if pad_mask is not None:
+            m_float = pad_mask.to(src_reps.dtype).unsqueeze(-1) # (bs, seq_len, 1)
+            valid_lengths = pad_mask.sum(dim=1, keepdim=True).clamp(min=1.0).unsqueeze(-1)
+            global_rep = (src_reps * m_float).sum(dim=1, keepdim=True) / valid_lengths # (bs, 1, d_model)
+        else:
+            global_rep = src_reps.mean(dim=1, keepdim=True) # (bs, 1, d_model)
+
+        # --- 步骤 2：分别计算局部特征与全局 Baseline ---
+        token_logits = self.token_mlp(src_reps)       # (bs, seq_len, d_count)
+        global_baseline = self.global_mlp(global_rep) # (bs, 1, d_count)
+
+        # --- 步骤 3：融合 (Shape + Scale) ---
+        out = token_logits + global_baseline
+        
+        # --- 步骤 4：处理激活函数与 Mask ---
+        # 配合 SmoothL1Loss，强制输出大于 0 的平滑数值
+        out = F.softplus(out) 
+
+        if pad_mask is not None:
+            out = out * m_float
+            
+        return out
+
+    @classmethod
+    def create_from_model(
+        cls,
+        parent_model: object,
+        d_model: Optional[int] = None,
+        d_count: Optional[int] = None,
+        d_pred_h: Optional[int] = None,
+        p_drop: float = 0.1,
+        init_xavier: bool = True,
+    ) -> "TranslationProfileHead":
+        if d_model is None:
+            if hasattr(parent_model, "d_model"):
+                d_model = int(getattr(parent_model, "d_model"))
+            else:
+                raise ValueError("d_model not provided and parent_model has no attribute 'd_model'")
+
+        if d_count is None:
+            if hasattr(parent_model, "d_count"):
+                d_count = int(getattr(parent_model, "d_count"))
+            elif hasattr(parent_model, "src_emb") and hasattr(parent_model.src_emb, "d_count"):
+                d_count = int(getattr(parent_model.src_emb, "d_count"))
+            else:
+                raise ValueError("d_count not provided and cannot be inferred from parent_model")
+
+        return cls(d_model=d_model, d_count=d_count, d_pred_h=d_pred_h, p_drop=p_drop, init_xavier=init_xavier)
 
 class CellClassificationHead(nn.Module):
     """

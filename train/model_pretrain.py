@@ -15,10 +15,19 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 from utils import unwrap_model
-from train.distributed_bucket_sampler import DistributedBucketSampler
+from train.distributed_balanced_bucket_sampler import DistributedBucketSampler
 from train.masking_adapter import BatchMaskingAdapter, get_dynamic_mask_ratio
 
 torch.set_printoptions(profile="full")
+
+class TensorEncoder(json.JSONEncoder):
+    """自定义 JSON 编码器，让 json.dump 自动解析并转换 PyTorch Tensor"""
+    def default(self, obj):
+        if isinstance(obj, torch.Tensor):
+            # 如果是单个数值的 Tensor 转为 float，如果是多维 Tensor 转为 list
+            return obj.tolist() if obj.numel() > 1 else float(obj.item())
+        # 对于其他类型，使用默认处理方式
+        return super().default(obj)
 
 def create_lr_lambda(total_steps: int, warmup_steps: int = 0, min_eta: float = 1e-4):
     """
@@ -104,6 +113,7 @@ class PretrainingTrainer:
         learning_rate: float = 1e-5,
         lr_warmup_perc: float = 0.2,
         accumulation_steps: int = 5,
+        balance_classes: bool = False,
         beta: Tuple[float, float] = (0.9, 0.98),
         epsilon: float = 1e-9,
         weight_decay: float = 0.01,
@@ -133,16 +143,19 @@ class PretrainingTrainer:
         # masking and sampler (reuse user's adapters)
         self.masking_adapter = BatchMaskingAdapter(mask_value)
         self.mask_perc = mask_perc
-        self.current_mask_range = self.mask_perc.get("count", (0, 0.2)),
+        self.current_mask_range = self.mask_perc.get("count", (0, 0.2))
 
         # samplers that produce per-rank batches
+        self.balance_classes = balance_classes
         self.sampler = DistributedBucketSampler(
             lengths=self.dataset.lengths,
             batch_size=self.batch_size,
             num_replicas=self.world_size,
             rank=self.rank,
             shuffle=True,
-            drop_last=True
+            drop_last=True,
+            balance_classes=self.balance_classes,
+            cell_type_idxs=[int(x) for x in self.dataset.cell_type_idxs]
         )
         self.val_sampler = DistributedBucketSampler(
             lengths=self.val_dataset.lengths,
@@ -150,7 +163,9 @@ class PretrainingTrainer:
             num_replicas=self.world_size,
             rank=self.rank,
             shuffle=False,
-            drop_last=False
+            drop_last=False,
+            balance_classes=self.balance_classes,
+            cell_type_idxs=[int(x) for x in self.val_dataset.cell_type_idxs]
         )
 
         # counts and scheduling
@@ -158,9 +173,7 @@ class PretrainingTrainer:
         self._total_steps = max(1, int(self.epoch_num * self.steps_per_epoch // max(1, self.ac_steps)))
         
         # loss criterions
-        self.classify_criterion = nn.CrossEntropyLoss(reduction="mean", label_smoothing=0.49)
-        self.count_criterion = nn.PoissonNLLLoss(log_input=True, full=True, reduction="none") # PoissonNLLLoss
-        # nn.SmoothL1Loss(reduction="none", beta=1.0) # nn.MSELoss(reduction="none")
+        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0) # nn.MSELoss(reduction="none")
 
         # build optimizer & scheduler & scaler
         self.optimizer = self._build_optimizer(lr=self.lr, betas=self.beta, eps=self.epsilon, weight_decay=self.weight_decay)
@@ -172,8 +185,8 @@ class PretrainingTrainer:
         self.scaler = torch.amp.GradScaler() # for gradiant scaling in autocasting
 
         # logging & checkpointing
-        self.checkpoint_dir = os.path.join(checkpoint_dir, "pretrain")
-        self.log_dir = os.path.join(log_dir, "pretrain")
+        self.checkpoint_dir = checkpoint_dir
+        self.log_dir = log_dir
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
         self.model_full_name = f"{self.model_name}.{dataset_name}.{self.batch_size*self.ac_steps*self.world_size}_{self.lr}"
@@ -182,7 +195,7 @@ class PretrainingTrainer:
 
         # bookkeeping for resume
         self.start_epoch = 0
-        self.best_val_loss = torch.tensor([np.inf] * len(self.mask_perc))  # seq, count, cell default
+        self.best_val_loss = float('inf')
         if self.resume:
             self._maybe_load_checkpoint()
 
@@ -248,7 +261,7 @@ class PretrainingTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "scaler": self.scaler.state_dict(),
-            "best_val_loss": self.best_val_loss.tolist(),
+            "best_val_loss": self.best_val_loss,
             "training_epoch_data": self.training_epoch_data,
             "training_batch_data": self.training_batch_data,
         }
@@ -272,7 +285,13 @@ class PretrainingTrainer:
             model_unwrapped = unwrap_model(self.model)
             model_unwrapped.load_state_dict(ckpt["model"], strict=True)
             self.start_epoch = int(ckpt.get("epoch", 0))
-            self.best_val_loss = torch.tensor(ckpt.get("best_val_loss", self.best_val_loss.tolist()))
+
+            bvl = ckpt.get("best_val_loss", float('inf'))
+            if isinstance(bvl, torch.Tensor):
+                self.best_val_loss = float(bvl.sum().item())
+            else:
+                self.best_val_loss = bvl
+
             # attempt to restore optimizer/scheduler/scaler if present
             try:
                 if "optimizer" in ckpt and ckpt["optimizer"] is not None:
@@ -311,10 +330,8 @@ class PretrainingTrainer:
 
         # pad sequences
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
-        # count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
-        count_embs_expm1 = [torch.expm1(c) for c in count_embs] # PoissonNLLLoss
-        count_embs_padded = pad_sequence(count_embs_expm1, batch_first=True, padding_value=-1)  # PoissonNLLLoss
-
+        count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
+        
         # pad mask where True means valid token
         pad_masks = (seq_embs_padded != -1)[:, :, 0].squeeze(-1)
 
@@ -382,21 +399,17 @@ class PretrainingTrainer:
         result is expected to be a dict mapping 'seq','count','cell' to model outputs.
         """
         device = self.device
-        loss = torch.tensor(0.0, device=device)
 
-        # count_pred = result["count"]  # (B, L, 10 or 1)
-        count_pred = result["count"].float() # PoissonNLLLoss
-        count_raw = count_raw_emb.float().clamp(min=0.0) # PoissonNLLLoss
-
+        count_pred = result["count"]  # (B, L, 10 or 1)
+        
         num_masked_count_token = count_emb_masks.sum()
         if count_pred.shape[2] == 1:
             ## for summarized density
-            # count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-            count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw.squeeze(-1)) * count_emb_masks.float() # PoissonNLLLoss
+            count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
+            
         else:
             ## for RPF density for all read length
-            # count_loss_all = self.count_criterion(count_pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-            count_loss_all = self.count_criterion(count_pred, count_raw) * count_emb_masks.unsqueeze(-1).float() # PoissonNLLLoss
+            count_loss_all = self.count_criterion(count_pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
 
         return count_loss_all.sum() / (num_masked_count_token + eps)
 
@@ -572,11 +585,12 @@ class PretrainingTrainer:
             val_loss, val_batch_loss = self.eval_epoch(epoch)
 
             # update best and bookkeeping (only for active heads/mask task)
-            is_best = val_loss < self.best_val_loss
+            val_loss_float = float(val_loss.item())
+            is_best = val_loss_float < self.best_val_loss
             if is_best:
-                self.best_val_loss = val_loss.detach().cpu()
+                self.best_val_loss = val_loss_float
 
-            self.training_epoch_data.append({"epoch": epoch+1, "train_loss": train_loss, "valid_loss": val_loss})
+            self.training_epoch_data.append({"epoch": epoch+1, "train_loss": float(train_loss.item()), "valid_loss": val_loss})
             self.training_batch_data.append({"epoch": epoch+1, 
                                              "train_batch_loss": [x for x in train_batch_loss], 
                                              "valid_loss": [x for x in val_batch_loss]})
@@ -584,7 +598,9 @@ class PretrainingTrainer:
             # save on master periodically
             if self.rank == 0 and (epoch + 1) % self._save_every == 0:
                 self.save_checkpoint(epoch + 1, is_best)
+    
                 with open(os.path.join(self.log_dir, self.model_full_name + ".epoch_data.json"), "w") as f:
-                    json.dump(self.training_epoch_data, f)
+                    json.dump(self.training_epoch_data, f, cls=TensorEncoder)
+                
                 with open(os.path.join(self.log_dir, self.model_full_name + ".batch_data.json"), "w") as f:
-                    json.dump(self.training_batch_data, f)
+                    json.dump(self.training_batch_data, f, cls=TensorEncoder)

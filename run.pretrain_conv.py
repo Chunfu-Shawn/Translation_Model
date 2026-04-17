@@ -6,7 +6,7 @@ from data.RPF_counter_v3 import *
 from model.translation_base_model_conv import TranslationBaseModel
 from model.mask_heads import PsiteDensityHead
 from train.model_pretrain import PretrainingTrainer
-from data.dataset import TranslationDataset
+from data.translation_dataset import TranslationDataset
 from utils import print_param_counts
 
 rank = int(os.environ['LOCAL_RANK'])        # torchrun 会设
@@ -17,15 +17,15 @@ torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 
 # load dataset
-dataset_dir = '/home/user/data3/yaoc/translation_model/data/input_dataset/'
-dataset_name = "datasets_4_cell_types_6k.no_rl.depth0.1_cov0.1"
+dataset_dir = '/home/user/data3/rbase/translation_model/data/dataset/'
+dataset_name = "7c_4k.depth0.1_cov0.1_rpm1"
 train_dataset_path = os.path.join(dataset_dir, dataset_name + ".train.h5")
 val_dataset_path = os.path.join(dataset_dir, dataset_name + ".valid.h5")
 train_dataset = TranslationDataset.from_h5(train_dataset_path, lazy=True)
 val_dataset = TranslationDataset.from_h5(val_dataset_path, lazy=True)
 
 # create model
-base_model = TranslationBaseModel.from_config("config/base_model_conv_384d_8h_10l_4c.yaml").cuda(rank)
+base_model = TranslationBaseModel.from_config("config/base_model_conv_384d_10l_7c.yaml").cuda(rank)
 base_model.model_name = base_model.model_name
 # create heads
 base_model.add_head(
@@ -54,7 +54,7 @@ trainer = PretrainingTrainer(
     model = base_model,
     dataset = train_dataset,
     val_dataset = val_dataset,
-    dataset_name = "6k_depth0.1_cov0.1",
+    dataset_name = dataset_name,
     batch_size = 20,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint',
     log_dir = '/home/user/data3/rbase/translation_model/models/log',
@@ -64,7 +64,6 @@ trainer = PretrainingTrainer(
     save_every = 1,
     epoch_num = epoch_num,
     mask_value = 0,
-    head_warmup_perc = {"count": 0},
     mask_perc = {"count": (0.3, 1.5), "cell": 0.05},
     learning_rate = 0.0005,
     lr_warmup_perc = 0.3,

@@ -2,57 +2,110 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
+import torch
 from scipy.stats import pearsonr
 from tqdm import tqdm
 from collections import defaultdict
+import seaborn as sns
+import matplotlib.pyplot as plt
 from plotnine import *
 import warnings
+
+from eval.calculate_te import *
 
 # 忽略警告
 warnings.filterwarnings("ignore")
 
+def extract_gt_and_cds_from_dataset(dataset):
+    """
+    从 TranslationDataset 提取真实序列 (GT) 和 CDS 信息。
+    返回结构: { cell_type: { tid: {'gt': [...], 'cds_start': x, 'cds_end': y, 'depth': z} } }
+    """
+    print("Extracting Ground Truth and CDS info from dataset...")
+    info_dict = defaultdict(dict)
+    
+    # 我们必须完整遍历 dataset，因为需要拿到每个样本的 count_emb
+    for i in tqdm(range(len(dataset)), desc="Parsing Dataset"):
+        # 调用 dataset 的 __getitem__ 方法获取所有需要的信息
+        uuid, cell_type_idx, meta_info, seq_emb, count_emb = dataset[i]
+        
+        # 解析 uuid 获取 tid 和 cell_type
+        # 假设 uuid 格式仍然是 'ENST000001-HeLa-xxx'
+        parts = str(uuid).rsplit('-', 2)
+        if len(parts) < 2: 
+            continue
+            
+        tid = parts[0]
+        cell_type = parts[1]
+        
+        # 将 tensor 转换为 numpy 一维数组
+        if torch.is_tensor(count_emb):
+            gt_array = count_emb.numpy().reshape(-1)
+        else:
+            gt_array = np.array(count_emb).reshape(-1)
+            
+        info_dict[cell_type][tid] = {
+            'gt': gt_array,
+            'cds_start': meta_info['cds_start_pos'],
+            'cds_end': meta_info['cds_end_pos'],
+            'rpf_depth': meta_info.get('rpf_depth', 0) 
+        }
+        
+    print(f"Extraction complete for {len(info_dict)} cell types.")
+    return info_dict
+
 class MultiCellEvaluator:
-    def __init__(self, pkl_path, min_depth=1.0, min_cells=3):
+    # 这里的 dataset_info_dict 传入刚才提取的双层字典
+    def __init__(self, dataset, pkl_path, min_depth=1.0, min_cells=3):
+        
+        self.dataset_info = extract_gt_and_cds_from_dataset(dataset)
         self.pkl_path = pkl_path
         self.min_depth = min_depth
         self.min_cells = min_cells
+        
         self.grouped_data = self._load_and_group_data()
         self.cell_types = self._get_all_cell_types()
         
-        # --- 缓存结果容器 ---
-        # 1. 存储每个转录本的特异性指标 (TID, BioSim, R_Match, R_Mismatch...)
         self.transcript_metrics_df = None 
-        # 2. 存储两两细胞间的相关性列表 (Key: (c1, c2), Value: {'gt': [], 'pred': []})
         self.pairwise_data = None
-        # 3. 标记分析是否已运行
         self._analysis_done = False
 
     def _load_and_group_data(self):
-        print(f"Loading data from {self.pkl_path}...")
+        print(f"Loading predictions from {self.pkl_path}...")
         with open(self.pkl_path, 'rb') as f:
             raw_data = pickle.load(f)
         
         grouped = defaultdict(dict)
-        for uuid, data in raw_data.items():
-            try:
-                parts = uuid.rsplit('-', 2) 
-                if len(parts) < 3: continue 
-                tid = parts[0]
-                cell_type = parts[1]
-                
-                cds_info = data.get('cds_info', {})
-                cds_start = cds_info.get('start', 0) - 1
-                cds_end = cds_info.get('end', 0)
-                
-                grouped[tid][cell_type] = {
-                    'pred': np.array(data['pred']).reshape(-1),
-                    'gt': np.array(data['truth']).reshape(-1),
-                    'cds_start': max(0, int(cds_start)),
-                    'cds_end': int(cds_end),
-                    'depth': data.get('depth', 0)
-                }
-            except Exception:
-                continue
+        
+        # raw_data 结构为 {cell_type: {tid: predictions}}
+        for cell_type, tid_dict in raw_data.items():
+            for tid, pred_array in tid_dict.items():
+                try:
+                    # [修改核心]：检查 dataset 中是否存在对应的 (cell_type, tid)
+                    if cell_type not in self.dataset_info or tid not in self.dataset_info[cell_type]:
+                        continue
+                        
+                    ds_info = self.dataset_info[cell_type][tid]
+                    
+                    # 获取 CDS 和 GT
+                    cds_start = ds_info['cds_start']
+                    cds_end = ds_info['cds_end']
+                    gt_array = ds_info['gt']
+                    depth = ds_info.get('rpf_depth', 0)
+                    
+                    if cds_start < 0 or cds_end < 0:
+                        continue
+                    
+                    grouped[tid][cell_type] = {
+                        'pred': np.array(pred_array).reshape(-1),
+                        'gt': gt_array, # 从 dataset 中来
+                        'cds_start': int(cds_start),
+                        'cds_end': int(cds_end),
+                        'depth': float(depth)
+                    }
+                except Exception as e:
+                    continue
+                    
         print(f"Grouped into {len(grouped)} transcripts.")
         return grouped
 
@@ -328,6 +381,121 @@ class MultiCellEvaluator:
         p.save(out_path)
         print(f"Saved: {out_path}")
 
+    def compute_te_pairwise_matrices(self, out_dir="./results", log_transform=True):
+        """
+        提取所有转录本的 TE，并计算细胞类型之间的 TE 相关性矩阵
+        """
+        print("Calculating Transcript TE and pairwise correlations...")
+        os.makedirs(out_dir, exist_ok=True)
+        
+        # 1. 提取所有的 TE 值
+        te_records = []
+        for tid, cells_dict in self.grouped_data.items():
+            for cell, data in cells_dict.items():
+                cds_start, cds_end = data['cds_start'], data['cds_end']
+                
+                gt_te = calculate_morf_mean_signal(data['gt'], cds_start, cds_end)
+                pred_te = calculate_morf_mean_signal(data['pred'], cds_start, cds_end)
+                
+                te_records.append({
+                    'TID': tid,
+                    'Cell': cell,
+                    'GT_TE': gt_te,
+                    'Pred_TE': pred_te
+                })
+        
+        te_df = pd.DataFrame(te_records)
+        
+        # [修复]：强制将 TE 数据转换为 float32，解决 Pandas Cython 底层不支持 float16 导致的 TypeError
+        te_df['GT_TE'] = te_df['GT_TE'].astype('float32')
+        te_df['Pred_TE'] = te_df['Pred_TE'].astype('float32')
+        
+        # 顺手保存一下所有转录本的 TE 原始计算值
+        te_df.to_csv(os.path.join(out_dir, "transcript_TE_values.csv"), index=False)
+        
+        # 2. 将长表透视为宽表 (Rows: TID, Columns: Cell Types)
+        # [修复 2 防御性编程]：使用 pivot_table 代替 pivot，防止极小概率出现的重复 TID 导致报错
+        gt_pivot = te_df.pivot_table(index='TID', columns='Cell', values='GT_TE', aggfunc='mean')
+        pred_pivot = te_df.pivot_table(index='TID', columns='Cell', values='Pred_TE', aggfunc='mean')
+        
+        # 3. 对数转换 (防止极高表达的管家基因主导 Pearson 相关性)
+        if log_transform:
+            gt_pivot = np.log1p(gt_pivot)
+            pred_pivot = np.log1p(pred_pivot)
+            
+        # 4. 计算相关性矩阵
+        gt_corr_matrix = gt_pivot.corr()
+        pred_corr_matrix = pred_pivot.corr()
+        
+        # 5. 格式化并缓存，用于热图和 CSV
+        cells = self.cell_types
+        records = []
+        self.te_pairwise_data = {} 
+        
+        for i, c1 in enumerate(cells):
+            for j, c2 in enumerate(cells):
+                # 检查是否在矩阵列中
+                if c1 in gt_corr_matrix.columns and c2 in gt_corr_matrix.columns:
+                    val_gt = gt_corr_matrix.loc[c1, c2]
+                    val_pred = pred_corr_matrix.loc[c1, c2]
+                else:
+                    val_gt, val_pred = np.nan, np.nan
+                    
+                # 缓存供绘图使用 (包含双向)
+                self.te_pairwise_data[(c1, c2)] = {'GT': val_gt, 'Pred': val_pred}
+                
+                # 只保留唯一 pair 存入 CSV
+                if i < j: 
+                    records.append({
+                        "Cell 1": c1, "Cell 2": c2,
+                        "GT TE Corr": val_gt, "Pred TE Corr": val_pred
+                    })
+                    
+        df_corr = pd.DataFrame(records).dropna()
+        csv_path = os.path.join(out_dir, "cell_type_TE_pairwise_correlation.csv")
+        df_corr.to_csv(csv_path, index=False)
+        print(f"TE Pairwise correlation table saved to {csv_path}")
+        
+        return df_corr
+
+    def plot_te_merged_heatmap(self, out_path="te_merged_heatmap.pdf"):
+        """
+        绘制 TE 细胞间相关性的三角热图 (GT 上三角，Pred 下三角)
+        """
+        # 确保数据已计算
+        if not hasattr(self, 'te_pairwise_data') or self.te_pairwise_data is None:
+            self.compute_te_pairwise_matrices(out_dir=os.path.dirname(out_path) or ".")
+            
+        cells = self.cell_types
+        plot_data = []
+        
+        for i, c1 in enumerate(cells):
+            for j, c2 in enumerate(cells):
+                if i == j:
+                    val = 1.0
+                elif i < j: # Upper -> GT
+                    val = self.te_pairwise_data.get((c1, c2), {}).get('GT', np.nan)
+                else:       # Lower -> Pred
+                    val = self.te_pairwise_data.get((c1, c2), {}).get('Pred', np.nan)
+                    
+                plot_data.append({'Cell_X': c2, 'Cell_Y': c1, 'Correlation': val})
+                
+        df_plot = pd.DataFrame(plot_data)
+        df_plot['Cell_X'] = pd.Categorical(df_plot['Cell_X'], categories=cells)
+        df_plot['Cell_Y'] = pd.Categorical(df_plot['Cell_Y'], categories=list(reversed(cells)))
+
+        # [贴士] 这里我换了橘红色系 (OrRd) 调色板，以便跟之前 Profile 的蓝绿色区分开
+        p = (
+            ggplot(df_plot, aes(x='Cell_X', y='Cell_Y', fill='Correlation'))
+            + geom_tile(color="white", size=0.5)
+            + geom_text(aes(label='Correlation'), format_string='{:.2f}', size=8)
+            + scale_fill_distiller(palette="OrRd", direction=-1, limits=(0, 1)) 
+            + labs(title="Transcript TE Correlation: Obs. (Upper) vs Pred. (Lower)", x="", y="")
+            + theme_minimal()
+            + theme(axis_text_x=element_text(rotation=45, hjust=1), figure_size=(7, 6), panel_grid=element_blank())
+        )
+        p.save(out_path)
+        print(f"Saved TE Heatmap: {out_path}")
 
     # ==========================================
     # 5. 案例研究：Bar Chart (GT) + Line (Pred)
@@ -543,3 +711,160 @@ class MultiCellEvaluator:
         out_path = os.path.join(out_dir, f"psite_profile_case_{best_tid}.pdf")
         p.save(out_path)
         print(f"Saved plot to: {out_path}")
+
+
+    def analyze_high_variance_te_transcripts(self, out_dir="./results", top_k=100, min_cells=3, plot_top_n_cases=5):
+        """
+        寻找 TE 波动最大的 Top K 转录本，绘制双向层级聚类热图，并画出前 N 个 Case。
+        """
+        print(f"Finding Top {top_k} transcripts with highest TE variance across cells...")
+        os.makedirs(out_dir, exist_ok=True)
+        
+        # 1. 计算所有满足条件转录本的 TE
+        te_records = []
+        for tid, cells_dict in self.grouped_data.items():
+            if len(cells_dict) < min_cells: continue
+            
+            for cell, data in cells_dict.items():
+                te = calculate_morf_mean_signal(data['pred'], data['cds_start'], data['cds_end'])
+                te_records.append({'TID': tid, 'Cell': cell, 'TE': te})
+                
+        if not te_records:
+            print("No valid transcripts found based on min_cells threshold.")
+            return
+            
+        te_df = pd.DataFrame(te_records)
+        
+        # 2. 透视表 (Index: TID, Columns: Cell) 
+        # 缺失的数据 (某细胞未表达) 填充为 0
+        pivot_df = te_df.pivot_table(index='TID', columns='Cell', values='TE').fillna(0)
+        
+        # 3. 计算标准差 (Std) 作为差异指标
+        pivot_df['TE_Std'] = pivot_df.std(axis=1)
+        pivot_df['TE_Mean'] = pivot_df.mean(axis=1)
+        pivot_df['TE_CV'] = pivot_df['TE_Std'] / (pivot_df['TE_Mean'] + 1e-6) # 变异系数
+        
+        # 4. 提取 Top K (按标准差降序)
+        top_k_df = pivot_df.sort_values(by='TE_Std', ascending=False).head(top_k)
+        
+        # 保存 Top K 表格
+        csv_path = os.path.join(out_dir, f"top_{top_k}_variable_TE_transcripts.csv")
+        top_k_df.reset_index().to_csv(csv_path, index=False)
+        print(f"Saved Top {top_k} list to {csv_path}")
+        
+        # 5. 绘制双向层级聚类热图 (Clustermap)
+        # 剔除统计列，只保留表达矩阵
+        heatmap_matrix = top_k_df.drop(columns=['TE_Std', 'TE_Mean', 'TE_CV'])
+        
+        # 对数转换以优化可视化效果 (防止极值破坏颜色映射)
+        plot_matrix = np.log1p(heatmap_matrix)
+        
+        # 使用 seaborn 绘制聚类热图
+        plt.figure(figsize=(10, 12))
+        g = sns.clustermap(
+            plot_matrix, 
+            cmap="YlOrRd",           # 红黄色系，适合表达量
+            method='ward',           # 聚类方法
+            metric='euclidean',      # 距离度量
+            figsize=(12, min(20, 4 + 0.15 * top_k)), # 根据基因数动态调整高度
+            yticklabels=True, 
+            xticklabels=True
+        )
+        g.fig.suptitle(f"Hierarchical Clustering of Top {top_k} Variable TEs (log1p)", y=1.02, fontsize=14)
+        g.ax_heatmap.set_ylabel("Transcripts")
+        g.ax_heatmap.set_xlabel("Cell Types")
+        
+        clustermap_path = os.path.join(out_dir, f"top_{top_k}_te_clustermap.pdf")
+        g.savefig(clustermap_path, bbox_inches='tight')
+        plt.close()
+        print(f"Saved Clustermap to {clustermap_path}")
+        
+        # 6. 为排名最靠前的 N 个转录本绘制 Profile Case Study
+        top_tids = top_k_df.index.tolist()[:plot_top_n_cases]
+        print(f"Plotting case studies for the top {plot_top_n_cases} transcripts...")
+        for tid in top_tids:
+            self.plot_case_study(target_tid=tid, out_dir=out_dir, top_k_cells=min_cells)
+
+
+    # =========================================================================
+    # 重构: 取消寻找逻辑，直接绘图
+    # =========================================================================
+    def plot_case_study(self, target_tid, out_dir="./results", top_k_cells=4):
+        """
+        绘制指定 target_tid 的 P-site 分布。取消了之前复杂的扫描逻辑。
+        """
+        if target_tid not in self.grouped_data:
+            print(f"Target TID {target_tid} not found in grouped data.")
+            return
+
+        os.makedirs(out_dir, exist_ok=True)
+        data_dict = self.grouped_data[target_tid]
+        all_cells = list(data_dict.keys())
+        
+        if len(all_cells) == 0:
+            return
+            
+        # 提取 CDS 信息 (假设同一 TID 在不同细胞中一致)
+        ref_cell = all_cells[0]
+        cds_start = data_dict[ref_cell]['cds_start']
+        cds_end = data_dict[ref_cell]['cds_end']
+        
+        # 筛选测序深度 Top K 的细胞用于展示，避免画出全空白的子图
+        cell_depths = [(c, data_dict[c]['depth']) for c in all_cells]
+        cell_depths.sort(key=lambda x: x[1], reverse=True)
+        selected_cells = [x[0] for x in cell_depths[:top_k_cells]]
+
+        plot_data = []
+        for cell in selected_cells:
+            gt = data_dict[cell]['gt']
+            pred = data_dict[cell]['pred']
+            
+            # # Normalization (Max Norm)
+            # gt_max = np.max(gt)
+            # pred_max = np.max(pred)
+            # gt_norm = gt / gt_max if gt_max > 1e-6 else gt
+            # pred_norm = pred / pred_max if pred_max > 1e-6 else pred
+            
+            indices = np.arange(len(gt))
+            
+            df_gt = pd.DataFrame({'Position': indices, 'Value': gt, 'Source': 'Ground Truth', 'Cell': cell})
+            df_pred = pd.DataFrame({'Position': indices, 'Value': pred, 'Source': 'Prediction', 'Cell': cell})
+            plot_data.extend([df_gt, df_pred])
+
+        df_plot = pd.concat(plot_data)
+        df_plot['Cell'] = pd.Categorical(df_plot['Cell'], categories=selected_cells)
+
+        # 构建底部的 CDS 指示条
+        cds_rect_data = pd.DataFrame({
+            'xmin': [cds_start] * len(selected_cells),
+            'xmax': [cds_end] * len(selected_cells),
+            'ymin': [-0.05] * len(selected_cells), 
+            'ymax': [0] * len(selected_cells),
+            'Cell': selected_cells
+        })
+        cds_rect_data['Cell'] = pd.Categorical(cds_rect_data['Cell'], categories=selected_cells)
+
+        p = (
+            ggplot()
+            + geom_rect(data=cds_rect_data,
+                        mapping=aes(xmin='xmin', xmax='xmax', ymin='ymin', ymax='ymax'),
+                        fill="#f39c12", alpha=1.0) 
+            + geom_col(data=df_plot[df_plot['Source'] == 'Ground Truth'], 
+                       mapping=aes(x='Position', y='Value'),
+                       fill="gray", alpha=0.4, width=1)
+            + geom_line(data=df_plot[df_plot['Source'] == 'Prediction'], 
+                        mapping=aes(x='Position', y='Value'),
+                        color="#005b96", size=0.3, alpha=1)
+            + facet_grid('Cell ~ .', scales="free_y")
+            + labs(title=f"Case Study: {target_tid}",
+                   subtitle="Gray: GT | Blue: Pred | Orange: CDS",
+                   x="Position (nt)", y="Translation profile")
+            + theme_classic()
+            + theme(
+                strip_background=element_rect(fill="#f0f0f0"),
+                figure_size=(10, 1.5 * len(selected_cells))
+            )
+        )
+        
+        out_path = os.path.join(out_dir, f"psite_profile_case_{target_tid}.pdf")
+        p.save(out_path, verbose=False) # 关闭单独打印每个图的保存日志，避免刷屏

@@ -20,6 +20,15 @@ from train.masking_adapter import BatchMaskingAdapter, get_dynamic_mask_ratio
 
 torch.set_printoptions(profile="full")
 
+class TensorEncoder(json.JSONEncoder):
+    """自定义 JSON 编码器，让 json.dump 自动解析并转换 PyTorch Tensor"""
+    def default(self, obj):
+        if isinstance(obj, torch.Tensor):
+            # 如果是单个数值的 Tensor 转为 float，如果是多维 Tensor 转为 list
+            return obj.tolist() if obj.numel() > 1 else float(obj.item())
+        # 对于其他类型，使用默认处理方式
+        return super().default(obj)
+
 def create_lr_lambda(total_steps: int, warmup_steps: int = 0, min_eta: float = 1e-4):
     """
     Linear warmup then cosine decay lambda for LambdaLR.
@@ -77,7 +86,7 @@ class PretrainingTrainer:
         Number of epochs to train.
     accumulation_steps : int
         Gradient accumulation steps.
-    mask_value, mask_perc, head_warmup_perc:
+    mask_value, mask_perc:
         Masking-related hyperparameters used by the user's masking adapter.
     learning_rate, lr_warmup_perc, beta, epsilon, weight_decay:
         Optimizer and scheduler settings.
@@ -100,8 +109,7 @@ class PretrainingTrainer:
         print_progress_every: int = 50,
         save_every: int = 5,
         epoch_num: int = 100,
-        head_warmup_perc: dict = {"seq": 0, "count": 0, "cell": 0},
-        mask_perc: dict = {"seq": 0.1, "count": 0.3, "cell": 0.1},
+        mask_perc: dict = {"count": 0.3, "cell": 0.1},
         learning_rate: float = 1e-5,
         lr_warmup_perc: float = 0.2,
         accumulation_steps: int = 5,
@@ -134,8 +142,7 @@ class PretrainingTrainer:
         # masking and sampler (reuse user's adapters)
         self.masking_adapter = BatchMaskingAdapter(mask_value)
         self.mask_perc = mask_perc
-        self.current_mask_range = self.mask_perc.get("count", (0, 0.2)),
-        self.head_warmup_perc = head_warmup_perc
+        self.current_mask_range = self.mask_perc.get("count", (0, 0.2))
 
         # samplers that produce per-rank batches
         self.sampler = DistributedBucketSampler(
@@ -184,14 +191,14 @@ class PretrainingTrainer:
 
         # bookkeeping for resume
         self.start_epoch = 0
-        self.best_val_loss = torch.tensor([np.inf] * len(self.mask_perc))  # seq, count, cell default
+        self.best_val_loss = float('inf')
         if self.resume:
             self._maybe_load_checkpoint()
 
         if self.rank == 0:
             print(f"[Trainer] model_trainer_name={self.model_full_name}")
             print(f"[Trainer] device={self.device}, steps_per_epoch={self.steps_per_epoch}, total_steps={self._total_steps}")
-            print(f"[Trainer] mask_perc={self.mask_perc}, head_warmup={self.head_warmup_perc}")
+            print(f"[Trainer] mask_perc={self.mask_perc}")
 
     # -------------------------
     # optimizer / param grouping
@@ -250,7 +257,7 @@ class PretrainingTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "scaler": self.scaler.state_dict(),
-            "best_val_loss": self.best_val_loss.tolist(),
+            "best_val_loss": self.best_val_loss,
             "training_epoch_data": self.training_epoch_data,
             "training_batch_data": self.training_batch_data,
         }
@@ -274,7 +281,13 @@ class PretrainingTrainer:
             model_unwrapped = unwrap_model(self.model)
             model_unwrapped.load_state_dict(ckpt["model"], strict=True)
             self.start_epoch = int(ckpt.get("epoch", 0))
-            self.best_val_loss = torch.tensor(ckpt.get("best_val_loss", self.best_val_loss.tolist()))
+
+            bvl = ckpt.get("best_val_loss", float('inf'))
+            if isinstance(bvl, torch.Tensor):
+                self.best_val_loss = float(bvl.sum().item())
+            else:
+                self.best_val_loss = bvl
+
             # attempt to restore optimizer/scheduler/scaler if present
             try:
                 if "optimizer" in ckpt and ckpt["optimizer"] is not None:
@@ -296,18 +309,6 @@ class PretrainingTrainer:
     # -------------------------
     # masking + collate pipeline
     # -------------------------
-    def get_active_heads(self, epoch: int) -> List[str]:
-        """
-        Determine which heads/tasks are active at the given epoch according to the warmup schedule.
-        """
-        active_heads: List[str] = []
-        if "seq" in unwrap_model(self.model).list_heads() and epoch >= self.head_warmup_perc.get("seq", np.inf) * self.epoch_num:
-            active_heads.append("seq")
-        if "count" in unwrap_model(self.model).list_heads() and epoch >= self.head_warmup_perc.get("count", np.inf) * self.epoch_num:
-            active_heads.append("count")
-        if self.rank == 0:
-            print(f"[Trainer] Activate heads: {active_heads}")
-        return active_heads
     
     def collate_mask_pad_batch_to_cuda(self, batch, full_mask=0.15):
         """
@@ -326,7 +327,8 @@ class PretrainingTrainer:
         # pad sequences
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         # count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
-        count_embs_padded = pad_sequence(torch.expm1(count_embs), batch_first=True, padding_value=-1) # PoissonNLLLoss
+        count_embs_expm1 = [torch.expm1(c) for c in count_embs] # PoissonNLLLoss
+        count_embs_padded = pad_sequence(count_embs_expm1, batch_first=True, padding_value=-1)  # PoissonNLLLoss
 
         # pad mask where True means valid token
         pad_masks = (seq_embs_padded != -1)[:, :, 0].squeeze(-1)
@@ -384,73 +386,39 @@ class PretrainingTrainer:
             pad_masks
         )
     
-
-    # -------------------------
-    # multi-task loss & DWA
-    # -------------------------
-    def multi_task_criterion(self, active_heads, 
-                             result: Dict[str, torch.Tensor],
-                             seq_raw_emb: torch.Tensor, seq_emb_masks: torch.Tensor,
-                             count_raw_emb: torch.Tensor, count_emb_masks: torch.Tensor,
-                             eps: float = 1e-6) -> torch.Tensor:
+    def count_task_criterion(
+            self,
+            result: Dict[str, torch.Tensor],
+            count_raw_emb: torch.Tensor, 
+            count_emb_masks: torch.Tensor,
+            eps: float = 1e-6) -> torch.Tensor:
         """
         Compute per-task losses and return a tensor [seq_loss, count_loss, cell_loss].
         result is expected to be a dict mapping 'seq','count','cell' to model outputs.
         """
         device = self.device
-        losses = {head: torch.tensor(0.0, device=device) for head in active_heads}
 
-        if "seq" in active_heads:
-            seq_pred = result["seq"]  # shape: (B, L, 4) or similar
-            num_masked_seq_token = seq_emb_masks.sum()
-            seq_loss_all = -(torch.nn.functional.log_softmax(seq_pred, dim=-1) * seq_raw_emb * seq_emb_masks.unsqueeze(-1).float())
-            losses["seq"] = seq_loss_all.sum() / (num_masked_seq_token + eps)
+        # count_pred = result["count"]  # (B, L, 10 or 1)
+        count_pred = result["count"].float() # PoissonNLLLoss
+        count_raw = count_raw_emb.float().clamp(min=0.0) # PoissonNLLLoss
 
-        if "count" in active_heads:
-            # count_pred = result["count"]  # (B, L, 10 or 1)
-            count_pred = result["count"].float() # PoissonNLLLoss
-            count_raw = count_raw_emb.float().clamp(min=0.0) # PoissonNLLLoss
-
-            num_masked_count_token = count_emb_masks.sum()
-            if count_pred.shape[2] == 1:
-                ## for summarized density
-                # count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-                count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw.squeeze(-1)) * count_emb_masks.float() # PoissonNLLLoss
-            else:
-                ## for RPF density for all read length
-                # count_loss_all = self.count_criterion(count_pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-                count_loss_all = self.count_criterion(count_pred, count_raw) * count_emb_masks.unsqueeze(-1).float() # PoissonNLLLoss
-
-            losses["count"] = count_loss_all.sum() / (num_masked_count_token + eps)
-
-        return torch.stack([loss for _, loss in losses.items()], dim=0)
-
-    
-    def dynamic_weight_average(self, epoch: int, active_heads: list, T: float = 2.0, eps: float = 1e-8) -> torch.Tensor:
-        """
-        Dynamic Weight Averaging (DWA) heuristic: adapt task weights based on recent training losses.
-        """
-        device = self.device
-        base = torch.tensor([2.0 * i + 1.0 for i in range(len(active_heads))][::-1], dtype=torch.float32, device=device)
-        if epoch > 1 and len(self.training_epoch_data) >= 2:
-            prev = torch.tensor(self.training_epoch_data[-1]["train_loss"], dtype=torch.float32, device=device)
-            prev2 = torch.tensor(self.training_epoch_data[-2]["train_loss"], dtype=torch.float32, device=device)
-            w_i = prev / (prev2 + eps)
-            if len(w_i) == len(base):
-                loss_weight = base * torch.nn.functional.softmax(w_i / T, dim=-1)
-            else:
-                raise RuntimeError("Numer of mask tasks are not equal to number of losses to resumed!")
+        num_masked_count_token = count_emb_masks.sum()
+        if count_pred.shape[2] == 1:
+            ## for summarized density
+            # count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
+            count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw.squeeze(-1)) * count_emb_masks.float() # PoissonNLLLoss
         else:
-            loss_weight = base
-        if self.rank == 0:
-            print(f"[Trainer] loss_weight: {loss_weight}")
-        return loss_weight
+            ## for RPF density for all read length
+            # count_loss_all = self.count_criterion(count_pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
+            count_loss_all = self.count_criterion(count_pred, count_raw) * count_emb_masks.unsqueeze(-1).float() # PoissonNLLLoss
+
+        return count_loss_all.sum() / (num_masked_count_token + eps)
 
     
     # -------------------------
     # epoch-level train / eval
     # -------------------------
-    def train_epoch(self, epoch: int, active_heads: list) -> Tuple[torch.Tensor, List]:
+    def train_epoch(self, epoch: int) -> Tuple[torch.Tensor, List]:
         """
         Run one training epoch on the train dataset for this rank/process.
         Returns mean losses (tensor) and gathered per-batch losses from all ranks.
@@ -465,12 +433,11 @@ class PretrainingTrainer:
             pin_memory=True,
             collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s)
         )
-        total_losses = torch.zeros(len(active_heads)).to(self.device)
-        local_losses = []
+        total_loss = torch.zeros(1).to(self.device)
+        local_loss = []
         batch_num = len(dataloader)
         start_time = time.time()
         self.sampler.set_epoch(epoch) # DDP
-        loss_weight = self.dynamic_weight_average(epoch, active_heads, T=2.0) # DWA
 
         if self.rank == 0:
             pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} train")
@@ -484,16 +451,11 @@ class PretrainingTrainer:
 
             # run the forward pass with autocasting
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = self.model(seq_embs_masked, count_embs_masked, cell_idxs_masked, pad_masks, active_heads)
+                outputs = self.model(seq_embs_masked, count_embs_masked, cell_idxs_masked, pad_masks, ["count"])
                 # multi-task learning losses
-                losses = self.multi_task_criterion(active_heads, outputs,
-                                                   seq_embs_padded, seq_emb_masks, 
-                                                   count_embs_padded, count_emb_masks)
+                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks)
                 ## mean loss (dynamic weight average) for accumulation
-                acc_losses = losses / self.ac_steps
-                # compute a scalar loss for backward that respects loss_weight
-                # normalize loss_weight to sum=1 to avoid scaling issues across different numbers of tasks
-                scalar_for_backward = (acc_losses * (loss_weight / loss_weight.sum())).sum()
+                acc_loss = loss / self.ac_steps
 
             # to synchronize and update in this batch ?
             do_sync = ((batch_idx + 1) % self.ac_steps == 0)
@@ -506,7 +468,7 @@ class PretrainingTrainer:
             )
             with context:
                 # scales loss and back propagation accumulatively
-                self.scaler.scale(scalar_for_backward).backward()
+                self.scaler.scale(acc_loss).backward()
 
             # synchronic gradient accumulation
             if do_sync:
@@ -515,21 +477,21 @@ class PretrainingTrainer:
                 self.scheduler.step() # update learning rate
                 self.optimizer.zero_grad() # reset gradient
 
-            total_losses += losses.detach()
-            local_losses.append([float(l.item()) for l in losses])
+            total_loss += loss.detach()
+            local_loss.append([float(loss)])
 
             if self.rank == 0 and (batch_idx + 1) % self._print_progress_every == 0:
                 pbar.update(self._print_progress_every)
-                print(f"loss: {losses}")
+                print(f"loss: {loss}")
 
         if self.rank == 0:
             pbar.close()
 
         # sync and gather
-        dist.all_reduce(total_losses, op=dist.ReduceOp.SUM) # total of seq_loss and count_loss
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM) # total of seq_loss and count_loss
         gathered_losses = [None for _ in range(self.world_size)]
-        dist.all_gather_object(gathered_losses, local_losses)
-        mean_epoch_losses = total_losses/float(batch_num * self.world_size)
+        dist.all_gather_object(gathered_losses, local_loss)
+        mean_epoch_losses = total_loss/float(batch_num * self.world_size)
 
         # time
         end_time = time.time()
@@ -538,7 +500,7 @@ class PretrainingTrainer:
         return mean_epoch_losses, gathered_losses
     
 
-    def eval_epoch(self, epoch: int, active_heads: list) -> Tuple[torch.Tensor, List]:
+    def eval_epoch(self, epoch: int) -> Tuple[torch.Tensor, List]:
         """
         Run one evaluation epoch (no gradient).
         """
@@ -552,8 +514,8 @@ class PretrainingTrainer:
             pin_memory=True,
             collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, full_mask=1)
         )
-        total_losses = torch.zeros(len(active_heads)).to(self.device)
-        local_losses = []
+        total_loss = torch.zeros(1).to(self.device)
+        local_loss = []
         batch_num = len(val_loader)
         start_time = time.time()
         self.val_sampler.set_epoch(epoch) # DDP
@@ -569,27 +531,25 @@ class PretrainingTrainer:
 
                 # run the forward pass with autocasting
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = unwrap_model(self.model).predict(seq_embs_masked, count_embs_masked, cell_idxs_masked, pad_masks, active_heads)
+                outputs = unwrap_model(self.model).predict(seq_embs_masked, count_embs_masked, cell_idxs_masked, pad_masks, ["count"])
                 # multi-task learning losses
-                losses = self.multi_task_criterion(active_heads, outputs,
-                                                seq_embs_padded, seq_emb_masks, 
-                                                count_embs_padded, count_emb_masks)
+                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks)
 
-            total_losses += losses.detach()
-            local_losses.append([float(l.item()) for l in losses])
+            total_loss += loss.detach()
+            local_loss.append([float(loss)])
 
             if self.rank == 0 and (batch_idx + 1) % self._print_progress_every == 0:
                 pbar.update(self._print_progress_every)
-                print(f"loss: {losses}") 
+                print(f"loss: {loss}") 
 
         if self.rank == 0:
             pbar.close()
 
         # all-reduce and gather
-        dist.all_reduce(total_losses, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         gathered_losses = [None for _ in range(self.world_size)]
-        dist.all_gather_object(gathered_losses, local_losses)
-        mean_epoch_losses = total_losses/float(batch_num * self.world_size)
+        dist.all_gather_object(gathered_losses, local_loss)
+        mean_epoch_losses = total_loss/float(batch_num * self.world_size)
 
         # time
         end_time = time.time()
@@ -611,9 +571,8 @@ class PretrainingTrainer:
             if self.rank == 0:
                 print(f"[Trainer] === Starting epoch {epoch+1}/{self.epoch_num} ===")
 
-            active_heads = self.get_active_heads(epoch)
             # update mask ratio
-            if "count" in active_heads and isinstance(self.mask_perc["count"], (tuple, list)):
+            if isinstance(self.mask_perc["count"], (tuple, list)):
                 if len(self.mask_perc["count"]) == 2:
                     start = self.mask_perc["count"][0]
                     end = self.mask_perc["count"][1]
@@ -623,23 +582,26 @@ class PretrainingTrainer:
             if self.rank == 0:
                 print(f"[Trainer] === Epoch {epoch+1} Curriculum: Mask Ratio Range set to {self.current_mask_range}")
 
-            train_loss, train_batch_loss = self.train_epoch(epoch, active_heads)
-            val_loss, val_batch_loss = self.eval_epoch(epoch, active_heads)
+            train_loss, train_batch_loss = self.train_epoch(epoch)
+            val_loss, val_batch_loss = self.eval_epoch(epoch)
 
             # update best and bookkeeping (only for active heads/mask task)
-            is_best = torch.sum(val_loss[:len(active_heads)]) < torch.sum(self.best_val_loss[:len(active_heads)])
+            val_loss_float = float(val_loss.item())
+            is_best = val_loss_float < self.best_val_loss
             if is_best:
-                self.best_val_loss = val_loss.detach().cpu()
+                self.best_val_loss = val_loss_float
 
-            self.training_epoch_data.append({"epoch": epoch+1, "train_loss": train_loss.tolist(), "valid_loss": val_loss.tolist()})
+            self.training_epoch_data.append({"epoch": epoch+1, "train_loss": float(train_loss.item()), "valid_loss": val_loss})
             self.training_batch_data.append({"epoch": epoch+1, 
-                                             "train_batch_loss": [x for proc in train_batch_loss for x in proc], 
-                                             "valid_loss": [x for proc in val_batch_loss for x in proc]})
+                                             "train_batch_loss": [x for x in train_batch_loss], 
+                                             "valid_loss": [x for x in val_batch_loss]})
 
             # save on master periodically
             if self.rank == 0 and (epoch + 1) % self._save_every == 0:
                 self.save_checkpoint(epoch + 1, is_best)
+    
                 with open(os.path.join(self.log_dir, self.model_full_name + ".epoch_data.json"), "w") as f:
-                    json.dump(self.training_epoch_data, f)
+                    json.dump(self.training_epoch_data, f, cls=TensorEncoder)
+                
                 with open(os.path.join(self.log_dir, self.model_full_name + ".batch_data.json"), "w") as f:
-                    json.dump(self.training_batch_data, f)
+                    json.dump(self.training_batch_data, f, cls=TensorEncoder)

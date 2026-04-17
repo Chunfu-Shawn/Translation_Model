@@ -24,6 +24,7 @@ class ModelConfig:
     number_of_layers: int = 6
     d_ff: int = 2048
     adaptive_dim: int = 32
+    gamma_scale: float = 0.2
     p_drop: float = 0.1
     # optional metadata
     model_name: Optional[str] = None
