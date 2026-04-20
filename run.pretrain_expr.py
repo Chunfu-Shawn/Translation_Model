@@ -25,7 +25,9 @@ train_dataset = TranslationDataset.from_h5(train_dataset_path, lazy=True)
 val_dataset = TranslationDataset.from_h5(val_dataset_path, lazy=True)
 
 # create model
-base_model = TranslationBaseModel.from_config("config/base_model_expr_512d_16h_12l_7c_64env_8ad.yaml").cuda(rank)
+base_model = TranslationBaseModel.from_config(
+    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_512d_16h_12l_7c_64env_8ad.yaml"
+    ).cuda(rank)
 # create heads
 base_model.add_head(
     "count",
