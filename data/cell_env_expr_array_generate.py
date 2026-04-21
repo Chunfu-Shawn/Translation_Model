@@ -2,102 +2,205 @@ import os
 import pandas as pd
 import numpy as np
 import torch
+import json
 
-def build_expression_dict_end_to_end(file_path, output_pt_path, tpm_threshold=5.0, cv_threshold=1.0):
+def prepare_ortholog_mapping(ortho_csv_path):
     """
-    一站式处理流水线：
-    读取Counts -> 计算全集TPM -> 过滤高变基因 -> Log2平滑 -> Z-score标准化 -> 打包为 float16 PT文件
+    Reads BioMart ortholog table and resolves 1:many, many:1, and many:many 
+    relationships using a greedy confidence-based approach to construct a strict 1:1:1 mapping.
     """
-    print(f"正在读取文件: {file_path}")
+    print(f"Loading ortholog table from: {ortho_csv_path}")
+    # Assuming the file is tab-separated. Change to sep=',' if it is a standard CSV.
+    df = pd.read_csv(ortho_csv_path, sep='\t') 
+
+    # Define column names (ensure these exactly match your file headers)
+    h_id = 'Gene stable ID'
+    mac_id = 'Macaque gene stable ID'
+    mac_conf = 'Macaque orthology confidence [0 low, 1 high]'
+    mus_id = 'Mouse gene stable ID'
+    mus_conf = 'Mouse orthology confidence [0 low, 1 high]'
+
+    # ---------------------------------------------------------
+    # 1. Independently resolve Human <-> Macaque 1:1 relationships
+    # ---------------------------------------------------------
+    df_mac = df[[h_id, mac_id, mac_conf]].dropna(subset=[h_id, mac_id]).copy()
+    # Sort by confidence descending
+    df_mac = df_mac.sort_values(by=mac_conf, ascending=False)
+    # Greedy deduplication: enforce uniqueness for both Human and Macaque IDs, keeping the highest confidence
+    df_mac = df_mac.drop_duplicates(subset=[h_id], keep='first')
+    df_mac = df_mac.drop_duplicates(subset=[mac_id], keep='first')
+
+    # ---------------------------------------------------------
+    # 2. Independently resolve Human <-> Mouse 1:1 relationships
+    # ---------------------------------------------------------
+    df_mus = df[[h_id, mus_id, mus_conf]].dropna(subset=[h_id, mus_id]).copy()
+    df_mus = df_mus.sort_values(by=mus_conf, ascending=False)
+    df_mus = df_mus.drop_duplicates(subset=[h_id], keep='first')
+    df_mus = df_mus.drop_duplicates(subset=[mus_id], keep='first')
+
+    # ---------------------------------------------------------
+    # 3. Intersect to build a strict 1:1:1 Triplet coordinate system
+    # ---------------------------------------------------------
+    # Inner join using Human ID as the anchor
+    df_triplets = pd.merge(df_mac[[h_id, mac_id]], df_mus[[h_id, mus_id]], on=h_id, how='inner')
+
+    # Build unified mapping dictionaries (Any species ID -> Unified Human Anchor ID)
+    id_mapping = {}
+    anchor_to_native = {} 
+
+    for _, row in df_triplets.iterrows():
+        anchor = row[h_id]
+        m_id = row[mac_id]
+        ms_id = row[mus_id]
+
+        # Reverse lookup dict: map any species-specific ID back to the anchor
+        id_mapping[anchor] = anchor
+        id_mapping[m_id] = anchor
+        id_mapping[ms_id] = anchor
+
+        # Forward tracking dict: useful for downstream traceability analysis
+        anchor_to_native[anchor] = {
+            'Human': anchor,
+            'Macaque': m_id,
+            'Mouse': ms_id
+        }
+
+    print(f"Cleaning complete: Parsed {len(df_triplets)} strict 1-to-1-to-1 shared ortholog gene families.")
+    return id_mapping, anchor_to_native
+
+
+def build_cross_species_expression_dict(
+    file_path, 
+    output_pt_path, 
+    id_mapping, 
+    reference_anchor_ids=None # Reference gene list to ensure consistent dimensions across species
+):
+    """
+    Aligns single-species count files and extracts expression vectors.
+    Performs Z-score normalization on the WHOLE GENOME first, then maps to orthologs.
+    """
+    print(f"\nReading counts file: {file_path}")
     df = pd.read_csv(file_path, sep='\t', comment='#')
     
-    # 1. 清理列名并识别样本列
     bam_cols = df.columns[6:]
     rename_dict = {col: os.path.basename(col).replace('.bam', '') for col in bam_cols}
     df = df.rename(columns=rename_dict)
     sample_cols = list(rename_dict.values())
     
-    print(f"检测到 {len(sample_cols)} 个细胞系样本: {sample_cols}")
+    df['Clean_Geneid'] = df['Geneid'].str.split('.').str[0]
     
-    # 2. 计算全集 TPM (必须在全局进行以保证 Scaling Factor 准确)
-    print("正在计算全集 TPM...")
-    tpm_cols = []
+    # ==========================================
+    # 1. Whole-Genome TPM and Z-score Calculation
+    # ==========================================
+    print("Calculating RPK, TPM, and Z-score across the entire native genome...")
+    zscore_cols = []
+    
     for col in sample_cols:
+        # Calculate native RPK
         rpk = df[col] / (df['Length'] / 1000.0)
-        scaling_factor = rpk.sum() / 1e6
+        # Calculate whole-transcriptome sequencing depth
+        scaling_factor = rpk.sum() / 1e6  
+        # Calculate TPM
+        tpm = rpk / scaling_factor
         
-        tpm_col_name = f"{col}_TPM"
-        df[tpm_col_name] = rpk / scaling_factor
-        tpm_cols.append(tpm_col_name)
-        
-    # 3. 双重过滤 (寻找高变基因)
-    print("正在根据 TPM 和 CV 阈值过滤高变基因...")
-    max_tpm = df[tpm_cols].max(axis=1)
-    mask_expressed = max_tpm > tpm_threshold
-    
-    tpm_mean = df[tpm_cols].mean(axis=1)
-    tpm_std = df[tpm_cols].std(axis=1)
-    cv = tpm_std / (tpm_mean + 1e-8)  # 加上1e-8防除0
-    mask_variation = cv > cv_threshold
-    
-    # 得到只包含高变基因的 DataFrame 子集
-    filtered_df = df[mask_expressed & mask_variation].copy()
-    
-    print(f"-> 过滤前基因总数: {len(df)}")
-    print(f"-> 过滤后高变基因数量: {len(filtered_df)}")
-    
-    # 4. 提取干净的 Gene ID，这将决定后续输入张量的排列顺序
-    filtered_df['Clean_Geneid'] = filtered_df['Geneid'].str.split('.').str[0]
-    gene_ids = filtered_df['Clean_Geneid'].tolist()
-    d_expr_size = len(gene_ids)
-    print(f"最终模型的输入基因维度 (d_expr): {d_expr_size}")
-    
-    # 5. 在高变子集上计算 Log2 和 Z-score，并打包字典
-    print("正在对高变子集执行 Log2 平滑与 Z-score 标准化...")
-    expr_dict = {}
-    
-    for col in sample_cols:
-        # 提取当前细胞系的 TPM 子集
-        tpm = filtered_df[f"{col}_TPM"]
+        # Log2 smoothing
         log_tpm = np.log2(tpm + 1.0)
-        
-        # 在当前细胞系内部对特征进行 Z-score 标准化
+        # Z-score standardization (adding 1e-8 to prevent division by zero)
         z_score = (log_tpm - log_tpm.mean()) / (log_tpm.std() + 1e-8)
         
-        # 转为 float16 以极大地节省模型显存
-        tensor_fp16 = torch.tensor(z_score.values, dtype=torch.float16)
-        expr_dict[col] = tensor_fp16
+        z_col_name = f"{col}_Zscore"
+        df[z_col_name] = z_score
+        zscore_cols.append(z_col_name)
+
+    # ==========================================
+    # 2. Map to Ortholog Anchor IDs
+    # ==========================================
+    # Map to Anchor ID (genes without orthology will become NaN)
+    df['Anchor_ID'] = df['Clean_Geneid'].map(id_mapping)
+    aligned_df = df.dropna(subset=['Anchor_ID']).copy()
+    
+    # Merge any residual many-to-one mappings safely using mean
+    # (Though prepare_ortholog_mapping ensures 1:1, this is a safe fallback)
+    grouped_zscore = aligned_df.groupby('Anchor_ID')[zscore_cols].mean()
+
+    # ==========================================
+    # 3. Align to Reference Coordinate System
+    # ==========================================
+    if reference_anchor_ids is not None:
+        print(f"Aligning to reference gene coordinates (Dimension: {len(reference_anchor_ids)})...")
+        # Reindex using the reference list. Missing genes are filled with 0.0
+        # (0.0 is perfect here, as it mathematically represents the whole-genome average baseline)
+        final_df = grouped_zscore.reindex(reference_anchor_ids).fillna(0.0)
+        final_gene_ids = reference_anchor_ids
+    else:
+        print("No reference coordinates provided. Using all currently mapped orthologs as the baseline...")
+        final_df = grouped_zscore.copy()
+        final_gene_ids = final_df.index.tolist()
+        print(f"-> Retained {len(final_gene_ids)} ortholog genes for the reference coordinate system.")
+    
+    # ==========================================
+    # 4. Pack into Dictionary and Save
+    # ==========================================
+    expr_dict = {}
+    for col, z_col in zip(sample_cols, zscore_cols):
+        expr_dict[col] = torch.tensor(final_df[z_col].values, dtype=torch.float16)
         
-    # 6. 保存为 .pt 文件
     os.makedirs(os.path.dirname(output_pt_path) or '.', exist_ok=True)
     torch.save(expr_dict, output_pt_path)
+    print(f"✅ Successfully saved expression dictionary to: {output_pt_path} (Shape: {expr_dict[sample_cols[0]].shape})")
     
-    print(f"\n✅ 成功保存精简版表达量字典至: {output_pt_path}")
-    print(f"   字典键值 (Keys): {list(expr_dict.keys())}")
-    print(f"   向量形状 (Shape): {expr_dict[sample_cols[0]].shape}")
-    print(f"   数据类型 (Dtype): {expr_dict[sample_cols[0]].dtype}")
-    
-    return expr_dict, gene_ids
+    return expr_dict, final_gene_ids
 
-
+# ==========================================
+# Usage Example: Cross-species Pipeline
+# ==========================================
 if __name__ == "__main__":
-    file_path = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts.txt"
-    output_pt = "/home/user/data3/rbase/translation_model/models/src/config/cell_expression_dict.pt"
+    # Config file paths
+    ortholog_csv = "/home/user/data3/rbase/genome_ref/Homolog/human_macaque_mouse_orthologs.tsv" 
+    
+    # Assuming you have featureCounts results for different species
+    human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts.txt"
+    mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_counts.txt"
+    
+    out_dir = "/home/user/data3/rbase/translation_model/models/lib"
 
-    # 运行一站式构建管道
-    expr_dict, gene_list = build_expression_dict_end_to_end(
-        file_path=file_path, 
-        output_pt_path=output_pt, 
-        tpm_threshold=5.0,   # 最大 TPM 至少为 5
-        cv_threshold=1.0     # 变异系数大于 1
+    # 1. Preprocess the ortholog table
+    id_mapping, anchor_to_native = prepare_ortholog_mapping(ortholog_csv)
+
+    # ---------------------------------------------------------
+    # Phase 1: Process Human data to establish the "Global Reference Coordinates"
+    # ---------------------------------------------------------
+    print("\n========== Phase 1: Establishing Human Reference Coordinates ==========")
+    human_pt = os.path.join(out_dir, "human_expression_dict.pt")
+    _, global_anchor_ids = build_cross_species_expression_dict(
+        file_path=human_counts, 
+        output_pt_path=human_pt, 
+        id_mapping=id_mapping,
+        reference_anchor_ids=None # Set to None to let the script define the universe via Human data
     )
 
-    # 打印查看前 10 个提取的高变 ID
-    print("\n提取的高变 ID 向量前 10 个示例:")
-    print(gene_list[:10])
-
-    # 保存基因顺序字典，以便未来核查或对齐新数据
-    order_file = output_pt.replace('.pt', '_gene_order.txt')
+    # Save this reference coordinate system for future lookups
+    order_file = os.path.join(out_dir, "global_anchor_gene_order.txt")
     with open(order_file, 'w') as f:
-        f.write("\n".join(gene_list))
-    print(f"✅ 基因排列顺序已单独保存至: {order_file}")
+        f.write("\n".join(global_anchor_ids))
+    print(f"✅ Global reference coordinate system saved to: {order_file}")
+
+    # Save species traceability dictionary
+    mapping_file = os.path.join(out_dir, "global_species_id_mapping.json")
+    final_mapping_dict = {gid: anchor_to_native[gid] for gid in global_anchor_ids if gid in anchor_to_native}
+    with open(mapping_file, 'w') as f:
+        json.dump(final_mapping_dict, f, indent=4)
+
+    # ---------------------------------------------------------
+    # Phase 2: Process other species, forcibly aligning to the reference coordinates
+    # ---------------------------------------------------------
+    # print("\n========== Phase 2: Aligning Mouse Data ==========")
+    # mouse_pt = os.path.join(out_dir, "mouse_expression_dict.pt")
+    # build_cross_species_expression_dict(
+    #     file_path=mouse_counts, 
+    #     output_pt_path=mouse_pt, 
+    #     id_mapping=id_mapping,
+    #     reference_anchor_ids=global_anchor_ids # Forcible alignment
+    # )
+
+    # print("\n🎉 All cross-species alignment tasks are complete! You can now merge human_pt and mouse_pt to feed the model.")

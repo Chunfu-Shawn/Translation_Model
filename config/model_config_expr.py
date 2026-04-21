@@ -1,5 +1,5 @@
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 __author__ = "Chunfu Xiao"
 __version__="1.1.0"
@@ -21,10 +21,14 @@ class ModelConfig:
     d_model: int
     d_expr: int
     d_cell_env: int = 32
+    d_species: int = 16
+
+    all_species: List[str] = field(default_factory=lambda: ["human", "macaque", "mouse"])
+    
     expr_dict_path: Optional[str] = None
     n_heads: int = 8
     number_of_layers: int = 6
-    d_ff: int = 2048
+    d_ff: int = 1024
     adaptive_dim: int = 32
     gamma_scale: float = 0.5
     p_drop: float = 0.1

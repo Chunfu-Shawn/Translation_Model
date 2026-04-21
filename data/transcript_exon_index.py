@@ -90,7 +90,13 @@ def create_optimized_index(gtf_file, db_file):
     transcript_cds_dict = {}
 
     for transcript in db.features_of_type('transcript'):
+        # --- 统一处理带有版本的 transcript_id 开始 ---
         tid = transcript.id
+        # 如果 tid 中没有小数点，且 attributes 中存在 'transcript_version'，则进行拼接
+        if "." not in tid and 'transcript_version' in transcript.attributes:
+            version = transcript.attributes['transcript_version'][0]
+            tid = f"{tid}.{version}"
+
         # print(transcript)
         gene_id = transcript.attributes['gene_id'][0]
         chrom = transcript.chrom
@@ -251,16 +257,35 @@ if __name__=="__main__":
     #     print(tid)
     #     print(loaded_tx_cds[tid])
 
-    # In-house PacBio
+    # # In-house PacBio
+    # gtf_file = '/home/user/data3/lit/project/sORFs/08-Iso-seq-20250717/results/custom.gtf.with_orf.gtf'
+    # tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.inhouse.pkl'
+    # tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.inhouse.pkl'
+    # tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.inhouse.pkl'
+    # tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.inhouse.pkl'
+    
+    # # build index
+    # tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.inhouse.db')
 
-    gtf_file = '/home/user/data3/lit/project/sORFs/08-Iso-seq-20250717/results/custom.gtf.with_orf.gtf'
-    tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.inhouse.pkl'
-    tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.inhouse.pkl'
-    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.inhouse.pkl'
-    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.inhouse.pkl'
+    # # save
+    # with open(tree_index_file, 'wb') as f:
+    #     pickle.dump(tree_index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tree_strand_index_file, 'wb') as f:
+    #     pickle.dump(tree_strand_index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tx_meta_file, 'wb') as f:
+    #     pickle.dump(tx_meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tx_cds_file, 'wb') as f:
+    #     pickle.dump(tx_cds, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    ####### Macaque #######
+    gtf_file = '/home/user/data3/rbase/genome_ref/Rhesus_macaque/rheMac10/rheMac10.ensGene.gtf'
+    tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.macaque.pkl'
+    tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.macaque.pkl'
+    tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.macaque.pkl'
+    tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.macaque.pkl'
     
     # build index
-    tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.inhouse.db')
+    tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.macaque.db')
 
     # save
     with open(tree_index_file, 'wb') as f:
@@ -271,3 +296,23 @@ if __name__=="__main__":
         pickle.dump(tx_meta, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(tx_cds_file, 'wb') as f:
         pickle.dump(tx_cds, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    ####### Mouse #######
+    # gtf_file = '/home/user/data3/rbase/genome_ref/Mus_musculus/gencode.vM32.annotation.gtf'
+    # tree_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.mouse.pkl'
+    # tree_strand_index_file = '/home/user/data3/rbase/translation_model/models/lib/genome_index_tree.strand.mouse.pkl'
+    # tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.mouse.pkl'
+    # tx_cds_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_cds.mouse.pkl'
+    
+    # # build index
+    # tree_index, tree_strand_index, tx_meta, tx_cds = create_optimized_index(gtf_file, 'temp.mouse.db')
+
+    # # save
+    # with open(tree_index_file, 'wb') as f:
+    #     pickle.dump(tree_index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tree_strand_index_file, 'wb') as f:
+    #     pickle.dump(tree_strand_index, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tx_meta_file, 'wb') as f:
+    #     pickle.dump(tx_meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # with open(tx_cds_file, 'wb') as f:
+    #     pickle.dump(tx_cds, f, protocol=pickle.HIGHEST_PROTOCOL)

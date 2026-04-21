@@ -3,17 +3,18 @@ import time
 import json
 import math
 import contextlib
-from typing import Dict, Any, Tuple, List
+from typing import Union, Dict, Any, Tuple, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 from utils import unwrap_model
+from data.translation_dataset import TranslationDataset
 from train.distributed_balanced_bucket_sampler import DistributedBucketSampler
 from train.masking_adapter import BatchMaskingAdapter, get_dynamic_mask_ratio
 
@@ -59,9 +60,9 @@ class PretrainingTrainer:
     def __init__(
         self,
         model: nn.Module,
-        dataset,
-        val_dataset,
-        dataset_name,
+        dataset_paths: Union[str, List[str]],
+        val_dataset_paths: Union[str, List[str]],
+        dataset_name: str,
         batch_size: int,
         checkpoint_dir: str,
         log_dir: str,
@@ -72,7 +73,7 @@ class PretrainingTrainer:
         print_progress_every: int = 50,
         save_every: int = 5,
         epoch_num: int = 100,
-        mask_perc: dict = {"count": 0.3, "cell": 0.1},
+        mask_perc: dict = {"count": 0.3, "species": 0.15, "cell": 0.15},
         expr_noise_std: float = 0.1, # Standard deviation of Gaussian noise to inject (10% of Z-score variance)
         learning_rate: float = 1e-5,
         lr_warmup_perc: float = 0.2,
@@ -85,8 +86,6 @@ class PretrainingTrainer:
         # basic attributes
         self.model = model
         self.model_name = unwrap_model(model).model_name
-        self.dataset = dataset
-        self.val_dataset = val_dataset
         self.rank = rank
         self.world_size = world_size
         self.resume = resume
@@ -108,42 +107,18 @@ class PretrainingTrainer:
         self.masking_adapter = BatchMaskingAdapter(mask_value)
         self.mask_perc = mask_perc
         self.current_mask_range = self.mask_perc.get("count", (0, 0.2))
-
-        # expression logic: extract mean vector from dataset directly
-        self.expr_noise_std = expr_noise_std
-        self.mean_expr_vector = None
-        
-        if hasattr(self.dataset, 'cell_expr_dict') and len(self.dataset.cell_expr_dict) > 0:
-            all_vecs = list(self.dataset.cell_expr_dict.values())
-            self.mean_expr_vector = torch.from_numpy(np.mean(all_vecs, axis=0)).float()
-            if self.rank == 0:
-                print(f"[Trainer] Calculated mean expression vector from {len(all_vecs)} cell profiles in dataset.")
-        else:
-            if self.rank == 0:
-                print("[Trainer] WARNING: No cell_expr_dict found in dataset. Unknown cells will use batch-level mean.")
-
-        # samplers that produce per-rank batches
         self.balance_classes = balance_classes
-        self.sampler = DistributedBucketSampler(
-            lengths=self.dataset.lengths,
-            batch_size=self.batch_size,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True,
-            drop_last=True,
-            balance_classes=self.balance_classes,
-            cell_types=getattr(self.dataset, 'cell_types', None)
-        )
-        self.val_sampler = DistributedBucketSampler(
-            lengths=self.val_dataset.lengths,
-            batch_size=self.batch_size,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=False,
-            drop_last=False,
-            balance_classes=self.balance_classes,
-            cell_types=getattr(self.val_dataset, 'cell_types', None)
-        )
+
+        # Build dataset and sampler dynamically
+        self.dataset, self.sampler = self._build_dataset_and_sampler(dataset_paths, is_train=True)
+        self.val_dataset, self.val_sampler = self._build_dataset_and_sampler(val_dataset_paths, is_train=False)
+
+        # Expression logic: Calculate global mean vector across all datasets
+        self.expr_noise_std = expr_noise_std
+        self.species_mean_expr = {}
+        self.cell_mean_expr = {}
+        self.global_mean_expr = None
+        self._cache_expression_means()
 
         # counts and scheduling
         self.steps_per_epoch = len(self.sampler)  # per-process mini-batches per epoch
@@ -180,6 +155,116 @@ class PretrainingTrainer:
             print(f"[Trainer] model_trainer_name={self.model_full_name}")
             print(f"[Trainer] device={self.device}, steps_per_epoch={self.steps_per_epoch}, total_steps={self._total_steps}")
             print(f"[Trainer] mask_perc={self.mask_perc}")
+            print(f"[Trainer] Train Datasets: {len(self.dataset)} samples. Eval Datasets: {len(self.val_dataset)} samples.")
+
+    # =========================================================
+    # Dataset Builder Method
+    # =========================================================
+    def _build_dataset_and_sampler(
+        self, 
+        paths: Union[str, List[str]], 
+        is_train: bool
+    ) -> Tuple[ConcatDataset, DistributedBucketSampler]:
+        """
+        Dynamically build a ConcatDataset and its corresponding BucketSampler.
+        """
+        if isinstance(paths, str):
+            paths = [paths]
+            
+        datasets = []
+        for path in paths:
+            ds = TranslationDataset.from_h5(path, lazy=True) 
+            datasets.append(ds)
+            
+        combined_dataset = ConcatDataset(datasets)
+        
+        # {species: {cell_type: expr_array}}
+        combined_dataset.global_expr_dict = {}
+        
+        all_lengths = []
+        all_cell_types = []
+        
+        for ds in combined_dataset.datasets:
+            all_lengths.extend(ds.lengths)
+            
+            if hasattr(ds, 'cell_types') and hasattr(ds, 'species'):
+                # 1. 为 Sampler 构建跨物种的类别标签
+                if self.balance_classes:
+                    combined_types = [f"{sp}_{ct}" for sp, ct in zip(ds.species, ds.cell_types)]
+                    all_cell_types.extend(combined_types)
+                
+                # 2. 极速提取独一无二的 (species, cell_type) 组合
+                if hasattr(ds, 'cell_expr_dict') and ds.cell_expr_dict:
+                    unique_pairs = set(zip(ds.species, ds.cell_types))
+                    
+                    for sp, ct in unique_pairs:
+                        if ct in ds.cell_expr_dict:
+                            if sp not in combined_dataset.global_expr_dict:
+                                combined_dataset.global_expr_dict[sp] = {}
+                            # 填入表达向量（不同 h5 文件中相同的组织表达谱通常一致，直接覆盖即可）
+                            combined_dataset.global_expr_dict[sp][ct] = ds.cell_expr_dict[ct]
+                
+        sampler = DistributedBucketSampler(
+            lengths=all_lengths,
+            batch_size=self.batch_size,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=is_train,
+            drop_last=is_train,
+            balance_classes=self.balance_classes if is_train else False, 
+            cell_types=all_cell_types if (self.balance_classes and is_train) else None
+        )
+        
+        return combined_dataset, sampler
+        
+        
+    # =========================================================
+    # Internal Method for Caching Expression Means
+    # =========================================================
+    def _cache_expression_means(self):
+        """
+        基于预构建的 global_expr_dict，极速计算并缓存全局、物种特异、细胞特异的平均表达向量。
+        """
+        global_vecs = []
+        
+        # [MODIFIED] 直接获取挂载在 ConcatDataset 上的全局字典
+        global_expr_dict = getattr(self.dataset, 'global_expr_dict', {})
+        
+        # 1. 遍历精简后的字典 (层级为 species -> cell_type -> vector)
+        for sp, ct_dict in global_expr_dict.items():
+            if sp not in self.species_mean_expr:
+                self.species_mean_expr[sp] = []
+                
+            for ct, vec in ct_dict.items():
+                # 按物种收集
+                self.species_mean_expr[sp].append(vec)
+                
+                # 按细胞类型收集 (跨物种)
+                if ct not in self.cell_mean_expr:
+                    self.cell_mean_expr[ct] = []
+                self.cell_mean_expr[ct].append(vec)
+                
+                # 全局收集
+                global_vecs.append(vec)
+                        
+        # 2. 将收集到的列表聚合为均值 Tensor
+        for sp in self.species_mean_expr:
+            sp_mean = np.mean(self.species_mean_expr[sp], axis=0)
+            self.species_mean_expr[sp] = torch.from_numpy(sp_mean).float()
+            
+        for ct in self.cell_mean_expr:
+            ct_mean = np.mean(self.cell_mean_expr[ct], axis=0)
+            self.cell_mean_expr[ct] = torch.from_numpy(ct_mean).float()
+            
+        # 3. 计算全局保底均值并打印日志
+        if global_vecs:
+            global_mean = np.mean(global_vecs, axis=0)
+            self.global_mean_expr = torch.from_numpy(global_mean).float()
+            if self.rank == 0:
+                print(f"[Trainer] Cached {len(self.species_mean_expr)} species means and {len(self.cell_mean_expr)} cell means.")
+        else:
+            if self.rank == 0:
+                print("[Trainer] WARNING: No expression vectors found. Masked models will fallback to absolute zeros.")
 
     # -------------------------
     # optimizer / param grouping
@@ -290,18 +375,17 @@ class PretrainingTrainer:
     # -------------------------
     # masking + collate pipeline
     # -------------------------
-    def collate_mask_pad_batch_to_cuda(self, batch, full_mask=0.15):
+    def collate_mask_pad_batch_to_cuda(self, batch, is_eval=False):
         """
         Collate function matching user's masking behavior.
         Receives expr_vectors directly from the dataset.
         """
         # Unpack matching TranslationDataset.__getitem__ outputs
-        _, cell_types, expr_vectors, meta_info, seq_embs, count_embs = zip(*batch)
+        _, species, cell_types, expr_vectors, meta_info, seq_embs, count_embs = zip(*batch)
 
+        species_list = list(species)
         cell_types = list(cell_types)
         expr_batch = torch.stack(expr_vectors) # [B, d_expr]
-        # print(cell_types)
-        # print(expr_batch.sum(dim=1))
         
         cds_starts = [meta.get("cds_start_pos", -1) for meta in meta_info]
         motif_occs = [meta.get("motif_occs", []) for meta in meta_info]
@@ -333,35 +417,70 @@ class PretrainingTrainer:
                 occs=motif_occs, 
                 pad_mask=pad_masks, 
                 mask_perc_range=self.current_mask_range, 
-                full_mask_perc=full_mask
+                full_mask_perc=1 if is_eval else 0.0
             )
         else:
             count_embs_masked = count_embs_padded.clone()
+
+        # ==========================================
+        # Species Masking (Fallback to 'unknown')
+        # ==========================================
+        species_mask = torch.zeros(B, dtype=torch.bool)
+        
+        if "species" in self.mask_perc and not is_eval:
+            species_mask = torch.rand(B) < self.mask_perc.get("species", 0)
+            
+            species_list = [
+                "unknown" if mask_flag else sp 
+                for sp, mask_flag in zip(species_list, species_mask)
+            ]
 
         # ==========================================
         # Cell Type Masking (Fallback to Mean Vector)
         # ==========================================
         cell_mask = torch.zeros(B, dtype=torch.bool)
         
-        if "cell" in self.mask_perc:
-            probs = torch.rand(B)
-            cell_mask = probs < self.mask_perc.get("cell", 0)
+        if "cell" in self.mask_perc and not is_eval:
+            cell_mask = torch.rand(B) < self.mask_perc.get("cell", 0)
+            cell_types_masked = [
+                "unknown" if mask_flag else ct 
+                for ct, mask_flag in zip(cell_types, cell_mask)
+            ]
+
+        for i in range(B):
+            s_masked = species_mask[i].item()
+            c_masked = cell_mask[i].item()
             
-            if cell_mask.any():
-                if self.mean_expr_vector is not None:
-                    # Apply mean vector to masked cells
-                    expr_batch[cell_mask] = self.mean_expr_vector.to(expr_batch.dtype)
+            sp = species_list[i]
+            ct = cell_types[i]
+            
+            if s_masked and c_masked:
+                # 1. 均未知 -> 彻底抹除，填 0
+                expr_batch[i] = 0.0
+                
+            elif s_masked and not c_masked:
+                # 2. 仅物种未知 -> 已知是某细胞，使用该细胞的跨物种均值
+                if ct in self.cell_mean_expr:
+                    expr_batch[i] = self.cell_mean_expr[ct].to(expr_batch.dtype)
                 else:
-                    # Fallback to current batch mean if global mean is missing
-                    expr_batch[cell_mask] = expr_batch.mean(dim=0).to(expr_batch.dtype)
+                    expr_batch[i] = self.global_mean_expr.to(expr_batch.dtype) if self.global_mean_expr is not None else 0.0
+                    
+            elif not s_masked and c_masked:
+                # 3. 仅细胞未知 -> 已知是某物种，使用该物种的整体均值
+                if sp in self.species_mean_expr:
+                    expr_batch[i] = self.species_mean_expr[sp].to(expr_batch.dtype)
+                else:
+                    expr_batch[i] = self.global_mean_expr.to(expr_batch.dtype) if self.global_mean_expr is not None else 0.0
+
+            # print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
+        
 
         return (
-            cell_types,              # original cell string (ground truth for logging)
-            expr_batch,              # Provided directly from dataset unpacking
-            cell_mask,               # bool: which samples were masked
-            seq_embs_padded,
+            species_list,
+            cell_types,
+            cell_mask,
+            expr_batch,
             seq_embs_masked,
-            seq_emb_masks,
             count_embs_padded,
             count_embs_masked,
             count_emb_masks,
@@ -404,7 +523,7 @@ class PretrainingTrainer:
             prefetch_factor=5, 
             persistent_workers=True, 
             pin_memory=True,
-            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s)
+            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, is_eval=False)
         )
         total_loss = torch.zeros(1).to(self.device)
         local_loss = []
@@ -417,8 +536,8 @@ class PretrainingTrainer:
 
         for batch_idx, batch_data in enumerate(dataloader):
             # Unpack the batch
-            cell_types, expr_batch, cell_mask, \
-            seq_embs_padded, seq_embs_masked, seq_emb_masks, \
+            species_list, cell_types, cell_mask, expr_batch, \
+            seq_embs_masked, \
             count_embs_padded, count_embs_masked, count_emb_masks, pad_masks = batch_data
 
             # Move tensors to CUDA
@@ -443,6 +562,7 @@ class PretrainingTrainer:
                 outputs = self.model(
                     seq_batch=seq_embs_masked, 
                     count_batch=count_embs_masked, 
+                    species=species_list,
                     expr_vector=expr_batch,      # Feed continuous tensor directly
                     src_mask=pad_masks, 
                     head_names=["count"]
@@ -493,7 +613,7 @@ class PretrainingTrainer:
             prefetch_factor=5, 
             persistent_workers=True, 
             pin_memory=True,
-            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, full_mask=1)
+            collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, is_eval=True)
         )
         total_loss = torch.zeros(1).to(self.device)
         local_loss = []
@@ -504,38 +624,40 @@ class PretrainingTrainer:
         if self.rank == 0:
             pbar = tqdm(total = batch_num, desc=f"Epoch {epoch+1} evaluate")
 
-        for batch_idx, batch_data in enumerate(val_loader):
-            
-            cell_types, expr_batch, cell_mask, \
-            seq_embs_padded, seq_embs_masked, seq_emb_masks, \
-            count_embs_padded, count_embs_masked, count_emb_masks, pad_masks = batch_data
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(val_loader):
+                
+                species_list, cell_types, cell_mask, expr_batch, \
+                seq_embs_masked, \
+                count_embs_padded, count_embs_masked, count_emb_masks, pad_masks = batch_data
 
-            # Move tensors to CUDA
-            expr_batch = expr_batch.cuda(non_blocking=True)
-            seq_embs_masked = seq_embs_masked.cuda(non_blocking=True)
-            count_embs_masked = count_embs_masked.cuda(non_blocking=True)
-            count_embs_padded = count_embs_padded.cuda(non_blocking=True)
-            count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-            pad_masks = pad_masks.cuda(non_blocking=True)
+                # Move tensors to CUDA
+                expr_batch = expr_batch.cuda(non_blocking=True)
+                seq_embs_masked = seq_embs_masked.cuda(non_blocking=True)
+                count_embs_masked = count_embs_masked.cuda(non_blocking=True)
+                count_embs_padded = count_embs_padded.cuda(non_blocking=True)
+                count_emb_masks = count_emb_masks.cuda(non_blocking=True)
+                pad_masks = pad_masks.cuda(non_blocking=True)
 
-            # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = unwrap_model(self.model).predict(
-                    seq_batch=seq_embs_masked, 
-                    count_batch=count_embs_masked, 
-                    expr_vector=expr_batch,   
-                    src_mask=pad_masks, 
-                    head_names=["count"],
-                    move_inputs_to_device=False # Already moved manually
-                )
-                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks)
+                # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = unwrap_model(self.model).predict(
+                        seq_batch=seq_embs_masked, 
+                        count_batch=count_embs_masked, 
+                        species=species_list,
+                        expr_vector=expr_batch,
+                        src_mask=pad_masks, 
+                        head_names=["count"],
+                        move_inputs_to_device=False # Already moved manually
+                    )
+                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks)
 
-            total_loss += loss.detach()
-            local_loss.append([float(loss)])
+                total_loss += loss.detach()
+                local_loss.append([float(loss)])
 
-            if self.rank == 0 and (batch_idx + 1) % self._print_progress_every == 0:
-                pbar.update(self._print_progress_every) 
-                print(f"\tloss: {loss}")
+                if self.rank == 0 and (batch_idx + 1) % self._print_progress_every == 0:
+                    pbar.update(self._print_progress_every) 
+                    print(f"\tloss: {loss}")
 
         if self.rank == 0:
             pbar.close()

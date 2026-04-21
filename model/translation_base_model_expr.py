@@ -10,7 +10,7 @@ from config.model_config_expr import ModelConfig
 from model.model_modules_expr import LinearEmbedding, AdaEncoder, AdaZeroEncoderLayer
 
 __author__ = "Chunfu Xiao"
-__version__="1.4.0"
+__version__="1.6.0"
 __email__ = "chunfushawn@gmail.com"
 
 
@@ -47,6 +47,7 @@ class TranslationBaseModel(nn.Module):
 
     Improvements over the original:
       - Uses continuous Transcriptome Profile (d_expr) instead of discrete cell IDs.
+      - Integrates a discrete `species` label to capture evolutionary translation baselines.
       - Includes a Bottleneck Projector to compress massive d_expr to d_cell_env.
       - Can automatically lookup `expr_vector` from a registered dictionary via `cell_type` string.
       - Safe fallback to a mean expression vector for unknown cell types.
@@ -58,6 +59,8 @@ class TranslationBaseModel(nn.Module):
         d_model: int,
         d_expr: int = 40000,
         d_cell_env: int = 64,
+        all_species: List[str] = ["human", "macaque", "mouse"],
+        d_species: int = 16,
         n_heads: int = 8,
         number_of_layers: int = 12,
         d_ff: int = 2048,
@@ -74,6 +77,8 @@ class TranslationBaseModel(nn.Module):
             d_model=d_model,
             d_expr=d_expr,
             d_cell_env=d_cell_env,
+            all_species=all_species, 
+            d_species=d_species,
             n_heads=n_heads,
             number_of_layers=number_of_layers,
             d_ff=d_ff,
@@ -89,19 +94,39 @@ class TranslationBaseModel(nn.Module):
         self.d_model = d_model
         self.d_expr = d_expr
         self.d_cell_env = d_cell_env
+        self.d_species = d_species
+
         self.n_heads = n_heads
         self.adaptive_dim = adaptive_dim
         self.gamma_scale = gamma_scale
+
+        # ==========================================
+        # Dynamic Species Dictionary Mapping
+        # ==========================================
+        self.all_species = all_species if all_species else []
+        # Total classes = defined species + 1 (reserved index 0 for 'unknown')
+        self.num_species = len(self.all_species) + 1
+        # Create case-insensitive mapping: e.g., {"human": 1, "macaque": 2, "mouse": 3}
+        self.species_mapping = {sp.lower(): idx + 1 for idx, sp in enumerate(self.all_species)}
 
         # embeds source data into high-dimensional potent embedding vectors
         self.src_emb = LinearEmbedding(self.d_seq, self.d_count, self.d_model)
 
         # ==========================================
-        # Gene expression projector
+        # Species Embedding Layer
+        # Maps discrete species ID (e.g., 0 for Human, 1 for Mouse) to a dense vector
+        # Index 0 is reserved for 'Unknown/Generic' species
+        # ==========================================
+        self.species_embedding = nn.Embedding(self.num_species, self.d_species, padding_idx=0)
+
+        # ==========================================
+        # Gene expression + Species projector
+        # Now accepts d_expr + d_species as input to the bottleneck
         # ==========================================
         self.expr_projector = nn.Sequential(
             nn.Dropout(max(p_drop * 3, 0.9)),
-            nn.Linear(self.d_expr, self.d_cell_env, bias=False),
+            # Input dimension is now d_expr + d_species
+            nn.Linear(self.d_expr + self.d_species, self.d_cell_env, bias=False),
             nn.GELU(),
             nn.Linear(self.d_cell_env, self.adaptive_dim)
         )
@@ -235,6 +260,8 @@ class TranslationBaseModel(nn.Module):
             d_model=int(cfg_dict["d_model"]),
             d_expr=int(cfg_dict["d_expr"]),
             d_cell_env=int(cfg_dict["d_cell_env"]),
+            all_species=list(cfg_dict.get("all_species", ["human", "mouse", "macaque"])),
+            d_species=int(cfg_dict.get("d_species", 16)),
             n_heads=int(cfg_dict.get("n_heads", 8)),
             number_of_layers=int(cfg_dict.get("number_of_layers", 6)),
             d_ff=int(cfg_dict.get("d_ff", 2048)),
@@ -262,6 +289,8 @@ class TranslationBaseModel(nn.Module):
             d_model=cfg.d_model,
             d_expr=cfg.d_expr,
             d_cell_env=cfg.d_cell_env,
+            all_species=cfg.all_species,
+            d_species=cfg.d_species,
             n_heads=cfg.n_heads,
             number_of_layers=cfg.number_of_layers,
             d_ff=cfg.d_ff,
@@ -466,6 +495,54 @@ class TranslationBaseModel(nn.Module):
              
         return output_expr_batch
     
+    # ==========================================
+    # String-Aware Species Normalization
+    # Resolves strings/lists into batched Long indices using species_mapping
+    # ==========================================
+    def _normalize_species(self, species: Any, batch_size: int) -> torch.LongTensor:
+        """
+        Normalize species inputs (strings, ints, lists) into a long tensor of shape (batch_size,).
+        If unknown or None -> returns 0 (Generic/Fallback).
+        """
+        # Helper to convert a single item (str or int) to the correct dictionary index
+        def _single_to_index(val) -> int:
+            if isinstance(val, str):
+                return self.species_mapping.get(val.lower(), 0)
+            try:
+                ival = int(val)
+                if 0 <= ival < self.num_species:
+                    return ival
+            except Exception:
+                pass
+            return 0
+
+        if species is None:
+            return torch.zeros((batch_size,), dtype=torch.long)
+            
+        if isinstance(species, str):
+            idx = _single_to_index(species)
+            return torch.full((batch_size,), idx, dtype=torch.long)
+            
+        if isinstance(species, (list, tuple, np.ndarray)):
+            if len(species) == 1:
+                idx = _single_to_index(species[0] if isinstance(species, list) else species.item())
+                return torch.full((batch_size,), idx, dtype=torch.long)
+            if len(species) == batch_size:
+                mapped = [_single_to_index(x) for x in species]
+                return torch.tensor(mapped, dtype=torch.long)
+            raise ValueError(f"Length of species array ({len(species)}) must match batch_size ({batch_size}) or 1.")
+            
+        if isinstance(species, torch.Tensor):
+            if species.numel() == 1:
+                idx = _single_to_index(species.item())
+                return torch.full((batch_size,), idx, dtype=torch.long)
+            if species.dim() == 1 and species.numel() == batch_size:
+                return species.to(dtype=torch.long).clamp(0, self.num_species - 1)
+
+        # Fallback for unexpected scalars
+        idx = _single_to_index(species)
+        return torch.full((batch_size,), idx, dtype=torch.long)
+    
     # -------------------------
     # Forward / predict
     # -------------------------
@@ -475,6 +552,7 @@ class TranslationBaseModel(nn.Module):
         count_batch: torch.Tensor,
         cell_type: Optional[Any] = None, 
         expr_vector: torch.Tensor = None,
+        species: Optional[Any] = None,
         src_mask: Optional[torch.Tensor] = None,
         head_names: Optional[List[str]] = None, 
         head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -483,6 +561,7 @@ class TranslationBaseModel(nn.Module):
         """
         Strict forward.
         You must provide EITHER `expr_vector` (shape: bs, d_expr) OR `cell_type` (for dict lookup).
+        Optionally provide `species` (shape: bs) to inject evolutionary baselines.
         """
 
         # --- basic type checks ---
@@ -500,9 +579,17 @@ class TranslationBaseModel(nn.Module):
         bs = seq_batch.shape[0]
         seq_len = seq_batch.shape[1]
 
-        # get expr vector by cell type
+        # 1. Resolve Dynamic Cellular Environment (Transcriptome)
         final_expr_vector = self._resolve_expr_vector(cell_type, expr_vector, bs)
         final_expr_vector = final_expr_vector.to(self.device)
+
+        # 2. Resolve Static Evolutionary Baseline (Species)
+        species_idx_batch = self._normalize_species(species, bs).to(self.device)
+        species_embs = self.species_embedding(species_idx_batch) # -> (bs, d_species)
+
+        # 3. Concatenate Transcriptome + Species before the bottleneck projection
+        # This allows the projector to interpret expression levels in the context of the specific species
+        combined_env_features = torch.cat([final_expr_vector, species_embs], dim=-1) # -> (bs, d_expr + d_species)
 
         # src_mask validation if provided
         if src_mask is not None:
@@ -519,11 +606,11 @@ class TranslationBaseModel(nn.Module):
         # compute embeddings (expects shapes (bs, seq_len, d_seq) & (bs, seq_len, d_count))
         src_embs = self.src_emb(seq_batch, count_batch)  # -> (bs, seq_len, d_model)
 
-        # cell environment embeddings
-        env_embs = self.expr_projector(final_expr_vector)
+        # 4. Create the final Compact Style from the concatenated features
+        compact_style = self.expr_projector(combined_env_features) # -> (bs, adaptive_dim)
 
-        # encode (pass env_embs for AdaLayerNorm)
-        src_reps = self.encoder(src_embs, src_mask, env_embs)
+        # encode (pass compact_style for AdaLayerNorm)
+        src_reps = self.encoder(src_embs, src_mask, compact_style)
 
         # if user requested no heads, return raw representations (optionally squeeze later)
         if not head_names:
@@ -565,6 +652,7 @@ class TranslationBaseModel(nn.Module):
         count_batch: Union[torch.Tensor, np.ndarray, list, tuple] = None,
         cell_type: Any = None,
         expr_vector: Any = None,
+        species: Any = None,
         src_mask: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         head_names: Optional[List[str]] = None,
         head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -589,6 +677,9 @@ class TranslationBaseModel(nn.Module):
         # process expr_vector and cell_type
         final_expr = self._resolve_expr_vector(cell_type, expr_vector, bs)
 
+        # resolve species
+        species_idx = self._normalize_species(species, bs)
+
         # 3) move tensor inputs to model device 
         if move_inputs_to_device:
             # move only if input is a torch.Tensor (avoid converting np/list here)
@@ -598,6 +689,7 @@ class TranslationBaseModel(nn.Module):
                 count_batch = count_batch.to(model_device)
             if isinstance(src_mask, torch.Tensor):
                 src_mask = src_mask.to(model_device)
+            species_idx = species_idx.to(model_device)
 
         # 4) run forward under no_grad
         with torch.no_grad():
@@ -605,6 +697,7 @@ class TranslationBaseModel(nn.Module):
                 seq_batch=seq_batch, 
                 count_batch=count_batch, 
                 expr_vector=final_expr, 
+                species=species_idx,
                 src_mask=src_mask, 
                 head_names=head_names, 
                 head_inputs=head_inputs

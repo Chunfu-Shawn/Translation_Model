@@ -31,6 +31,7 @@ class TranslationDataset(Dataset):
     """
     def __init__(self, dataset_dict):
         self.uuids = dataset_dict["uuids"]
+        self.species = dataset_dict["species"]
         self.cell_types = dataset_dict["cell_types"]
         self.cell_expr_dict = dataset_dict.get("cell_expr_dict", {})
         self.meta_info = dataset_dict["meta_info"]
@@ -58,6 +59,7 @@ class TranslationDataset(Dataset):
             # 读取所有样本到内存（safe but memory heavy）
             data = {
                 "uuids": [],
+                "species": [],
                 "cell_types": [],
                 "cell_expr_dict": {},
                 "meta_info": [],
@@ -80,6 +82,7 @@ class TranslationDataset(Dataset):
                         tid = grp.attrs.get("tid", -1)
                         # [:] is requested, data eager
                         data["uuids"].append(str(uuid))
+                        data["species"].append(str(grp.attrs.get("species", None)))
                         data["cell_types"].append(str(grp.attrs.get("cell_type", None)))
                         data["cell_type_idxs"].append(np.int16(grp.attrs.get("cell_type_idx", -1)))
                         data["meta_info"].append(
@@ -106,6 +109,7 @@ class TranslationDataset(Dataset):
             # 读取索引 (idxs + lengths）到内存
             uuids = []
             lengths = []
+            species = []
             cell_types = []
             cell_expr_dict = {}
 
@@ -121,14 +125,17 @@ class TranslationDataset(Dataset):
                             cell_expr_dict[str(ct)] = f["cell_exprs"][ct][:]
 
                     for uuid in f["samples"].keys():
+                        grp = f["samples"][uuid]
                         uuids.append(str(uuid))
-                        lengths.append(int(f["samples"][uuid]["count_emb"].shape[0]))
-                        cell_types.append(str(f["samples"][uuid].attrs.get("cell_type", None)))
+                        lengths.append(int(grp["count_emb"].shape[0]))
+                        species.append(str(grp.attrs.get("species", None)))
+                        cell_types.append(str(grp.attrs.get("cell_type", None)))
             except FileNotFoundError:
                 print(f"### Error: No such file: {path} ! ###")
 
             obj.uuids = uuids
             obj.lengths = lengths
+            obj.species = species
             obj.cell_types = cell_types
             obj.cell_expr_dict = cell_expr_dict # [Optimized] Store in memory
 
@@ -153,6 +160,7 @@ class TranslationDataset(Dataset):
             # lazy h5 读取
             self._open_h5()
             uuid = self.uuids[idx]
+            species = self.species[idx]
             grp = self._h5_handle["samples"][uuid]
             tid = grp.attrs.get("tid", -1)
             cell_type = str(grp.attrs.get('cell_type', None))
@@ -170,10 +178,11 @@ class TranslationDataset(Dataset):
             seq_emb = torch.from_numpy(self._h5_handle["sequences"][tid][:]).float() # (L, 4)
             count_emb = torch.from_numpy(grp["count_emb"][:]).float() # (L, 1)
                                    
-            return uuid, cell_type, expr_vector, meta_info, seq_emb, count_emb
+            return uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb
 
         # otherwise load from memory（self.dataset)
         uuid = str(self.uuids[idx])
+        species = str(self.species[idx])
         cell_type = str(self.cell_types[idx])
         expr_arr = self.cell_expr_dict.get(cell_type, np.array([]))
         expr_vector = torch.from_numpy(expr_arr).float()
@@ -181,7 +190,7 @@ class TranslationDataset(Dataset):
         seq_emb = torch.from_numpy(self.seq_embs[idx]).float()
         count_emb = torch.from_numpy(self.count_embs[idx]).float()
 
-        return uuid, cell_type, expr_vector, meta_info, seq_emb, count_emb
+        return uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb
     
     def get_identifier(self, idx):
         return self.uuids[idx]

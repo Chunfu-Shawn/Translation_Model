@@ -3,18 +3,19 @@ import time
 import json
 import math
 import contextlib
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Union, Dict, Any, Tuple, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 from utils import unwrap_model
+from data.translation_dataset import TranslationDataset
 from train.distributed_balanced_bucket_sampler import DistributedBucketSampler
 from train.masking_adapter import BatchMaskingAdapter, get_dynamic_mask_ratio
 
@@ -96,9 +97,9 @@ class PretrainingTrainer:
     def __init__(
         self,
         model: nn.Module,
-        dataset,
-        val_dataset,
-        dataset_name,
+        dataset_paths: Union[str, List[str]],      # [MODIFIED] Type hint updated
+        val_dataset_paths: Union[str, List[str]],  # [MODIFIED] Type hint updated
+        dataset_name: str,
         batch_size: int,
         checkpoint_dir: str,
         log_dir: str,
@@ -109,7 +110,7 @@ class PretrainingTrainer:
         print_progress_every: int = 50,
         save_every: int = 5,
         epoch_num: int = 100,
-        mask_perc: dict = {"count": 0.3, "cell": 0.1},
+        mask_perc: dict = {"count": 0.3, "species": 0.1, "cell": 0.1},
         learning_rate: float = 1e-5,
         lr_warmup_perc: float = 0.2,
         accumulation_steps: int = 5,
@@ -121,8 +122,6 @@ class PretrainingTrainer:
         # basic attributes
         self.model = model
         self.model_name = unwrap_model(model).model_name
-        self.dataset = dataset
-        self.val_dataset = val_dataset
         self.rank = rank
         self.world_size = world_size
         self.resume = resume
@@ -140,40 +139,22 @@ class PretrainingTrainer:
         # device for this process
         self.device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
 
-        # masking and sampler (reuse user's adapters)
+        # masking and sampler 
         self.masking_adapter = BatchMaskingAdapter(mask_value)
         self.mask_perc = mask_perc
         self.current_mask_range = self.mask_perc.get("count", (0, 0.2))
-
-        # samplers that produce per-rank batches
         self.balance_classes = balance_classes
-        self.sampler = DistributedBucketSampler(
-            lengths=self.dataset.lengths,
-            batch_size=self.batch_size,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True,
-            drop_last=True,
-            balance_classes=self.balance_classes,
-            cell_type_idxs=[int(x) for x in self.dataset.cell_type_idxs]
-        )
-        self.val_sampler = DistributedBucketSampler(
-            lengths=self.val_dataset.lengths,
-            batch_size=self.batch_size,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=False,
-            drop_last=False,
-            balance_classes=self.balance_classes,
-            cell_type_idxs=[int(x) for x in self.val_dataset.cell_type_idxs]
-        )
+
+        # Build train and validation datasets and samplers uniformly
+        self.dataset, self.sampler = self._build_dataset_and_sampler(dataset_paths, is_train=True)
+        self.val_dataset, self.val_sampler = self._build_dataset_and_sampler(val_dataset_paths, is_train=False)
 
         # counts and scheduling
         self.steps_per_epoch = len(self.sampler)  # per-process mini-batches per epoch
         self._total_steps = max(1, int(self.epoch_num * self.steps_per_epoch // max(1, self.ac_steps)))
         
         # loss criterions
-        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0) # nn.MSELoss(reduction="none")
+        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0) 
 
         # build optimizer & scheduler & scaler
         self.optimizer = self._build_optimizer(lr=self.lr, betas=self.beta, eps=self.epsilon, weight_decay=self.weight_decay)
@@ -182,7 +163,7 @@ class PretrainingTrainer:
             optimizer=self.optimizer,
             lr_lambda=create_lr_lambda(total_steps=self._total_steps, warmup_steps=warmup_steps, min_eta=1e-4)
         )
-        self.scaler = torch.amp.GradScaler() # for gradiant scaling in autocasting
+        self.scaler = torch.amp.GradScaler() 
 
         # logging & checkpointing
         self.checkpoint_dir = checkpoint_dir
@@ -203,6 +184,59 @@ class PretrainingTrainer:
             print(f"[Trainer] model_trainer_name={self.model_full_name}")
             print(f"[Trainer] device={self.device}, steps_per_epoch={self.steps_per_epoch}, total_steps={self._total_steps}")
             print(f"[Trainer] mask_perc={self.mask_perc}")
+            print(f"[Trainer] Train Datasets: {len(self.dataset)} samples. Eval Datasets: {len(self.val_dataset)} samples.")
+
+
+    def _build_dataset_and_sampler(
+        self, 
+        paths: Union[str, List[str]], 
+        is_train: bool
+    ) -> Tuple[ConcatDataset, DistributedBucketSampler]:
+        """
+        Dynamically build a ConcatDataset and its corresponding BucketSampler.
+        Automatically handles single path vs. list of paths.
+        """
+        # 1. Normalize input to list
+        if isinstance(paths, str):
+            paths = [paths]
+            
+        # 2. Instantiate all child datasets securely using lazy mode
+        datasets = []
+        for path in paths:
+            ds = TranslationDataset.from_h5(path, lazy=True) 
+            datasets.append(ds)
+            
+        # 3. Concatenate datasets
+        combined_dataset = ConcatDataset(datasets)
+        
+        # 4. Extract global lengths and logically separated cell_types
+        all_lengths = []
+        all_cell_types = []
+        
+        for ds in combined_dataset.datasets:
+            all_lengths.extend(ds.lengths)
+            
+            # Combine species and cell_type for precise class balancing
+            if self.balance_classes and hasattr(ds, 'cell_types') and hasattr(ds, 'species'):
+                combined_types = [
+                    f"{sp}_{ct}" for sp, ct in zip(ds.species, ds.cell_types)
+                ]
+                all_cell_types.extend(combined_types)
+                
+        # 5. Instantiate DistributedBucketSampler
+        # Note: Validation sets usually do not require shuffle, drop_last, or class balancing
+        sampler = DistributedBucketSampler(
+            lengths=all_lengths,
+            batch_size=self.batch_size,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=is_train,
+            drop_last=is_train,
+            balance_classes=self.balance_classes if is_train else False, 
+            cell_types=all_cell_types if (self.balance_classes and is_train) else None
+        )
+        
+        return combined_dataset, sampler
 
     # -------------------------
     # optimizer / param grouping

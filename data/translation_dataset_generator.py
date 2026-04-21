@@ -55,6 +55,7 @@ class DatasetGenerator():
                  transcript_meta_file: str, 
                  transcript_cds_file: str, 
                  chrom_groups: dict, 
+                 species: str,
                  min_length=0, max_length=None, 
                  motif_file_path: str = ""):
         
@@ -66,6 +67,7 @@ class DatasetGenerator():
             self.tx_cds = pickle.load(f)
 
         self.chrom_groups = chrom_groups
+        self.species = species
         self.nt_mapping = dict(zip("ACGTN", range(5)))
         
         self.motifs_list = load_motifs_from_file(motif_file_path)
@@ -284,8 +286,8 @@ class DatasetGenerator():
             print("### Dataset config is empty! ###")
             return False
 
-        raw_cell_types = [item["cell_type"] for item in dataset_config]
-        all_cell_types = list(dict.fromkeys(raw_cell_types))
+        all_cell_types = [item["cell_type"] for item in dataset_config]
+        # all_cell_types = list(dict.fromkeys(raw_cell_types))
         
         # ==========================================
         # Pre-load the Cell Expression Dictionary
@@ -312,6 +314,7 @@ class DatasetGenerator():
             print("### WARNING: No expr_dict_path provided or file missing. Expression vectors will not be saved. ###")
 
         print(f"### Load count, transcriptome and coding data from {len(dataset_config)} samples ###")
+        print(f"### Species: {self.species} ###")
         print(f"### Cell types: {all_cell_types} ###")
         
         # add shared sequence embeddings
@@ -393,6 +396,7 @@ class DatasetGenerator():
                 for i, uuid in enumerate(dataset["uuids"]):
                     g = grp_root.create_group(uuid)
                     g.attrs["tid"] = dataset["tids"][i]
+                    g.attrs['species'] = str(self.species)
                     g.attrs['cell_type'] = dataset["cell_types"][i]
                     g.attrs['cds_start_pos'] = dataset["cds_start_pos"][i]
                     g.attrs['cds_end_pos'] = dataset["cds_end_pos"][i]

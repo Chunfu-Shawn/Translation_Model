@@ -18,22 +18,20 @@ torch.backends.cudnn.benchmark = True
 
 # load dataset
 dataset_dir = '/home/user/data3/rbase/translation_model/data/dataset/'
-dataset_name = "7c_20k_depth0.1_cov0.1_rpm1"
+dataset_name = "7c_15k_depth0.1_cov0.1_rpm1"
 train_dataset_path = os.path.join(dataset_dir, dataset_name + ".train.h5")
 val_dataset_path = os.path.join(dataset_dir, dataset_name + ".valid.h5")
-train_dataset = TranslationDataset.from_h5(train_dataset_path, lazy=True)
-val_dataset = TranslationDataset.from_h5(val_dataset_path, lazy=True)
 
 # create model
 base_model = TranslationBaseModel.from_config(
-    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_512d_16h_12l_7c_64env_8ad.yaml"
+    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_256d_8h_10l_64env_8ad.yaml"
     ).cuda(rank)
 # create heads
 base_model.add_head(
     "count",
     PsiteDensityHead.create_from_model(
         base_model,
-        d_pred_h = 512
+        d_pred_h = 256
         ),
     overwrite = True
 )
@@ -53,10 +51,10 @@ base_model = DDP(
 epoch_num = 20
 trainer = PretrainingTrainer(
     model = base_model,
-    dataset = train_dataset,
-    val_dataset = val_dataset,
+    dataset_paths = [train_dataset_path],
+    val_dataset_paths = [val_dataset_path],
     dataset_name = dataset_name,
-    batch_size = 40,
+    batch_size = 3,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
     world_size = world_size,
@@ -65,7 +63,7 @@ trainer = PretrainingTrainer(
     save_every = 1,
     epoch_num = epoch_num,
     mask_value = 0,
-    mask_perc = {"count": (0.3, 1.5), "cell": 0.2},
+    mask_perc = {"count": (0.3, 1.5), "species": 0.2, "cell": 0.2},
     expr_noise_std = 0.1,
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,
