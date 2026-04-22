@@ -24,14 +24,14 @@ val_dataset_path = os.path.join(dataset_dir, dataset_name + ".valid.h5")
 
 # create model
 base_model = TranslationBaseModel.from_config(
-    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_256d_8h_10l_64env_8ad.yaml"
+    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_8h_10l_64env_8ad.yaml"
     ).cuda(rank)
 # create heads
 base_model.add_head(
     "count",
     PsiteDensityHead.create_from_model(
         base_model,
-        d_pred_h = 256
+        d_pred_h = 384
         ),
     overwrite = True
 )
@@ -54,7 +54,7 @@ trainer = PretrainingTrainer(
     dataset_paths = [train_dataset_path],
     val_dataset_paths = [val_dataset_path],
     dataset_name = dataset_name,
-    batch_size = 3,
+    batch_size = 20,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
     world_size = world_size,
@@ -67,7 +67,7 @@ trainer = PretrainingTrainer(
     expr_noise_std = 0.1,
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,
-    accumulation_steps = 4,
+    accumulation_steps = 1,
     balance_classes = False,
     beta = (0.9, 0.98),
     epsilon = 1e-9,
