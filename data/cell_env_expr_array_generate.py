@@ -73,11 +73,13 @@ def build_cross_species_expression_dict(
     file_path, 
     output_pt_path, 
     id_mapping, 
-    reference_anchor_ids=None # Reference gene list to ensure consistent dimensions across species
+    reference_anchor_ids=None, # Reference gene list to ensure consistent dimensions across species
+    min_tpm_threshold=1.0      # Threshold to filter out unexpressed genes from statistical calculations
 ):
     """
     Aligns single-species count files and extracts expression vectors.
-    Performs Z-score normalization on the WHOLE GENOME first, then maps to orthologs.
+    Performs robust Z-score normalization on the WHOLE GENOME first, avoiding zero-inflation, 
+    then maps to orthologs.
     """
     print(f"\nReading counts file: {file_path}")
     df = pd.read_csv(file_path, sep='\t', comment='#')
@@ -90,9 +92,9 @@ def build_cross_species_expression_dict(
     df['Clean_Geneid'] = df['Geneid'].str.split('.').str[0]
     
     # ==========================================
-    # 1. Whole-Genome TPM and Z-score Calculation
+    # 1. Whole-Genome TPM and Robust Z-score
     # ==========================================
-    print("Calculating RPK, TPM, and Z-score across the entire native genome...")
+    print(f"Calculating RPK, TPM, and robust Z-score (excluding TPM <= {min_tpm_threshold} from distribution stats)...")
     zscore_cols = []
     
     for col in sample_cols:
@@ -105,8 +107,25 @@ def build_cross_species_expression_dict(
         
         # Log2 smoothing
         log_tpm = np.log2(tpm + 1.0)
-        # Z-score standardization (adding 1e-8 to prevent division by zero)
-        z_score = (log_tpm - log_tpm.mean()) / (log_tpm.std() + 1e-8)
+        
+        # ---------------------------------------------------------
+        # Robust Standardization Strategy:
+        # Identify actively expressed genes to compute the background distribution.
+        # This prevents the massive zero-inflation from skewing the mean/std downward.
+        # ---------------------------------------------------------
+        active_mask = tpm > min_tpm_threshold
+        
+        # Fallback to global mean/std if the sample is completely dead (rare edge case)
+        if active_mask.sum() > 0:
+            active_mean = log_tpm[active_mask].mean()
+            active_std = log_tpm[active_mask].std()
+        else:
+            active_mean = log_tpm.mean()
+            active_std = log_tpm.std()
+        
+        # Standardize ALL genes using the active distribution.
+        # Genes with 0 TPM will correctly receive a negative Z-score, indicating suppression.
+        z_score = (log_tpm - active_mean) / (active_std + 1e-8)
         
         z_col_name = f"{col}_Zscore"
         df[z_col_name] = z_score
@@ -120,7 +139,6 @@ def build_cross_species_expression_dict(
     aligned_df = df.dropna(subset=['Anchor_ID']).copy()
     
     # Merge any residual many-to-one mappings safely using mean
-    # (Though prepare_ortholog_mapping ensures 1:1, this is a safe fallback)
     grouped_zscore = aligned_df.groupby('Anchor_ID')[zscore_cols].mean()
 
     # ==========================================
@@ -128,8 +146,8 @@ def build_cross_species_expression_dict(
     # ==========================================
     if reference_anchor_ids is not None:
         print(f"Aligning to reference gene coordinates (Dimension: {len(reference_anchor_ids)})...")
-        # Reindex using the reference list. Missing genes are filled with 0.0
-        # (0.0 is perfect here, as it mathematically represents the whole-genome average baseline)
+        # Reindex using the reference list. Missing annotations are filled with 0.0
+        # (0.0 represents the neutral mean of the *active* transcriptome here)
         final_df = grouped_zscore.reindex(reference_anchor_ids).fillna(0.0)
         final_gene_ids = reference_anchor_ids
     else:
@@ -158,7 +176,6 @@ if __name__ == "__main__":
     # Config file paths
     ortholog_csv = "/home/user/data3/rbase/genome_ref/Homolog/human_macaque_mouse_orthologs.tsv" 
     
-    # Assuming you have featureCounts results for different species
     human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts.txt"
     mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_counts.txt"
     
@@ -176,7 +193,8 @@ if __name__ == "__main__":
         file_path=human_counts, 
         output_pt_path=human_pt, 
         id_mapping=id_mapping,
-        reference_anchor_ids=None # Set to None to let the script define the universe via Human data
+        reference_anchor_ids=None, # Set to None to let the script define the universe via Human data
+        min_tpm_threshold=0      # Adjusted via the new parameter
     )
 
     # Save this reference coordinate system for future lookups
@@ -200,7 +218,8 @@ if __name__ == "__main__":
     #     file_path=mouse_counts, 
     #     output_pt_path=mouse_pt, 
     #     id_mapping=id_mapping,
-    #     reference_anchor_ids=global_anchor_ids # Forcible alignment
+    #     reference_anchor_ids=global_anchor_ids, # Forcible alignment
+    #     min_tpm_threshold=0
     # )
 
     # print("\n🎉 All cross-species alignment tasks are complete! You can now merge human_pt and mouse_pt to feed the model.")

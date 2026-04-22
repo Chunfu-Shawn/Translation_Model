@@ -472,7 +472,7 @@ class PretrainingTrainer:
                 else:
                     expr_batch[i] = self.global_mean_expr.to(expr_batch.dtype) if self.global_mean_expr is not None else 0.0
 
-            # print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
+            print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
         
 
         return (

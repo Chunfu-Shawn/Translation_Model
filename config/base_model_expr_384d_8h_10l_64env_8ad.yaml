@@ -1,6 +1,6 @@
 d_seq: 4
 d_count: 1
-d_model: 256
+d_model: 384
 d_expr: 16840
 d_cell_env: 64
 d_species: 16
@@ -8,8 +8,8 @@ all_species: ["human", "macaque", "mouse"]
 expr_dict_path: None #"/home/user/data3/rbase/translation_model/models/src/config/cell_expression_dict.pt"
 n_heads: 8
 number_of_layers: 10
-d_ff: 512
+d_ff: 768
 adaptive_dim: 8
 gamma_scale: 0.5
 p_drop: 0.1
-model_name: "base_model_expr_256d_8h_10l_64env_8ad"
+model_name: "base_model_expr_384d_8h_10l_64env_8ad"
