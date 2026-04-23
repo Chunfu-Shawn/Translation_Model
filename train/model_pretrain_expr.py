@@ -472,7 +472,7 @@ class PretrainingTrainer:
                 else:
                     expr_batch[i] = self.global_mean_expr.to(expr_batch.dtype) if self.global_mean_expr is not None else 0.0
 
-            print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
+            # print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
         
 
         return (
@@ -491,15 +491,17 @@ class PretrainingTrainer:
             self,
             result: Dict[str, torch.Tensor],
             count_raw_emb: torch.Tensor, 
-            count_emb_masks: torch.Tensor,
-            eps: float = 1e-6) -> torch.Tensor:
+            count_emb_masks: torch.Tensor
+            ) -> torch.Tensor:
         """
         Compute per-task losses and return a tensor [seq_loss, count_loss, cell_loss].
         result is expected to be a dict mapping 'seq','count','cell' to model outputs.
         """
-        count_pred = result["count"]  # (B, L, 10 or 1)
-        
-        num_masked_count_token = count_emb_masks.sum()
+        # float32 to maintain stability
+        count_pred = result["count"].float()  # (B, L, 10 or 1)
+        count_raw_emb = count_raw_emb.float()
+        num_masked_count_token = torch.clamp(count_emb_masks.sum().float(), min=1.0)
+
         if count_pred.shape[2] == 1:
             ## for summarized density
             count_loss_all = self.count_criterion(count_pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
@@ -508,7 +510,7 @@ class PretrainingTrainer:
             ## for RPF density for all read length
             count_loss_all = self.count_criterion(count_pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
 
-        return count_loss_all.sum() / (num_masked_count_token + eps)
+        return count_loss_all.sum() / num_masked_count_token
 
     
     # -------------------------
@@ -557,7 +559,7 @@ class PretrainingTrainer:
                 noise = torch.randn_like(expr_batch, dtype=torch.float32) * self.expr_noise_std
                 expr_batch = expr_batch + noise.to(expr_batch.dtype)
 
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 # Pass the dynamically generated expr_vector to the model
                 outputs = self.model(
                     seq_batch=seq_embs_masked, 
@@ -578,6 +580,8 @@ class PretrainingTrainer:
                 self.scaler.scale(acc_loss).backward()
 
             if do_sync:
+                # self.scaler.unscale_(self.optimizer) # 解开 scale 以计算真实梯度 norm
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) # 裁剪梯度，最大 norm 设为 1.0
                 self.scaler.step(self.optimizer)
                 self.scaler.update() 
                 self.scheduler.step()
@@ -640,7 +644,7 @@ class PretrainingTrainer:
                 pad_masks = pad_masks.cuda(non_blocking=True)
 
                 # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                     outputs = unwrap_model(self.model).predict(
                         seq_batch=seq_embs_masked, 
                         count_batch=count_embs_masked, 

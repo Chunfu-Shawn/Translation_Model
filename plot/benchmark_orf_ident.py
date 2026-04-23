@@ -166,14 +166,7 @@ def plot_model_benchmark(
     print(f"✅ Benchmark Complete! Plots saved to: {out_dir}")
 
 
-import os
-import pandas as pd
-import numpy as np
-from plotnine import *
 
-# =================================================================
-# [MODIFIED] 重命名函数，增加 x_col, y_col 及 label 动态参数
-# =================================================================
 def plot_tradeoff_benchmark(
         manifest: list, 
         out_dir: str = "./results/benchmark",
@@ -187,6 +180,7 @@ def plot_tradeoff_benchmark(
     """
     读取 overall_prediction_summary.csv 绘制任意两个指标的气泡轨迹图。
     默认设置为 x=TP_at_Best_Threshold, y=Best_F1_Score。
+    包含点大小映射：1M最小，Total最大，w/o Ribo-seq等于Total大小。
     """
     os.makedirs(out_dir, exist_ok=True)
     print(f"Loading and aggregating benchmark data ({x_col} vs {y_col})...")
@@ -204,13 +198,10 @@ def plot_tradeoff_benchmark(
                 continue
                 
             df = pd.read_csv(csv_path)
-            # =========================================================
-            # [MODIFIED] 动态提取用户指定的 x_col 和 y_col
-            # =========================================================
             records.append({
                 'Model': model_name,
                 'Type': model_type,
-                'Depth': 'Constant',
+                'Depth': 'Constant', # 表示深度无关
                 x_col: df.iloc[0][x_col],
                 y_col: df.iloc[0][y_col]
             })
@@ -227,9 +218,6 @@ def plot_tradeoff_benchmark(
                     continue
                     
                 df = pd.read_csv(csv_path)
-                # =========================================================
-                # [MODIFIED] 动态提取用户指定的 x_col 和 y_col
-                # =========================================================
                 records.append({
                     'Model': model_name,
                     'Type': model_type,
@@ -242,14 +230,21 @@ def plot_tradeoff_benchmark(
         raise ValueError("No valid records extracted. Please check your manifest and file paths.")
         
     plot_df = pd.DataFrame(records)
-    # [MODIFIED] 保存的聚合表名称也随之动态变化
+    
+    # =================================================================
+    # 严格设定 Depth 的层级顺序，确保画图和映射的逻辑性
+    # 将 'Constant' 追加到深度列表后面，便于统管
+    # =================================================================
+    all_depth_categories = depth_levels + ['Constant']
+    plot_df['Depth'] = pd.Categorical(plot_df['Depth'], categories=all_depth_categories, ordered=True)
+
     csv_out = os.path.join(out_dir, f"aggregated_{x_col}_{y_col}_metrics.csv")
     plot_df.to_csv(csv_out, index=False)
 
     print(f"Generating {x_col} vs {y_col} Benchmark Plot...")
     
     model_order = [
-        "TRACE", "Convolution", 
+        "TRACE",
         "TranslationAI", "RiboTISH", "RibORF",
         "ORF-structure"
     ]
@@ -275,10 +270,22 @@ def plot_tradeoff_benchmark(
         else:
             color_mapping[m_name] = grays[gray_idx % len(grays)]
             gray_idx += 1
+            
+    # =================================================================
+    # 点大小分配引擎 (Size Mapping)
+    # =================================================================
+    min_size = 2  # 最小点大小 (1M)
+    max_size = 5  # 最大点大小 (Total)
     
+    # 动态生成线性递增的大小数组
+    depth_sizes = np.linspace(min_size, max_size, len(depth_levels))
+    
+    # 构建映射字典
+    size_mapping = {d: s for d, s in zip(depth_levels, depth_sizes)}
+    # w/o Ribo-seq 模型对应 'Constant'，将其大小与 'Total' 齐平
+    size_mapping['Constant'] = 5 
     # =================================================================
-    # [MODIFIED] 动态映射 x 和 y
-    # =================================================================
+
     p = (
         ggplot(plot_df, aes(x=x_col, y=y_col, color='Model'))
         + geom_line(
@@ -286,9 +293,20 @@ def plot_tradeoff_benchmark(
             mapping=aes(group='Model'), 
             linetype='dashed', size=1.2, alpha=0.7
         )
-        + geom_point(size=4.5, alpha=0.9, stroke=0.5)
+        # =========================================================
+        # [MODIFIED] 在这里加入 size='Depth' 的映射，并移除写死的 size=4.5
+        # =========================================================
+        + geom_point(mapping=aes(size='Depth'), alpha=0.9, stroke=0.5)
+        
         + scale_x_log10()
         + scale_color_manual(values=color_mapping)
+        
+        # =========================================================
+        # [NEW] 传入刚才计算的尺寸字典。
+        # 使用 breaks 仅在图例中显示 Ribo-seq 深度，隐藏 'Constant'（避免读者困惑）
+        # =========================================================
+        + scale_size_manual(values=size_mapping, breaks=depth_levels, name="Ribo-seq Depth")
+        
         + theme_bw()
         + labs(
             title=title,
@@ -301,11 +319,10 @@ def plot_tradeoff_benchmark(
             axis_text=element_text(size=10),
             legend_position="right",
             legend_text=element_text(size=10),
-            legend_title=element_blank()
+            legend_title=element_text(size=10, face="bold") # 让图例标题更明显
         )
     )
     
-    # [MODIFIED] 根据指定的列名动态生成输出文件名
     save_path = os.path.join(out_dir, f"Benchmark_Tradeoff_{x_col}_vs_{y_col}.pdf")
     p.save(save_path, dpi=300, verbose=False)
     print(f"✅ Benchmark Complete! Trade-off plot saved to: {save_path}")
@@ -397,7 +414,7 @@ def plot_multi_model_top_k_precision(
     plot_df = plot_df.groupby('Model', group_keys=False).apply(downsample)
 
     model_order = [
-        "TRACE", "Convolution", 
+        "TRACE",
         "TranslationAI", "RiboTISH", "RibORF",
         "ORF-structure"
     ]

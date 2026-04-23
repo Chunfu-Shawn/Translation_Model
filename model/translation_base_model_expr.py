@@ -125,8 +125,8 @@ class TranslationBaseModel(nn.Module):
         # ==========================================
         self.expr_projector = nn.Sequential(
             nn.Dropout(max(p_drop * 3, 0.9)),
-            # Input dimension is now d_expr + d_species
             nn.Linear(self.d_expr + self.d_species, self.d_cell_env, bias=False),
+            nn.LayerNorm(self.d_cell_env), # 【新增】防止 4 万维度累加后方差爆炸
             nn.GELU(),
             nn.Linear(self.d_cell_env, self.adaptive_dim)
         )

@@ -90,15 +90,16 @@ def save_count_predictions(
     # --- Collate Function for Translation Dataset ---
     def collate_fn_count(batch):
         # 解包: uuid, cell_types, cell_type_idx, meta_info, seq_emb, count_emb
-        uuids, cell_types, expr_vectors, meta_infos, seq_embs, count_embs = zip(*batch)
+        uuids, species, cell_types, expr_vectors, meta_infos, seq_embs, count_embs = zip(*batch)
         lengths = [s.shape[0] for s in seq_embs]
         
         seq_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         count_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
+        species_list = list(species)
         cell_types = list(cell_types)
         expr_vectors = torch.stack(expr_vectors)
         
-        return uuids, cell_types, expr_vectors, meta_infos, seq_padded, count_padded, lengths
+        return uuids, species_list, cell_types, expr_vectors, meta_infos, seq_padded, count_padded, lengths
 
     # 获取 DataLoader
     dataloader, run_rank, run_world_size = _prepare_prediction_dataloader(
@@ -116,7 +117,7 @@ def save_count_predictions(
 
     # --- Inference Loop ---
     for batch_data in iterator:
-        b_uuids, b_cell_types, b_expr_vectors, b_meta, b_seq, b_count, b_lengths = batch_data
+        b_uuids, b_species, b_cell_types, b_expr_vectors, b_meta, b_seq, b_count, b_lengths = batch_data
         
         b_seq = b_seq.to(base_model.device)
         
@@ -125,10 +126,11 @@ def save_count_predictions(
         src_mask = (b_seq[:, :, 0] != -1)
         
         with torch.no_grad():
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 out = base_model.predict(
                     seq_batch=b_seq, 
-                    count_batch=masked_batch, 
+                    count_batch=masked_batch,
+                    species=b_species,
                     cell_type=b_cell_types, 
                     src_mask=src_mask, 
                     head_names=["count"]
