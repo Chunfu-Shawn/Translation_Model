@@ -248,7 +248,7 @@ def calculate_correlations_multitissue(
     
     print(f"\n>>> Evaluating transcripts in the Dataset (CDS Only: {for_cds})...")
     for i in tqdm(range(len(dataset))):
-        uuid, cell_type, cell_type_idx, meta_info, seq_emb, count_emb = dataset[i]
+        uuid, _, cell_type, _, meta_info, _, count_emb, _ = dataset[i]
         uuid_str = str(uuid)
         
         parts = uuid_str.split('-')

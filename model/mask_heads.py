@@ -7,42 +7,6 @@ __author__ = "Chunfu Xiao"
 __version__="1.0.0"
 __email__ = "chunfushawn@gmail.com"
 
-class MaskedSeqPredictorHead(nn.Module):
-    def __init__(self, pmt_len, d_model, d_seq, d_pred_h, p_drop=0.1):
-        super().__init__()
-        self.pmt_len = pmt_len
-        # class output shape: (bs, seq_len, d_seq)
-        self.classify_mlp = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_pred_h),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_pred_h, d_model),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(d_model, d_seq)
-        )
-        
-        # initialize parameters (Xavier for weight tensors by default)
-        self.init_params()
-
-    def init_params(self, default_initialization=False):
-        """
-        Initialize parameters. By default uses Xavier uniform for parameters that have dim > 1.
-        If `default_initialization` is True, skip custom initialization (use PyTorch defaults).
-        """
-        if default_initialization:
-            return
-        for name, p in self.named_parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def forward(self, src_reps):
-        # src_reps: [bs, pmt_len + seq_len, d_model], src_mask: [bs, pmt_len + seq_len]
-        src_reps = src_reps[:, self.pmt_len:, :] # -> [bs, seq_len, d_model]
-
-        return self.classify_mlp(src_reps) # [bs, seq_len, d_seq]
-
 class PsiteDensityHead(nn.Module):
     """
     PsiteDensityHead
@@ -172,6 +136,198 @@ class PsiteDensityHead(nn.Module):
         # infer d_count
         if d_count is None:
             # try common attribute names used in your codebase
+            if hasattr(parent_model, "d_count"):
+                d_count = int(getattr(parent_model, "d_count"))
+            elif hasattr(parent_model, "src_emb") and hasattr(parent_model.src_emb, "d_count"):
+                d_count = int(getattr(parent_model.src_emb, "d_count"))
+            else:
+                raise ValueError("d_count not provided and cannot be inferred from parent_model")
+
+        # now construct
+        return cls(d_model=d_model, d_count=d_count, d_pred_h=d_pred_h, p_drop=p_drop, init_xavier=init_xavier)
+
+
+class DecoupledCountHead(nn.Module):
+    """
+    DecoupledCountHead (Dual-Stream Architecture)
+
+    - Decouples the prediction into two streams:
+        1. Shape Stream: Predicts relative ribosome distribution (profile) across the sequence.
+        2. Scale Stream: Predicts global log-abundance (TE / Total Counts).
+    - Fuses them internally to produce the final absolute counts.
+    - If some dims are not provided, you can create this head from a `parent_model` using
+      `DecoupledCountHead.create_from_model(parent_model, **overrides)`.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_count: int,
+        d_pred_h: Optional[int] = None,
+        p_drop: float = 0.1,
+        init_xavier: bool = True,
+    ):
+        """
+        Parameters
+        ----------
+        d_model : int
+            Model embedding dimension.
+        d_count : int
+            Output count dimension per token (e.g., 1 for density, 10 for read lengths).
+        d_pred_h : Optional[int]
+            Hidden dimension for MLP. If None choose a reasonable default.
+        p_drop : float
+            Dropout probability.
+        init_xavier : bool
+            Whether to run Xavier initialization on linear weights.
+        """
+        super().__init__()
+        self.name = "DecoupledCountHead"
+        self.d_model = int(d_model)
+        self.d_count = int(d_count)
+        self.d_pred_h = int(d_pred_h) if d_pred_h is not None else max(64, self.d_model // 2)
+        self.p_drop = float(p_drop)
+        
+        # ---------------------------------------------------
+        # Stream 1: Shape (局部相对密度)
+        # 负责预测 L 长度的相对概率分布
+        # ---------------------------------------------------
+        self.shape_net = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_pred_h),
+            nn.GELU(),
+            nn.Dropout(self.p_drop),
+            nn.Linear(self.d_pred_h, self.d_count),
+            nn.ReLU()
+        )
+        
+        # ---------------------------------------------------
+        # Stream 2: Scale (全局翻译规模/TE)
+        # 负责预测 1 个 Log 空间的总体丰度
+        # ---------------------------------------------------
+        self.attention_pool = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model // 2),
+            nn.Tanh(),
+            nn.Linear(self.d_model // 2, 1) # 输出一个注意力得分
+        )
+
+        self.scale_net = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_pred_h),
+            nn.GELU(),
+            nn.Dropout(self.p_drop),
+            nn.Linear(self.d_pred_h, 1) # 输出 1 个 Log-TE
+        )
+
+        if init_xavier:
+            self._init_parameters()
+
+    def _init_parameters(self):
+        """Initialize linear weights with Xavier and biases to zero; LayerNorm weight=1 bias=0."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, src_reps: torch.Tensor, src_mask: torch.Tensor = None, **kwargs):
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        src_reps : torch.Tensor
+            Encoder representations with shape (bs, seq_len, d_model).
+        src_mask : Optional[torch.Tensor]
+            Boolean pad mask with shape (bs, seq_len), True for valid tokens.
+            (Note: In your previous code this was named pad_mask).
+
+        Returns
+        -------
+        dict
+            Contains:
+            - "psite_shape": shape (bs, seq_len, d_count)
+            - "te_scale": shape (bs, d_count)
+            - "profile": final fused counts, shape (bs, seq_len, d_count)
+        """
+
+        # ==========================================
+        # 1. 预测 Shape (局部相对密度)
+        # ==========================================
+        shape_preds = self.shape_net(src_reps)
+        
+        if src_mask is not None:
+            # 直接把 Padding 区域清零即可
+            mask_float = src_mask.to(src_reps.device).unsqueeze(-1).to(dtype=src_reps.dtype)
+            shape_preds = shape_preds * mask_float
+
+        # ==========================================
+        # 2. 预测 Scale (全局 Log-TE 或 Log-Total-Counts)
+        # ==========================================
+        # 1. 计算每个 token 的原始注意力得分
+        attn_logits = self.attention_pool(src_reps) # (B, L, 1)
+
+        # 2. Mask 掉 Padding 区域
+        if src_mask is not None:
+            mask_bool = src_mask.to(src_reps.device).unsqueeze(-1)
+            attn_logits = attn_logits.masked_fill(~mask_bool, -1e9)
+
+        # 3. 转化为权重 (和为 1)
+        attn_weights = torch.softmax(attn_logits, dim=1) # (B, L, 1)
+
+        # 4. 加权求和 (代替原来的 mean pooling)，关键序列（如 Kozak 周围）的特征会被放大，不重要的 UTR 会被忽略
+        global_rep = (src_reps * attn_weights).sum(dim=1) # (B, d_model)
+
+        # 5. 预测 Log-TE
+        scale_log = self.scale_net(global_rep) # (B, 1)
+
+        # ==========================================
+        # 3. 内部融合 (Fusion)
+        # ==========================================
+        # 将预测的 Log 规模通过 exp 还原为物理倍数 (仅用于融合，算 Loss 不用这个)
+        scale_linear = torch.exp(scale_log) # (B,)
+        
+        # 绝对翻译量 = 总规模 * 相对概率分布
+        fused_counts = scale_linear.unsqueeze(1) * shape_preds # (B, 1) * (B, L) -> (B, L)
+
+        # 返回一个字典，里面包含解耦的所有部分，供 Trainer 分别算 Loss
+        return {
+            "psite_shape": shape_preds,
+            "te_scale": scale_log,
+            "profile": fused_counts
+        }
+    
+    # ---------------------------
+    # Factory / helper functions
+    # ---------------------------
+    @classmethod
+    def create_from_model(
+        cls,
+        parent_model: object,
+        d_model: Optional[int] = None,
+        d_count: Optional[int] = None,
+        d_pred_h: Optional[int] = None,
+        p_drop: float = 0.1,
+        init_xavier: bool = True,
+    ) -> "DecoupledCountHead":
+        """
+        Create a DecoupledCountHead by inferring missing dimensions from `parent_model`.
+        """
+
+        # infer d_model
+        if d_model is None:
+            if hasattr(parent_model, "d_model"):
+                d_model = int(getattr(parent_model, "d_model"))
+            else:
+                raise ValueError("d_model not provided and parent_model has no attribute 'd_model'")
+
+        # infer d_count
+        if d_count is None:
             if hasattr(parent_model, "d_count"):
                 d_count = int(getattr(parent_model, "d_count"))
             elif hasattr(parent_model, "src_emb") and hasattr(parent_model.src_emb, "d_count"):

@@ -85,7 +85,7 @@ def build_cross_species_expression_dict(
     df = pd.read_csv(file_path, sep='\t', comment='#')
     
     bam_cols = df.columns[6:]
-    rename_dict = {col: os.path.basename(col).replace('.bam', '') for col in bam_cols}
+    rename_dict = {col: os.path.basename(col).split('.')[0] for col in bam_cols}
     df = df.rename(columns=rename_dict)
     sample_cols = list(rename_dict.values())
     
@@ -165,7 +165,8 @@ def build_cross_species_expression_dict(
         
     os.makedirs(os.path.dirname(output_pt_path) or '.', exist_ok=True)
     torch.save(expr_dict, output_pt_path)
-    print(f"✅ Successfully saved expression dictionary to: {output_pt_path} (Shape: {expr_dict[sample_cols[0]].shape})")
+    print(f"✅ Successfully saved expression dictionary to: {output_pt_path}")
+    print(f"Cell type: {expr_dict.keys()}; Array shape: {expr_dict[sample_cols[0]].shape}")
     
     return expr_dict, final_gene_ids
 
@@ -177,6 +178,7 @@ if __name__ == "__main__":
     ortholog_csv = "/home/user/data3/rbase/genome_ref/Homolog/human_macaque_mouse_orthologs.tsv" 
     
     human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts.txt"
+    macque_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/macaque_featureCounts.txt"
     mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_counts.txt"
     
     out_dir = "/home/user/data3/rbase/translation_model/models/lib"
@@ -212,6 +214,16 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # Phase 2: Process other species, forcibly aligning to the reference coordinates
     # ---------------------------------------------------------
+    print("\n========== Phase 2: Aligning Macaque Data ==========")
+    macaque_pt = os.path.join(out_dir, "macaque_expression_dict.pt")
+    build_cross_species_expression_dict(
+        file_path=macque_counts, 
+        output_pt_path=macaque_pt, 
+        id_mapping=id_mapping,
+        reference_anchor_ids=global_anchor_ids, # Forcible alignment
+        min_tpm_threshold=0
+    )
+
     # print("\n========== Phase 2: Aligning Mouse Data ==========")
     # mouse_pt = os.path.join(out_dir, "mouse_expression_dict.pt")
     # build_cross_species_expression_dict(

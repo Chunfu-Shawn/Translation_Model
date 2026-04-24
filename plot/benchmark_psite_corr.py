@@ -195,7 +195,7 @@ def prepare_length_robustness_data(
     length_records = []
     
     for i in tqdm(range(len(dataset))):
-        uuid, _, meta_info, seq_emb, _ = dataset[i]
+        uuid, _, _, _, meta_info, seq_emb, _, _ = dataset[i]
         uuid_str = str(uuid)
         parts = uuid_str.split('-')
         if len(parts) < 2: continue
@@ -297,7 +297,7 @@ def plot_length_robustness_line_chart(
     # --- 2. 自定义颜色与模型排序 ---
     color_mapping = {
         "TRACE": "#2C6B9A",
-        "Encoder": "#555555",
+        # "Encoder": "#555555",
         "Convolution": "#777777",
         "Translatomer": "#999999",
         "RiboMIMO (CDS)": "#BBBBBB",

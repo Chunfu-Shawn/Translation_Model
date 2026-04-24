@@ -252,14 +252,14 @@ class DatasetGenerator():
         te_dict = {t: rpf_clr[i] - (slope * rna_clr[i] + intercept) for i, t in enumerate(tids)}
         return te_dict, rpf_depth, rpf_cov
 
-    def count_embedding(self, arr, te_residual):
+    def count_norm(self, arr):
         """
         arr 已经是被 parse_and_winsorize_to_array 组装且净化好的矩阵了。
         """
         nz_mask = arr > 0
         nz_mean = np.mean(arr[nz_mask]) if np.any(nz_mask) else 1.0
         
-        norm_count = np.log1p((arr / nz_mean) * np.exp(te_residual))
+        norm_count = np.log1p((arr / nz_mean))
         
         return norm_count
 
@@ -281,7 +281,7 @@ class DatasetGenerator():
         datasets = {
             group: {
                 "uuids": [], "tids": [], "seq_embs": {}, "count_embs": [], 
-                "rpf_depth": [], "rpf_coverage": [], "te_val": [],
+                "rpf_depth": [], "rpf_coverage": [], "te_scales": [],
                 "cds_start_pos": [], "cds_end_pos": [],
                 "motif_occs": [], "cell_types": [], 
                 "cell_expr_dict" : {}
@@ -368,8 +368,8 @@ class DatasetGenerator():
 
                     # count array scaling
                     arr = ribo_arr_dict[tid]
-                    te_val = sample_te_dict[tid]
-                    count_emb = self.count_embedding(arr, te_val)
+                    te_scale = sample_te_dict[tid]
+                    norm_count = self.count_norm(arr)
 
                     # motif positions
                     seq_upper = self.seq_dict[tid].upper()
@@ -380,10 +380,10 @@ class DatasetGenerator():
 
                     datasets[group]["uuids"].append("-".join([tid, cell_type, str(i)]))
                     datasets[group]["tids"].append(tid)
-                    datasets[group]["count_embs"].append(np.float32(count_emb))
+                    datasets[group]["count_embs"].append(np.float32(norm_count))
                     datasets[group]["rpf_depth"].append(np.float32(rpf_depth_dict[tid]))
                     datasets[group]["rpf_coverage"].append(np.float32(rpf_cov_dict[tid]))
-                    datasets[group]["te_val"].append(np.float32(te_val))
+                    datasets[group]["te_scales"].append(np.float32(te_scale))
                     datasets[group]["cds_start_pos"].append(np.int16(self.tx_cds[tid]['cds_start_pos']))
                     datasets[group]["cds_end_pos"].append(np.int16(self.tx_cds[tid]['cds_end_pos']))
                     datasets[group]["motif_occs"].append(list(motif_occs))
@@ -409,7 +409,7 @@ class DatasetGenerator():
                     g.attrs['motif_occ'] = dataset["motif_occs"][i] #json.dumps(dataset["motif_occs"][i]) 
                     g.attrs['rpf_depth'] = dataset["rpf_depth"][i]
                     g.attrs['rpf_coverage'] = dataset["rpf_coverage"][i]
-                    g.attrs['te_val'] = dataset["te_val"][i]
+                    g.attrs['te_scale'] = dataset["te_scales"][i]
                     g.create_dataset("count_emb", data=dataset["count_embs"][i], compression="gzip")
 
                 # 2. save sequence embedding

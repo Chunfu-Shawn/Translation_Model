@@ -26,7 +26,7 @@ class DistributedBucketSampler(Sampler):
                  shuffle=True,
                  drop_last=False,
                  seed=0,
-                 cell_types=None,          # [Modified Parameter]
+                 cell_types=None,
                  balance_classes=False):   
         
         if num_replicas is None:
@@ -101,8 +101,16 @@ class DistributedBucketSampler(Sampler):
                 shuffler.shuffle(class_idx_list) 
                 # Truncate to the minimum count to achieve Downsampling
                 selected_indices.extend(class_idx_list[:self.min_count])
+
+            # global shuffle
+            if self.shuffle:
+                shuffler.shuffle(selected_indices)
         else:
             selected_indices = list(range(len(self.lengths)))
+
+            # global shuffle
+            if self.shuffle:
+                shuffler.shuffle(selected_indices)
 
         # ---------------------------------------------------------
         # 2. Padding / Truncating to ensure strict synchronization across DDP processes

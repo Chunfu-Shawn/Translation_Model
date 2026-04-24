@@ -48,7 +48,7 @@ if __name__=="__main__":
 
     ####### Macaque #######
     tx_meta_file = '/home/user/data3/rbase/translation_model/models/lib/transcript_meta.macaque.pkl'
-    fasta_tx_file = '/home/user/data3/rbase/genome_ref/Rhesus_macaque/rheMac10/fasta/Macaca_mulatta.Mmul_10.cdna.all.fa'
+    fasta_tx_file = '/home/user/data3/rbase/genome_ref/Rhesus_macaque/rheMac10/fasta/Macaca_mulatta.Mmul_10.transcripts.fa'
     tx_seq_file = '/home/user/data3/rbase/translation_model/models/lib/tx_seq.Mmul_10.v101.pkl'
 
     # load tx index
@@ -63,6 +63,7 @@ if __name__=="__main__":
         tx_id = h.split(" ")[0]
         if tx_id in tx_meta:
             tx_seq[tx_id] = s
+    print(tx_seq['ENSMMUT00000051915.3'])
 
     with open(tx_seq_file, 'wb') as f_seq:
         pickle.dump(tx_seq, f_seq, protocol=pickle.HIGHEST_PROTOCOL)

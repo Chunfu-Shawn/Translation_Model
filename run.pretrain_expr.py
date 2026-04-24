@@ -4,9 +4,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from data.RPF_counter_v3 import *
 from model.translation_base_model_expr import TranslationBaseModel
-from model.mask_heads import PsiteDensityHead
+from model.mask_heads import DecoupledCountHead
 from train.model_pretrain_expr import PretrainingTrainer
-from data.translation_dataset import TranslationDataset
 from utils import print_param_counts
 
 rank = int(os.environ['LOCAL_RANK'])        # torchrun 会设
@@ -18,9 +17,14 @@ torch.backends.cudnn.benchmark = True
 
 # load dataset
 dataset_dir = '/home/user/data3/rbase/translation_model/data/dataset/'
-dataset_name = "7c_15k_depth0.1_cov0.1_rpm1"
-train_dataset_path = os.path.join(dataset_dir, dataset_name + ".train.h5")
-val_dataset_path = os.path.join(dataset_dir, dataset_name + ".valid.h5")
+## human
+human_dataset_name = "human_7c_4k_depth0.1_cov0.1_rpm1"
+human_train_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".train.h5")
+human_val_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".valid.h5")
+## macaque
+# macaque_dataset_name = "macaque_4c_15k_depth0.1_cov0.1_rpm1"
+# macaque_train_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".train.h5")
+# macaque_val_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".valid.h5")
 
 # create model
 base_model = TranslationBaseModel.from_config(
@@ -29,7 +33,7 @@ base_model = TranslationBaseModel.from_config(
 # create heads
 base_model.add_head(
     "count",
-    PsiteDensityHead.create_from_model(
+    DecoupledCountHead.create_from_model(
         base_model,
         d_pred_h = 384
         ),
@@ -51,10 +55,10 @@ base_model = DDP(
 epoch_num = 20
 trainer = PretrainingTrainer(
     model = base_model,
-    dataset_paths = [train_dataset_path],
-    val_dataset_paths = [val_dataset_path],
-    dataset_name = dataset_name,
-    batch_size = 20,
+    dataset_paths = [human_train_dataset_path,],
+    val_dataset_paths = [human_val_dataset_path],
+    dataset_name = "human_7c_4k_depth0.1_cov0.1_rpm1",
+    batch_size = 2,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
     world_size = world_size,
