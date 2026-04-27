@@ -281,7 +281,7 @@ class DatasetGenerator():
         datasets = {
             group: {
                 "uuids": [], "tids": [], "seq_embs": {}, "count_embs": [], 
-                "rpf_depth": [], "rpf_coverage": [], "te_val": [],
+                "rpf_depth": [], "rpf_coverage": [], "te_scale": [],
                 "cds_start_pos": [], "cds_end_pos": [],
                 "motif_occs": [], "cell_types": [], 
                 "cell_expr_dict" : {}
@@ -368,8 +368,8 @@ class DatasetGenerator():
 
                     # count array scaling
                     arr = ribo_arr_dict[tid]
-                    te_val = sample_te_dict[tid]
-                    count_emb = self.count_embedding(arr, te_val)
+                    te_scale = sample_te_dict[tid]
+                    count_emb = self.count_embedding(arr, te_scale)
 
                     # motif positions
                     seq_upper = self.seq_dict[tid].upper()
@@ -383,7 +383,7 @@ class DatasetGenerator():
                     datasets[group]["count_embs"].append(np.float32(count_emb))
                     datasets[group]["rpf_depth"].append(np.float32(rpf_depth_dict[tid]))
                     datasets[group]["rpf_coverage"].append(np.float32(rpf_cov_dict[tid]))
-                    datasets[group]["te_val"].append(np.float32(te_val))
+                    datasets[group]["te_scale"].append(np.float32(te_scale))
                     datasets[group]["cds_start_pos"].append(np.int16(self.tx_cds[tid]['cds_start_pos']))
                     datasets[group]["cds_end_pos"].append(np.int16(self.tx_cds[tid]['cds_end_pos']))
                     datasets[group]["motif_occs"].append(list(motif_occs))
@@ -409,7 +409,7 @@ class DatasetGenerator():
                     g.attrs['motif_occ'] = dataset["motif_occs"][i] #json.dumps(dataset["motif_occs"][i]) 
                     g.attrs['rpf_depth'] = dataset["rpf_depth"][i]
                     g.attrs['rpf_coverage'] = dataset["rpf_coverage"][i]
-                    g.attrs['te_val'] = dataset["te_val"][i]
+                    g.attrs['te_scale'] = dataset["te_scale"][i]
                     g.create_dataset("count_emb", data=dataset["count_embs"][i], compression="gzip")
 
                 # 2. save sequence embedding

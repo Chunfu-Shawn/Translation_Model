@@ -259,7 +259,7 @@ class DatasetGenerator():
         nz_mask = arr > 0
         nz_mean = np.mean(arr[nz_mask]) if np.any(nz_mask) else 1.0
         
-        norm_count = np.log1p((arr / nz_mean))
+        norm_count = arr / nz_mean
         
         return norm_count
 
@@ -293,7 +293,6 @@ class DatasetGenerator():
             return False
 
         all_cell_types = [item["cell_type"] for item in dataset_config]
-        # all_cell_types = list(dict.fromkeys(raw_cell_types))
         
         # ==========================================
         # Pre-load the Cell Expression Dictionary

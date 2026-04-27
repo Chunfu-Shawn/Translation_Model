@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import ConcatDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from utils import unwrap_model
@@ -388,8 +389,8 @@ class PretrainingTrainer:
         expr_batch = torch.stack(expr_vectors) # [B, d_expr]
         
         cds_starts = [meta.get("cds_start_pos", -1) for meta in meta_info]
-        cds_stops = [meta.get("cds_stop_pos", -1) for meta in meta_info]
         motif_occs = [meta.get("motif_occs", []) for meta in meta_info]
+        te_targets = torch.tensor([meta.get("te_scale", None) for meta in meta_info], dtype=torch.float32)
 
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
@@ -463,19 +464,6 @@ class PretrainingTrainer:
 
             # print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
         
-        norm_lengths = torch.zeros(B, dtype=torch.float32)
-        for i in range(B):
-            s = cds_starts[i]
-            e = cds_stops[i]
-            
-            # 判断是否有合法的 CDS 标记
-            if s != -1 and e != -1 and e > s:
-                # 统计在 CDS 区域内，真正被 Mask 且需要计算 Loss 的 token 数量
-                mask_in_cds = count_emb_masks[i, s:e].sum().float()
-                norm_lengths[i] = mask_in_cds
-            else:
-                # 如果没有 CDS 标记，默认取该条序列所有 Mask token 的三分之一
-                norm_lengths[i] = count_emb_masks[i].sum().float() / 2.0
 
         return (
             species_list,
@@ -486,46 +474,49 @@ class PretrainingTrainer:
             count_embs_padded,
             count_embs_masked,
             count_emb_masks,
-            norm_lengths,
+            te_targets,
             pad_masks
         )
     
     def count_task_criterion(
-                self,
-                result: Dict[str, torch.Tensor],
-                count_raw_emb: torch.Tensor, 
-                count_emb_masks: torch.Tensor,
-                norm_lengths: torch.Tensor
+            self,
+            result: Dict[str, torch.Tensor],
+            count_raw_emb: torch.Tensor, 
+            count_emb_masks: torch.Tensor,
+            te_targets: torch.Tensor,
+            shape_weight: float = 0.7,
             ) -> torch.Tensor:
+        """
+        Compute per-task losses and return a tensor [seq_loss, count_loss, cell_loss].
+        result is expected to be a dict mapping 'seq','count','cell' to model outputs.
+        """
+        # pred_log_te = result["count"]["te_scale"].float() # (B, d_count)
+        # true_log_te = te_targets.float().to(pred_log_te.device)
+        
+        # # 形状对齐：如果 TE 标签是 (B,) 而预测是 (B, 1)，压缩预测维度
+        # if pred_log_te.shape[-1] == 1 and true_log_te.dim() == 1:
+        #     pred_log_te = pred_log_te.squeeze(-1)
             
-            pred = result["count"].float()  # (B, L, d_count) 
-            count_raw_emb = count_raw_emb.float()            
-            
-            # 1. 计算所有位置的基础 Loss
-            if pred.shape[2] == 1:
-                loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-            else:
-                loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-                
-            # ==========================================
-            # 样本级平均 (Instance-Level Averaging)
-            # ==========================================
-            # 2. 将 Loss 坍缩到 Batch 维度 (求每条序列的总 Loss)
-            if loss_all.dim() == 3:
-                loss_per_seq = loss_all.sum(dim=[1, 2]) # (B,)
-            else:
-                loss_per_seq = loss_all.sum(dim=1)      # (B,)
+        # # 在对数空间直接使用 SmoothL1Loss，对极端值极度鲁棒
+        # scale_loss = F.smooth_l1_loss(pred_log_te, true_log_te, reduction='mean')
 
-            # 3. 防止除以 0 (如果某条序列在 CDS 里刚好没有任何 token 被 mask)
-            safe_lengths = torch.clamp(norm_lengths.to(loss_per_seq.device), min=1.0)
-            
-            # 4. 计算单条序列的有效平均 Loss
-            per_sample_loss = loss_per_seq / safe_lengths
-            
-            # 5. 最后对整个 Batch 求均值
-            loss = per_sample_loss.mean()
+        # 2. Shape Loss (局部相对密度)
+        pred = result["count"].float()  # (B, L, d_count) 
+        count_raw_emb = count_raw_emb.float()            # (B, L, d_count)
+        
+        num_masked_count_token = torch.clamp(count_emb_masks.sum().float(), min=1.0)
 
-            return loss
+        if pred.shape[2] == 1:
+            loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
+        else:
+            loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
+            
+        loss = loss_all.sum() / num_masked_count_token
+
+        # 3. 融合总 Loss
+        #total_loss = (1 - shape_weight) * scale_loss + shape_weight * shape_loss
+
+        return loss
 
     
     # -------------------------
@@ -553,9 +544,9 @@ class PretrainingTrainer:
 
         for batch_idx, batch_data in enumerate(dataloader):
             # Unpack the batch
-            species_list, _, _, expr_batch, \
+            species_list, cell_types, cell_mask, expr_batch, \
             seq_embs_padded, \
-            count_embs_padded, count_embs_masked, count_emb_masks, norm_lengths, pad_masks = batch_data
+            count_embs_padded, count_embs_masked, count_emb_masks, te_targets, pad_masks = batch_data
 
             # Move tensors to CUDA
             expr_batch = expr_batch.cuda(non_blocking=True)
@@ -563,7 +554,7 @@ class PretrainingTrainer:
             count_embs_masked = count_embs_masked.cuda(non_blocking=True)
             count_embs_padded = count_embs_padded.cuda(non_blocking=True)
             count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-            norm_lengths = norm_lengths.cuda(non_blocking=True)
+            te_targets = te_targets.cuda(non_blocking=True)
             pad_masks = pad_masks.cuda(non_blocking=True)
 
             # ==========================================
@@ -586,7 +577,7 @@ class PretrainingTrainer:
                     head_names=["count"]
                 )
                 
-                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, norm_lengths)
+                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, te_targets)
                 acc_loss = loss / self.ac_steps
 
             do_sync = ((batch_idx + 1) % self.ac_steps == 0)
@@ -647,9 +638,9 @@ class PretrainingTrainer:
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(val_loader):
                 
-                species_list, _, _, expr_batch, \
+                species_list, cell_types, cell_mask, expr_batch, \
                 seq_embs_padded, \
-                count_embs_padded, count_embs_masked, count_emb_masks, norm_lengths, pad_masks = batch_data
+                count_embs_padded, count_embs_masked, count_emb_masks, te_targets, pad_masks = batch_data
 
                 # Move tensors to CUDA
                 expr_batch = expr_batch.cuda(non_blocking=True)
@@ -657,7 +648,7 @@ class PretrainingTrainer:
                 count_embs_masked = count_embs_masked.cuda(non_blocking=True)
                 count_embs_padded = count_embs_padded.cuda(non_blocking=True)
                 count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-                norm_lengths = norm_lengths.cuda(non_blocking=True)
+                te_targets = te_targets.cuda(non_blocking=True)
                 pad_masks = pad_masks.cuda(non_blocking=True)
 
                 # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
@@ -671,7 +662,7 @@ class PretrainingTrainer:
                         head_names=["count"],
                         move_inputs_to_device=False # Already moved manually
                     )
-                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, norm_lengths)
+                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, te_targets)
 
                 total_loss += loss.detach()
                 local_loss.append([float(loss)])
