@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from utils import unwrap_model
-from data.translation_dataset_v2 import TranslationDataset
+from data.translation_dataset import TranslationDataset
 from train.distributed_balanced_bucket_sampler import DistributedBucketSampler
 from train.masking_adapter import BatchMaskingAdapter, get_dynamic_mask_ratio
 
@@ -382,7 +382,7 @@ class PretrainingTrainer:
         Receives expr_vectors directly from the dataset.
         """
         # Unpack matching TranslationDataset.__getitem__ outputs
-        _, species, cell_types, expr_vectors, meta_info, seq_embs, count_embs, te_scales = zip(*batch)
+        _, species, cell_types, expr_vectors, meta_info, seq_embs, count_embs = zip(*batch)
 
         species_list = list(species)
         cell_types = list(cell_types)
@@ -390,10 +390,10 @@ class PretrainingTrainer:
         
         cds_starts = [meta.get("cds_start_pos", -1) for meta in meta_info]
         motif_occs = [meta.get("motif_occs", []) for meta in meta_info]
+        te_targets = torch.tensor([meta.get("te_scale", None) for meta in meta_info], dtype=torch.float32)
 
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
-        te_targets = torch.tensor(te_scales, dtype=torch.float32)
 
         pad_masks = (seq_embs_padded != -1)[:, :, 0].squeeze(-1)
         B, L = seq_embs_padded.shape[:2]
@@ -483,7 +483,8 @@ class PretrainingTrainer:
             result: Dict[str, torch.Tensor],
             count_raw_emb: torch.Tensor, 
             count_emb_masks: torch.Tensor,
-            te_targets: torch.Tensor
+            te_targets: torch.Tensor,
+            shape_weight: float = 0.7,
             ) -> torch.Tensor:
         """
         Compute per-task losses and return a tensor [seq_loss, count_loss, cell_loss].
@@ -499,9 +500,7 @@ class PretrainingTrainer:
         # 在对数空间直接使用 SmoothL1Loss，对极端值极度鲁棒
         scale_loss = F.smooth_l1_loss(pred_log_te, true_log_te, reduction='mean')
 
-        # ==========================================
         # 2. Shape Loss (局部相对密度)
-        # ==========================================
         pred_shape = result["count"]["psite_shape"].float()  # (B, L, d_count) 
         count_raw_emb = count_raw_emb.float()            # (B, L, d_count)
         
@@ -514,11 +513,8 @@ class PretrainingTrainer:
             
         shape_loss = shape_loss_all.sum() / num_masked_count_token
 
-        # ==========================================
         # 3. 融合总 Loss
-        # ==========================================
-        # 这里可以直接相加。你也可以在后续调参时给其中一项加权重，例如 scale_loss + 0.5 * shape_loss
-        total_loss = scale_loss + shape_loss
+        total_loss = (1 - shape_weight) * scale_loss + shape_weight * shape_loss
 
         return total_loss
 

@@ -92,7 +92,7 @@ class TranslationDataset(Dataset):
                                 "motif_occ": list(grp.attrs.get("motif_occ", None)),
                                 "rpf_depth": np.float32(grp.attrs.get("rpf_depth", -1)),
                                 "rpf_coverage": np.float32(grp.attrs.get("rpf_coverage", -1)),
-                                "te_val": np.float32(grp.attrs.get("te_val", -1))
+                                "te_scale": np.float32(grp.attrs.get("te_scale", None))
                             })
                         data["seq_embs"].append(f["sequences"][tid][:]) # (L, 4)
                         data["count_embs"].append(grp["count_emb"][:]) # (L, 1)
@@ -173,7 +173,7 @@ class TranslationDataset(Dataset):
                 "motif_occ": list(grp.attrs.get("motif_occ", None)),
                 "rpf_depth": np.float32(grp.attrs.get("rpf_depth", -1)),
                 "rpf_coverage": np.float32(grp.attrs.get("rpf_coverage", -1)),
-                "te_val": np.float32(grp.attrs.get("te_val", -1))
+                "te_scale": np.float32(grp.attrs.get("te_scale", None))
                 }
             seq_emb = torch.from_numpy(self._h5_handle["sequences"][tid][:]).float() # (L, 4)
             count_emb = torch.from_numpy(grp["count_emb"][:]).float() # (L, 1)

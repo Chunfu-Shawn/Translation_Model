@@ -97,7 +97,7 @@ def plot_model_benchmark(
     
     model_order = [
         "TRACE", "Convolution", 
-        "TranslationAI", "RiboTISH", "RibORF",
+        "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
         "ORF-structure"
     ]
     all_models_in_data = plot_df['Model'].unique().tolist()
@@ -245,7 +245,7 @@ def plot_tradeoff_benchmark(
     
     model_order = [
         "TRACE",
-        "TranslationAI", "RiboTISH", "RibORF",
+        "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
         "ORF-structure"
     ]
     all_models_in_data = plot_df['Model'].unique().tolist()
@@ -415,7 +415,7 @@ def plot_multi_model_top_k_precision(
 
     model_order = [
         "TRACE",
-        "TranslationAI", "RiboTISH", "RibORF",
+        "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
         "ORF-structure"
     ]
     all_models_in_data = plot_df['Model'].unique().tolist()

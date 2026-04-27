@@ -110,8 +110,8 @@ class TranslationEfficiencyAnalyzer:
                 
         meta = self.tx_cds[lookup_tid]
         
-        # 尝试获取 te_val，如果是评估预测结果，meta 里可能没有真实 TE，默认填入 NaN
-        te_val = meta.get('te_val', np.nan)
+        # 尝试获取 te_scale，如果是评估预测结果，meta 里可能没有真实 TE，默认填入 NaN
+        te_scale = meta.get('te_scale', np.nan)
         cds_start = int(meta.get('cds_start_pos', -1))
         cds_end = int(meta.get('cds_end_pos', -1))
         
@@ -120,9 +120,9 @@ class TranslationEfficiencyAnalyzer:
         else:
             cds_start = cds_start - 1  # 调整为 0-based 索引
             
-        self._process_and_append(results, uuid, transcript_id, cell_type, count_emb, cds_start, cds_end, te_val)
+        self._process_and_append(results, uuid, transcript_id, cell_type, count_emb, cds_start, cds_end, te_scale)
 
-    def _process_and_append(self, results_list, uuid, transcript_id, cell_type, count_emb, cds_start, cds_end, te_val):
+    def _process_and_append(self, results_list, uuid, transcript_id, cell_type, count_emb, cds_start, cds_end, te_scale):
         """
         内部核心逻辑：处理 Density 数组并计算翻译指标
         """
@@ -160,7 +160,7 @@ class TranslationEfficiencyAnalyzer:
             'UUID': uuid,
             'Tid': transcript_id,
             'Cell_Type': cell_type,
-            'TE': te_val,
+            'TE': te_scale,
             'mORF_Sum_Ratio': te_morf_ratio,
             'mORF_Mean_Ratio': te_morf_mean_ratio,
             'mORF_Mean_Density': te_morf_mean_signal,

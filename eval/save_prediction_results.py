@@ -141,7 +141,10 @@ def save_count_predictions(
         for i, uuid in enumerate(b_uuids):
             valid_len = b_lengths[i]
             # 仅提取 pred
-            pred = pred_batch[i, :valid_len].squeeze().cpu().numpy().astype(np.float16)
+            if isinstance(pred_batch, dict):
+                pred = pred_batch["profile"][i, :valid_len].squeeze().cpu().numpy().astype(np.float16)
+            else:
+                pred = pred_batch[i, :valid_len].squeeze().cpu().numpy().astype(np.float16)
             
             # 解析 UUID 获取 tid 和 cell_type (例如: "ENST00000652508.1-liver-3")
             parts = str(uuid).split('-')

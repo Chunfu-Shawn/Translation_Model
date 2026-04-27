@@ -45,14 +45,17 @@ class DeNovoSequenceDataset(Dataset):
     """
     def __init__(self, 
                  seq_dict: Dict[str, str], 
+                 species: str,
                  cell_type: str, 
-                 cell_type_mapping: Dict[str, int], 
+                 cell_expr_vector: np.ndarray,
                  min_len: int = 200,
                  max_len: int = 20000):
         self.tids = list(seq_dict.keys())
         self.seq_dict = seq_dict
+        self.species = species
         self.cell_type = cell_type
-        self.cell_type_idx = cell_type_mapping.get(cell_type, 0)
+        self.cell_expr_vector = np.array(cell_expr_vector, dtype=np.float32)
+        
         self.nt_mapping = dict(zip("ACGTN", range(5)))
         self.min_len = min_len
         self.max_len = max_len  # 设置最大支持长度限制
@@ -76,7 +79,7 @@ class DeNovoSequenceDataset(Dataset):
             if tid_clean.startswith('ENS') and '.' in tid_clean:
                 tid_clean = tid_clean.split('.')[0]
                 
-            uuid = f"{tid_clean}-{self.cell_type}-Prediction"
+            uuid = f"{tid_clean}-{self.species}-{self.cell_type}-Prediction"
             self.uuids.append(uuid)
             
             seq_idx = [self.nt_mapping.get(nt, 4) for nt in seq]
@@ -90,7 +93,8 @@ class DeNovoSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         uuid = self.uuids[idx]
-        cell_type_idx = torch.tensor(self.cell_type_idx, dtype=torch.long)
+        species = str(self.species)
+        cell_expr_tensor = torch.from_numpy(self.cell_expr_vector)
         seq_emb = torch.from_numpy(self.seq_embs[idx]).float()
         
         # 动态生成占位的 Count 矩阵 (纯 0)，长度将匹配截断后的长度
@@ -99,18 +103,19 @@ class DeNovoSequenceDataset(Dataset):
         # 返回空字典 meta_info 作为占位
         meta_info = {}
         
-        return uuid, cell_type_idx, meta_info, seq_emb, count_emb
+        return uuid, species, cell_expr_tensor, meta_info, seq_emb, count_emb
 
 def collate_fn_denovo(batch):
     """专门配套的组装函数"""
-    uuids, cell_idxs, meta_infos, seq_embs, count_embs = zip(*batch)
+    uuids, species, cell_exprs, meta_infos, seq_embs, count_embs = zip(*batch)
     lengths = [s.shape[0] for s in seq_embs]
     
     seq_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
     count_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
-    cell_idxs = torch.stack(cell_idxs)
+    species_list = list(species)
+    cell_exprs = torch.stack(cell_exprs)
     
-    return uuids, cell_idxs, meta_infos, seq_padded, count_padded, lengths
+    return uuids, species_list, cell_exprs, meta_infos, seq_padded, count_padded, lengths
 
 # =================================================================
 # 主引擎: 仅预测翻译图谱
@@ -127,7 +132,9 @@ class TranslationProfilePredictor:
 
     def run(
             self,
-            cell_type: str, 
+            species: str,
+            cell_type: str,
+            cell_expr_vector: np.ndarray, 
             target_tids: Optional[list] = None, 
             out_dir: str = "./results",
             suffix: str = "results",
@@ -170,10 +177,9 @@ class TranslationProfilePredictor:
         self.model.eval()
         base_model = unwrap_model(self.model)
         device = base_model.device
-        cell_mapping = getattr(base_model, "cell_type_mapping", {})
         
         # 构建 Dataset 和 DataLoader
-        dataset = DeNovoSequenceDataset(seq_dict, cell_type, cell_mapping, min_len, max_len)
+        dataset = DeNovoSequenceDataset(seq_dict, species, cell_type, cell_expr_vector, min_len, max_len)
         dataloader, run_rank, run_world_size = _prepare_prediction_dataloader(
             dataset, collate_fn_denovo, num_samples=None, batch_size=batch_size,
             rank=rank, world_size=world_size
@@ -184,16 +190,22 @@ class TranslationProfilePredictor:
         
         with torch.no_grad():
             for batch in iterator:
-                b_uuids, b_cell_idxs, b_meta, b_seq, b_count, b_lengths = batch
+                b_uuids, species_list, b_cell_exprs, b_meta, b_seq, b_count, b_lengths = batch
                 
+                b_cell_exprs = b_cell_exprs.to(device)
                 b_seq = b_seq.to(device)
-                b_cell_idxs = b_cell_idxs.to(device)
                 b_count = b_count.to(device)
                 
                 src_mask = (b_seq[:, :, 0] != -1)
                 
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    out = base_model.predict(b_seq, b_count, b_cell_idxs, src_mask, head_names=["count"])
+                    out = base_model.predict(
+                        seq_batch=b_seq, 
+                        count_batch=b_count, 
+                        species=species_list,
+                        expr_vector=b_cell_exprs,
+                        src_mask=src_mask, 
+                        head_names=["count"])
                 
                 probs_batch = out["count"]
                 
