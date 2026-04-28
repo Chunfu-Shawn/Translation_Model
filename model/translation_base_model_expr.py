@@ -124,7 +124,7 @@ class TranslationBaseModel(nn.Module):
         # Now accepts d_expr + d_species as input to the bottleneck
         # ==========================================
         self.expr_projector = nn.Sequential(
-            nn.Dropout(max(p_drop * 2, 0.9)),
+            nn.Dropout(min(p_drop * 2, 0.9)),
             nn.Linear(self.d_expr + self.d_species, self.d_cell_env, bias=False),
             nn.LayerNorm(self.d_cell_env),
             nn.GELU(),

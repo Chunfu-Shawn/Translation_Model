@@ -9,7 +9,7 @@ expr_dict_path: None #"/home/user/data3/rbase/translation_model/models/src/confi
 n_heads: 8
 number_of_layers: 10
 d_ff: 768
-adaptive_dim: 16
+adaptive_dim: 8
 gamma_scale: 0.5
 p_drop: 0.1
 model_name: "base_model_expr_384d_8h_10l_64env_8ad"
