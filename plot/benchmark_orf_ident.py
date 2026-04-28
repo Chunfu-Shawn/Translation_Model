@@ -244,7 +244,7 @@ def plot_tradeoff_benchmark(
     print(f"Generating {x_col} vs {y_col} Benchmark Plot...")
     
     model_order = [
-        "TRACE",
+        "TRACE", "Convolution",
         "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
         "ORF-structure"
     ]
@@ -414,7 +414,7 @@ def plot_multi_model_top_k_precision(
     plot_df = plot_df.groupby('Model', group_keys=False).apply(downsample)
 
     model_order = [
-        "TRACE",
+        "TRACE", "Convolution",
         "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
         "ORF-structure"
     ]

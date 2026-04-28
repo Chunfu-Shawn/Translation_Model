@@ -19,7 +19,6 @@ class ModelConfig:
     d_seq: int
     d_count: int
     d_model: int
-    all_cell_types: List[str]
     number_of_layers: int = 6
     d_ff: int = 2048
     kernel_size: int = 7

@@ -28,7 +28,7 @@ human_val_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".valid.
 
 # create model
 base_model = TranslationBaseModel.from_config(
-    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_8h_10l_64env_8ad.yaml"
+    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_8h_10l_64env_16ad.yaml"
     ).cuda(rank)
 # create heads
 base_model.add_head(

@@ -58,7 +58,6 @@ class TranslationBaseModel(nn.Module):
         d_seq: int,
         d_count: int,
         d_model: int,
-        all_cell_types: List[str],
         number_of_layers: int = 12,
         d_ff: int = 2048,
         kernel_size: int = 7,
@@ -71,7 +70,6 @@ class TranslationBaseModel(nn.Module):
             d_seq=d_seq,
             d_count=d_count,
             d_model=d_model,
-            all_cell_types=all_cell_types,
             number_of_layers=number_of_layers,
             d_ff=d_ff,
             kernel_size=kernel_size,
@@ -86,17 +84,6 @@ class TranslationBaseModel(nn.Module):
 
         # embeds source data into high-dimensional potent embedding vectors
         self.src_emb = LinearEmbedding(self.d_seq, self.d_count, self.d_model)
-
-        # cell type handling
-        self.num_provided_cells = len(all_cell_types)
-        self.num_cells = self.num_provided_cells + 1 # Total embeddings needed = N + 1
-        # mapping: token string -> index [1 .. num_classes-1]
-        self.cell_type_mapping = dict(
-            zip(
-                all_cell_types, 
-                range(1, self.num_cells) # Start from 1
-            )
-        )
 
         # Pass num_classes to Encoder/Layer for AdaLayerNorm embedding initialization
         encoder_layer = ConvEncoderLayer(d_model, d_ff, kernel_size, p_drop)
@@ -182,7 +169,7 @@ class TranslationBaseModel(nn.Module):
             raise TypeError("config must be a dict, ModelConfig, or a path to a JSON/YAML file.")
 
         # Basic validation & required keys
-        required = {"d_seq", "d_count", "d_model", "all_cell_types"}
+        required = {"d_seq", "d_count", "d_model"}
         missing = required - cfg_dict.keys()
         if missing:
             raise ValueError(f"Missing required config keys: {missing}")
@@ -192,7 +179,6 @@ class TranslationBaseModel(nn.Module):
             d_seq=int(cfg_dict["d_seq"]),
             d_count=int(cfg_dict["d_count"]),
             d_model=int(cfg_dict["d_model"]),
-            all_cell_types=list(cfg_dict["all_cell_types"]),
             number_of_layers=int(cfg_dict.get("number_of_layers", 6)),
             d_ff=int(cfg_dict.get("d_ff", 2048)),
             kernel_size=int(cfg_dict.get("kernel_size", 7)),
@@ -209,7 +195,7 @@ class TranslationBaseModel(nn.Module):
         Example:
             model = TranslationBaseModel.from_config("configs/my_model.yaml")
             or
-            cfg = {"d_seq":4, "d_count":10, "d_model":512, "all_cell_types": ["A","B",...]}
+            cfg = {"d_seq":4, "d_count":10, "d_model":512}
             model = TranslationBaseModel.from_config(cfg)
         """
         cfg = cls._normalize_config(config)
@@ -224,7 +210,6 @@ class TranslationBaseModel(nn.Module):
             d_seq=cfg.d_seq,
             d_count=cfg.d_count,
             d_model=cfg.d_model,
-            all_cell_types=cfg.all_cell_types,
             number_of_layers=cfg.number_of_layers,
             d_ff=cfg.d_ff,
             kernel_size=cfg.kernel_size,
@@ -349,75 +334,6 @@ class TranslationBaseModel(nn.Module):
 
         return seq_batch, count_batch, src_mask_batched, was_squeezed
     
-    def _normalize_cell_type(self, cell_type: Any, batch_size: int) -> torch.LongTensor:
-        """
-        Normalize cell_type inputs into a long tensor of shape (batch_size,).
-        If unknown or missing -> returns 0 (Default/Mean).
-        If known -> returns Index from 1 to N.
-        Accepts:
-          - single str -> convert to index or num_cells for unknown
-          - single int -> validate or map to num_cells if out-of-range
-          - list / np.ndarray / torch.Tensor -> length must be batch_size or 1 (will broadcast)
-        Unknown entries map to self.num_cells (reserved index).
-        """
-        # helper to convert single element to index
-        def _single_to_index(val) -> int:
-            if isinstance(val, str):
-                # Return 0 (default) if not found
-                return self.cell_type_mapping.get(val, 0)
-            try:
-                ival = int(val)
-            except Exception:
-                return 0 # Default on error
-            
-            # If ival is already in the range [0, num_classes-1], respect it
-            # This allows user to manually pass 0 for default, or 1..N for specific
-            if 0 <= ival < self.num_cells:
-                return ival
-            return 0 # Default if out of bounds
-
-        # If torch tensor
-        if isinstance(cell_type, torch.Tensor):
-            if cell_type.numel() == 1:
-                idx = _single_to_index(cell_type.item())
-                return torch.full((batch_size,), idx, dtype=torch.long)
-            if cell_type.dim() == 1:
-                if cell_type.numel() == batch_size:
-                    return cell_type.to(dtype=torch.long) # Assume user passes correct indices
-                if cell_type.numel() == 1:
-                    idx = _single_to_index(cell_type.item())
-                    return torch.full((batch_size,), idx, dtype=torch.long)
-                raise ValueError(f"cell_type tensor length {cell_type.numel()} != batch_size {batch_size}")
-            raise ValueError("Unsupported cell_type tensor shape.")
-
-        # numpy array
-        if isinstance(cell_type, np.ndarray):
-            arr = cell_type.flatten()
-            if arr.size == 1:
-                idx = _single_to_index(arr.item())
-                return torch.full((batch_size,), idx, dtype=torch.long)
-            if arr.size == batch_size:
-                mapped = [_single_to_index(x) for x in arr.tolist()]
-                return torch.tensor(mapped, dtype=torch.long)
-            raise ValueError(f"cell_type array length {arr.size} != batch_size {batch_size}")
-
-        # python list/tuple
-        if isinstance(cell_type, (list, tuple)):
-            if len(cell_type) == 1:
-                idx = _single_to_index(cell_type[0])
-                return torch.full((batch_size,), idx, dtype=torch.long)
-            if len(cell_type) == batch_size:
-                mapped = [_single_to_index(x) for x in cell_type]
-                return torch.tensor(mapped, dtype=torch.long)
-            raise ValueError(f"cell_type list length {len(cell_type)} != batch_size {batch_size}")
-
-        # scalar int/str or None
-        if cell_type is None:
-            return torch.zeros((batch_size,), dtype=torch.long) # All defaults
-
-        idx = _single_to_index(cell_type)
-        return torch.full((batch_size,), idx, dtype=torch.long)
-    
     # -------------------------
     # Forward / predict
     # -------------------------
@@ -425,7 +341,9 @@ class TranslationBaseModel(nn.Module):
         self,
         seq_batch: torch.Tensor,
         count_batch: torch.Tensor,
-        cell_type_idx: torch.LongTensor,
+        cell_type: Optional[Any] = None, 
+        expr_vector: torch.Tensor = None,
+        species: Optional[Any] = None,
         src_mask: Optional[torch.Tensor] = None,
         head_names: Optional[List[str]] = None, 
         head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -452,8 +370,6 @@ class TranslationBaseModel(nn.Module):
             raise TypeError("forward() expects seq_batch as torch.Tensor (dim==3). Use predict() for flexible inputs.")
         if not isinstance(count_batch, torch.Tensor):
             raise TypeError("forward() expects count_batch as torch.Tensor (dim==3). Use predict() for flexible inputs.")
-        if not isinstance(cell_type_idx, torch.Tensor):
-            raise TypeError("forward() expects cell_type_idx as torch.LongTensor. Use predict() for flexible inputs.")
         if seq_batch.dim() != 3:
             raise ValueError(f"seq_batch must have dim==3 (bs, seq_len, d_seq). Got shape {tuple(seq_batch.shape)}")
         if count_batch.dim() != 3:
@@ -473,10 +389,6 @@ class TranslationBaseModel(nn.Module):
             # ensure boolean dtype
             if src_mask.dtype != torch.bool:
                 src_mask = src_mask.bool()
-
-        # cell_type_idx validation
-        if cell_type_idx.dim() != 1 or cell_type_idx.shape[0] != bs:
-            raise ValueError("cell_type_idx must be a 1D long tensor of shape (bs,)")
         
         # compute embeddings (expects shapes (bs, seq_len, d_seq) & (bs, seq_len, d_count))
         src_embs = self.src_emb(seq_batch, count_batch)  # -> (bs, seq_len, d_model)
@@ -523,6 +435,8 @@ class TranslationBaseModel(nn.Module):
         seq_batch: Union[torch.Tensor, np.ndarray, list, tuple],
         count_batch: Union[torch.Tensor, np.ndarray, list, tuple] = None,
         cell_type: Any = None,
+        expr_vector: Any = None,
+        species: Any = None,
         src_mask: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         head_names: Optional[List[str]] = None,
         head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -543,8 +457,6 @@ class TranslationBaseModel(nn.Module):
         # 2). normalize inputs and preserve whether user passed a single sample
         seq_batch, count_batch, src_mask, was_squeezed = self._ensure_batch_dim_input(seq_batch, count_batch, src_mask)
         bs = seq_batch.shape[0]
-        # normalize cell_type to tensor of shape (bs,)
-        cell_type_idx = self._normalize_cell_type(cell_type, bs)
 
         # 3) move tensor inputs to model device 
         if move_inputs_to_device:
@@ -555,12 +467,16 @@ class TranslationBaseModel(nn.Module):
                 count_batch = count_batch.to(model_device)
             if isinstance(src_mask, torch.Tensor):
                 src_mask = src_mask.to(model_device)
-            if isinstance(cell_type_idx, torch.Tensor):
-                cell_type_idx = cell_type_idx.to(model_device)
 
         # 4) run forward under no_grad
         with torch.no_grad():
-            outputs = self.forward(seq_batch, count_batch, cell_type_idx, src_mask, head_names, head_inputs)
+            outputs = self.forward(
+                seq_batch=seq_batch, 
+                count_batch=count_batch,
+                src_mask=src_mask, 
+                head_names=head_names, 
+                head_inputs=head_inputs
+            )
 
         # 5) If forward produced batched outputs but input was single-sample,
         #    forward() should already support returning batched output consistently.

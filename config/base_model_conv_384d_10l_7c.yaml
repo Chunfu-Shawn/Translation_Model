@@ -1,9 +1,0 @@
-d_seq: 4
-d_count: 1
-d_model: 384
-number_of_layers: 10
-all_cell_types: ["brain_cerebrum", "liver", "testis", "kidney", "prostate", "HEK293T", "HeLa"]
-d_ff: 768
-p_drop: 0.1
-kernel_size: 7
-model_name: "base_model_conv_384d_10l_7c"

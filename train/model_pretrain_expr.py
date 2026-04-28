@@ -463,19 +463,14 @@ class PretrainingTrainer:
 
             # print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
         
-        norm_lengths = torch.zeros(B, dtype=torch.float32)
+        # 生成权重矩阵，默认 UTR 权重为 0.3
+        region_weights = torch.full((B, L), 0.3, dtype=torch.float32)
         for i in range(B):
             s = cds_starts[i]
             e = cds_stops[i]
-            
-            # 判断是否有合法的 CDS 标记
             if s != -1 and e != -1 and e > s:
-                # 统计在 CDS 区域内，真正被 Mask 且需要计算 Loss 的 token 数量
-                mask_in_cds = count_emb_masks[i, s:e].sum().float()
-                norm_lengths[i] = mask_in_cds
-            else:
-                # 如果没有 CDS 标记，默认取该条序列所有 Mask token 的三分之一
-                norm_lengths[i] = count_emb_masks[i].sum().float() / 2.0
+                e_clip = min(e, L)
+                region_weights[i, s:e_clip] = 0.7  # CDS 区域提权到 0.7
 
         return (
             species_list,
@@ -486,7 +481,7 @@ class PretrainingTrainer:
             count_embs_padded,
             count_embs_masked,
             count_emb_masks,
-            norm_lengths,
+            region_weights,  # <--- 新增返回区域权重
             pad_masks
         )
     
@@ -495,37 +490,43 @@ class PretrainingTrainer:
                 result: Dict[str, torch.Tensor],
                 count_raw_emb: torch.Tensor, 
                 count_emb_masks: torch.Tensor,
-                norm_lengths: torch.Tensor
+                region_weights: torch.Tensor # <--- 新增接收区域权重
             ) -> torch.Tensor:
             
-            pred = result["count"].float()  # (B, L, d_count) 
-            count_raw_emb = count_raw_emb.float()            
-            
-            # 1. 计算所有位置的基础 Loss
-            if pred.shape[2] == 1:
-                loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-            else:
-                loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-                
-            # ==========================================
-            # 样本级平均 (Instance-Level Averaging)
-            # ==========================================
-            # 2. 将 Loss 坍缩到 Batch 维度 (求每条序列的总 Loss)
-            if loss_all.dim() == 3:
-                loss_per_seq = loss_all.sum(dim=[1, 2]) # (B,)
-            else:
-                loss_per_seq = loss_all.sum(dim=1)      # (B,)
 
-            # 3. 防止除以 0 (如果某条序列在 CDS 里刚好没有任何 token 被 mask)
-            safe_lengths = torch.clamp(norm_lengths.to(loss_per_seq.device), min=1.0)
+        pred = result["count"].float()  # (B, L, d_count) 
+        count_raw_emb = count_raw_emb.float()
+        norm_lengths = count_emb_masks.sum(dim=1).float()          
+        
+        # 1. 计算所有位置的基础 Loss
+        if pred.shape[2] == 1:
+            loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
+            # 乘上区域权重 (CDS: 0.7, UTR: 0.3)
+            loss_all = loss_all * region_weights.to(loss_all.device)
+        else:
+            loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
+            # unsqueeze(-1) 保持维度对齐 (B, L, d_count)
+            loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
             
-            # 4. 计算单条序列的有效平均 Loss
-            per_sample_loss = loss_per_seq / safe_lengths
-            
-            # 5. 最后对整个 Batch 求均值
-            loss = per_sample_loss.mean()
+        # ==========================================
+        # 样本级平均 (Instance-Level Averaging)
+        # ==========================================
+        # 2. 将 Loss 坍缩到 Batch 维度 (求每条序列的总 Loss)
+        if loss_all.dim() == 3:
+            loss_per_seq = loss_all.sum(dim=[1, 2]) # (B,)
+        else:
+            loss_per_seq = loss_all.sum(dim=1)      # (B,)
 
-            return loss
+        # 3. 防止除以 0 (如果某条序列刚好没有任何 token 被 mask)
+        safe_lengths = torch.clamp(norm_lengths.to(loss_per_seq.device), min=1.0)
+        
+        # 4. 计算单条序列的有效平均 Loss (除以全长)
+        per_sample_loss = loss_per_seq / safe_lengths
+        
+        # 5. 最后对整个 Batch 求均值
+        loss = per_sample_loss.mean()
+
+        return loss
 
     
     # -------------------------
@@ -555,7 +556,7 @@ class PretrainingTrainer:
             # Unpack the batch
             species_list, _, _, expr_batch, \
             seq_embs_padded, \
-            count_embs_padded, count_embs_masked, count_emb_masks, norm_lengths, pad_masks = batch_data
+            count_embs_padded, count_embs_masked, count_emb_masks, region_weights, pad_masks = batch_data
 
             # Move tensors to CUDA
             expr_batch = expr_batch.cuda(non_blocking=True)
@@ -563,7 +564,7 @@ class PretrainingTrainer:
             count_embs_masked = count_embs_masked.cuda(non_blocking=True)
             count_embs_padded = count_embs_padded.cuda(non_blocking=True)
             count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-            norm_lengths = norm_lengths.cuda(non_blocking=True)
+            region_weights = region_weights.cuda(non_blocking=True)
             pad_masks = pad_masks.cuda(non_blocking=True)
 
             # ==========================================
@@ -586,7 +587,7 @@ class PretrainingTrainer:
                     head_names=["count"]
                 )
                 
-                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, norm_lengths)
+                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, region_weights)
                 acc_loss = loss / self.ac_steps
 
             do_sync = ((batch_idx + 1) % self.ac_steps == 0)
@@ -649,7 +650,7 @@ class PretrainingTrainer:
                 
                 species_list, _, _, expr_batch, \
                 seq_embs_padded, \
-                count_embs_padded, count_embs_masked, count_emb_masks, norm_lengths, pad_masks = batch_data
+                count_embs_padded, count_embs_masked, count_emb_masks, region_weights, pad_masks = batch_data
 
                 # Move tensors to CUDA
                 expr_batch = expr_batch.cuda(non_blocking=True)
@@ -657,7 +658,7 @@ class PretrainingTrainer:
                 count_embs_masked = count_embs_masked.cuda(non_blocking=True)
                 count_embs_padded = count_embs_padded.cuda(non_blocking=True)
                 count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-                norm_lengths = norm_lengths.cuda(non_blocking=True)
+                region_weights = region_weights.cuda(non_blocking=True)
                 pad_masks = pad_masks.cuda(non_blocking=True)
 
                 # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
@@ -671,7 +672,7 @@ class PretrainingTrainer:
                         head_names=["count"],
                         move_inputs_to_device=False # Already moved manually
                     )
-                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, norm_lengths)
+                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, region_weights)
 
                 total_loss += loss.detach()
                 local_loss.append([float(loss)])
