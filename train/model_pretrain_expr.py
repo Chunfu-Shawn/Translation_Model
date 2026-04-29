@@ -463,14 +463,14 @@ class PretrainingTrainer:
 
             # print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
         
-        # 生成权重矩阵，默认 UTR 权重为 0.3
-        region_weights = torch.full((B, L), 0.3, dtype=torch.float32)
+        # 生成权重矩阵，默认权重为 1
+        region_weights = torch.full((B, L), 1, dtype=torch.float32)
         for i in range(B):
             s = cds_starts[i]
             e = cds_stops[i]
             if s != -1 and e != -1 and e > s:
                 e_clip = min(e, L)
-                region_weights[i, s:e_clip] = 0.7  # CDS 区域提权到 0.7
+                region_weights[i, s:e_clip] = 1.2  # CDS 区域提权到 1.2
 
         return (
             species_list,

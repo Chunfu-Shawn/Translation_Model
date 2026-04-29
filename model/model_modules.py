@@ -339,8 +339,6 @@ class AddAdaZeroLayerNorm(nn.Module):
         
         # ==========================================
         # 限制 gamma 的幅度，防止特征坍塌
-        # torch.tanh 将输出限制在 (-1, 1)，乘以 0.2 后限制在 (-0.2, 0.2)
-        # 这样 1 + gamma 永远在 (0.8, 1.2) 之间，输入信号绝对不会被抹杀
         # ==========================================
         gamma = torch.tanh(gamma) * self.gamma_scale
         

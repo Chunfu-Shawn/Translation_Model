@@ -71,7 +71,7 @@ class TranslationEfficiencyAnalyzer:
                         
                     transcript_id = parts[0]
                     cell_type = parts[1]
-                    count_emb = sample[4]
+                    count_emb = sample[6]
                     
                     self._extract_and_run(results, uuid, transcript_id, cell_type, count_emb)
                 except Exception as e:

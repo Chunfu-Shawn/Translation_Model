@@ -179,7 +179,7 @@ if __name__ == "__main__":
     
     human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts.txt"
     macque_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/macaque_featureCounts.txt"
-    mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_counts.txt"
+    mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_featureCounts.txt"
     
     out_dir = "/home/user/data3/rbase/translation_model/models/lib"
 
@@ -224,14 +224,14 @@ if __name__ == "__main__":
         min_tpm_threshold=0
     )
 
-    # print("\n========== Phase 2: Aligning Mouse Data ==========")
-    # mouse_pt = os.path.join(out_dir, "mouse_expression_dict.pt")
-    # build_cross_species_expression_dict(
-    #     file_path=mouse_counts, 
-    #     output_pt_path=mouse_pt, 
-    #     id_mapping=id_mapping,
-    #     reference_anchor_ids=global_anchor_ids, # Forcible alignment
-    #     min_tpm_threshold=0
-    # )
+    print("\n========== Phase 2: Aligning Mouse Data ==========")
+    mouse_pt = os.path.join(out_dir, "mouse_expression_dict.pt")
+    build_cross_species_expression_dict(
+        file_path=mouse_counts, 
+        output_pt_path=mouse_pt, 
+        id_mapping=id_mapping,
+        reference_anchor_ids=global_anchor_ids, # Forcible alignment
+        min_tpm_threshold=0
+    )
 
-    # print("\n🎉 All cross-species alignment tasks are complete! You can now merge human_pt and mouse_pt to feed the model.")
+    print("\n🎉 All cross-species alignment tasks are complete! You can now merge human_pt and mouse_pt to feed the model.")
