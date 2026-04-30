@@ -15,17 +15,19 @@ def load_and_calculate_te_correlation(
         ref_df, 
         metric="mORF_Mean_Density", 
         corr_method="spearman",
+        eval_level="auto", 
+        target_cell_types=None, 
         out_dir="./",
         meta_pkl_path="/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl"
         ):
     """
     Load model prediction results and calculate correlation with the Protein-to-mRNA ratio reference table.
     Supports automatically mapping and aggregating model results from Transcript ID to Gene ID level using meta_pkl_path.
-    [NEW] Automatically computes the strict intersection of IDs across ALL models per Cell Type,
-    ensuring every model is evaluated on the exact same set of samples for fair benchmarking.
+    Automatically computes the strict intersection of IDs across ALL models per Cell Type.
+    [NEW] Supports filtering evaluation to a specific list of target_cell_types.
     """
     aggregated_data = []
-    print(f"--- Processing Data (Target Metric: {metric}, Method: {corr_method.capitalize()}) ---")
+    print(f"--- Processing Data (Target Metric: {metric}, Method: {corr_method.capitalize()}, Level: {eval_level}) ---")
 
     # ==========================================
     # 1. Identify the primary ID column in the reference table
@@ -34,20 +36,56 @@ def load_and_calculate_te_correlation(
     available_id_cols = [c for c in id_cols_master if c in ref_df.columns]
     val_cols = [c for c in ref_df.columns if c not in available_id_cols]
     
-    if any(c in available_id_cols for c in ['Tid', 'EnsemblTranscriptID']):
-        ref_merge_key = [c for c in ['Tid', 'EnsemblTranscriptID'] if c in available_id_cols][0]
-        target_level = 'Transcript'
-    elif any(c in available_id_cols for c in ['Gid', 'EnsemblGeneID']):
-        ref_merge_key = [c for c in ['Gid', 'EnsemblGeneID'] if c in available_id_cols][0]
-        target_level = 'Gene'
+    if eval_level.lower() == "gid":
+        if any(c in available_id_cols for c in ['Gid', 'EnsemblGeneID']):
+            ref_merge_key = [c for c in ['Gid', 'EnsemblGeneID'] if c in available_id_cols][0]
+            target_level = 'Gene'
+        else:
+            raise ValueError("eval_level set to 'Gid', but no Gene ID column found in reference table.")
+            
+    elif eval_level.lower() == "tid":
+        if any(c in available_id_cols for c in ['Tid', 'EnsemblTranscriptID']):
+            ref_merge_key = [c for c in ['Tid', 'EnsemblTranscriptID'] if c in available_id_cols][0]
+            target_level = 'Transcript'
+        else:
+            raise ValueError("eval_level set to 'Tid', but no Transcript ID column found in reference table.")
+            
     else:
-        raise ValueError("Reference table must contain 'Tid', 'Gid', 'EnsemblTranscriptID', or 'EnsemblGeneID'.")
+        if any(c in available_id_cols for c in ['Tid', 'EnsemblTranscriptID']):
+            ref_merge_key = [c for c in ['Tid', 'EnsemblTranscriptID'] if c in available_id_cols][0]
+            target_level = 'Transcript'
+        elif any(c in available_id_cols for c in ['Gid', 'EnsemblGeneID']):
+            ref_merge_key = [c for c in ['Gid', 'EnsemblGeneID'] if c in available_id_cols][0]
+            target_level = 'Gene'
+        else:
+            raise ValueError("Reference table must contain 'Tid', 'Gid', 'EnsemblTranscriptID', or 'EnsemblGeneID'.")
         
     print(f"  -> Detected target ID level in Reference: {ref_merge_key} ({target_level} Level)")
 
     ref_long = ref_df.melt(id_vars=available_id_cols, value_vars=val_cols, var_name='Cell_Type', value_name='PTR')
     ref_long = ref_long.dropna(subset=['PTR'])
     ref_long['ID_clean'] = ref_long[ref_merge_key].astype(str).str.split('.').str[0]
+
+    # =================================================================
+    # [NEW] 根据用户指定的细胞系进行极速过滤
+    # =================================================================
+    if target_cell_types is not None:
+        if isinstance(target_cell_types, str):
+            target_cell_types = [target_cell_types]
+            
+        before_ct_filter = len(ref_long)
+        ref_long = ref_long[ref_long['Cell_Type'].isin(target_cell_types)]
+        print(f"  -> [NEW] Filtered Reference by target cell types: {before_ct_filter} -> {len(ref_long)} records.")
+        
+        if ref_long.empty:
+            print("  [Warning] Reference table is empty after cell type filtering. Please check if your target_cell_types match the reference columns.")
+            return pd.DataFrame()
+
+    # 确保 Reference 表内没有重复 ID (针对 Gid 包含多 Tid 的情况求 PTR 均值)
+    before_agg = len(ref_long)
+    ref_long = ref_long.groupby(['ID_clean', 'Cell_Type'], as_index=False)['PTR'].mean()
+    if len(ref_long) < before_agg:
+        print(f"  -> Averaged PTR for multiple records mapping to the same {target_level} ID ({before_agg} -> {len(ref_long)}).")
 
     # ==========================================
     # 2. Preload mapping dictionary if the target is Gene Level
@@ -73,10 +111,10 @@ def load_and_calculate_te_correlation(
             raise RuntimeError(f"Failed to load or parse metadata pickle: {e}")
 
     # ==========================================
-    # [NEW] 3. Phase 1: Load all models and collect ID sets per Cell Type
+    # 3. Phase 1: Load all models and collect ID sets per Cell Type
     # ==========================================
-    processed_models = {}      # dict to store {model_name: (merged_df, current_metric)}
-    cell_type_id_sets = {}     # dict to store {cell_type: [set(ids_model_A), set(ids_model_B), ...]}
+    processed_models = {}      
+    cell_type_id_sets = {}     
     
     print("\n--- Phase 1: Data Loading & ID Extraction ---")
     for model_name, file_paths in data_config.items():
@@ -131,8 +169,9 @@ def load_and_calculate_te_correlation(
             else:
                 continue
 
-        # Aggregate and merge with Reference
         combined_df_agg = combined_df.groupby(['ID_clean', 'Cell_Type'], as_index=False)[current_metric].mean()
+        
+        # Merge with Reference (由于 Reference 已经被 target_cell_types 过滤，这里的 inner join 会自动扔掉模型中不要的细胞系数据)
         merged_df = pd.merge(combined_df_agg, ref_long, on=['ID_clean', 'Cell_Type'], how='inner')
         
         if merged_df.empty:
@@ -141,14 +180,13 @@ def load_and_calculate_te_correlation(
             
         processed_models[model_name] = (merged_df, current_metric)
         
-        # Record available IDs per cell type for this model
         for cell_type, group in merged_df.groupby('Cell_Type'):
             if cell_type not in cell_type_id_sets:
                 cell_type_id_sets[cell_type] = []
             cell_type_id_sets[cell_type].append(set(group['ID_clean']))
 
     # ==========================================
-    # [NEW] 4. Phase 2: Compute Strict Intersections
+    # 4. Phase 2: Compute Strict Intersections
     # ==========================================
     print("\n--- Phase 2: Intersecting Common IDs across Models ---")
     intersected_ids_per_cell = {}
@@ -158,13 +196,12 @@ def load_and_calculate_te_correlation(
         if len(sets_list) < expected_model_count:
             print(f"  [Warning] Cell '{cell_type}' is missing in some models. Strict intersection might be unfair, but proceeding with available models.")
         
-        # Take the intersection of all ID sets collected for this cell type
         common_ids = set.intersection(*sets_list)
         intersected_ids_per_cell[cell_type] = common_ids
         print(f"  -> Cell '{cell_type}': Found {len(common_ids)} strictly common IDs across models.")
 
     # ==========================================
-    # [NEW] 5. Phase 3: Filter, Calculate & Log
+    # 5. Phase 3: Filter, Calculate & Log
     # ==========================================
     print("\n--- Phase 3: Calculating Fair Correlations ---")
     for model_name, (merged_df, current_metric) in processed_models.items():
@@ -173,10 +210,7 @@ def load_and_calculate_te_correlation(
         for cell_type, group_df in merged_df.groupby('Cell_Type'):
             valid_ids = intersected_ids_per_cell.get(cell_type, set())
             
-            # Record N before filtering
             n_before = len(group_df)
-            
-            # Apply Strict Intersection Filter
             group_clean = group_df[group_df['ID_clean'].isin(valid_ids)].dropna(subset=[current_metric, 'PTR'])
             n_after = len(group_clean)
             
@@ -199,13 +233,13 @@ def load_and_calculate_te_correlation(
                 'Model': model_name,
                 'Mean': r_val, 
                 'P_value': p_val,
-                'N': n_after # Recording the fair, identical N
+                'N': n_after 
             })
 
     df = pd.DataFrame(aggregated_data)
     
     os.makedirs(out_dir, exist_ok=True)
-    file_suffix = f".{metric}.{corr_method}"
+    file_suffix = f".{metric}.{corr_method}.{eval_level}"
     save_path = os.path.join(out_dir, f"translation_efficiency_metrics{file_suffix}.csv")
     df.to_csv(save_path, index=False)
     print(f"\n✅ Correlation efficiency saved to: {save_path}")
@@ -213,8 +247,9 @@ def load_and_calculate_te_correlation(
     return df
 
 
-def plot_te_correlation_performance(agg_df, cell_types=None, metric_name="mORF Mean Density", 
-                                    corr_method="Spearman", out_dir="./", suffix="", no_color=False):
+def plot_te_correlation_performance(
+        agg_df, cell_types=None, metric_name="mORF Mean Density", 
+        corr_method="Spearman", out_dir="./", suffix="", no_color=False):
     """
     使用 plotnine 绘制 Bar + Errorbar(SEM) + Jitter Points，展示跨细胞类型的模型相关性表现。
     """

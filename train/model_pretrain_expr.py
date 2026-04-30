@@ -127,6 +127,7 @@ class PretrainingTrainer:
         
         # loss criterions
         self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0)  #nn.MSELoss(reduction="none")
+        self.te_criterion = nn.MSELoss(reduction="none")
 
         # build optimizer & scheduler & scaler
         self.optimizer = self._build_optimizer(lr=self.lr, betas=self.beta, eps=self.epsilon, weight_decay=self.weight_decay)
@@ -491,28 +492,30 @@ class PretrainingTrainer:
         )
     
     def count_task_criterion(
-                self,
-                result: Dict[str, torch.Tensor],
-                count_raw_emb: torch.Tensor, 
-                count_emb_masks: torch.Tensor,
-                # region_weights: torch.Tensor,
-                cds_masks: torch.Tensor, # <--- [NEW] Receive the CDS tracking masks
-                alpha: float = 1.0
-            ) -> torch.Tensor:
-            
+        self,
+        result: Dict[str, torch.Tensor],
+        count_raw_emb: torch.Tensor, 
+        count_emb_masks: torch.Tensor,
+        region_weights: torch.Tensor,
+        cds_masks: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Calculates the joint loss combining Token-level Micro Loss and Frame-aware Macro Loss.
+        Operating purely in linear scale (No Log/ReLU transformation).
+        """
         pred = result["count"].float()  # (B, L, d_count) 
         count_raw_emb = count_raw_emb.float()
         norm_lengths = count_emb_masks.sum(dim=1).float()          
         
         # ==========================================
-        # 1. Micro Loss (Token-level Shape)
+        # 1. Micro Loss (Token-level Shape Constraint)
         # ==========================================
         if pred.shape[2] == 1:
             loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-            # loss_all = loss_all * region_weights.to(loss_all.device)
+            loss_all = loss_all * region_weights.to(loss_all.device)
         else:
             loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-            # loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
+            loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
             
         if loss_all.dim() == 3:
             loss_per_seq = loss_all.sum(dim=[1, 2])
@@ -523,34 +526,63 @@ class PretrainingTrainer:
         per_sample_micro_loss = loss_per_seq / safe_lengths
         
         # ==========================================
-        # 2. Macro Loss (Sequence-level TE Constraint)
-        # Calculates mean ONLY over the CDS region (or full length if CDS is absent)
+        # 2. Macro Loss (Frame-aware TE Constraint via Linear-MSE)
         # ==========================================
-        # Intersect count_emb_masks with cds_masks to only calculate mean on MASKED tokens WITHIN the CDS.
-        # This prevents cheating by modifying unmasked tokens.
-        target_eval_mask = count_emb_masks.to(cds_masks.device) & cds_masks
+        B, L = cds_masks.shape
+        device = pred.device
         
+        # Dynamically parse the start of the CDS to construct accurate Frame Masks.
+        _, start_indices = cds_masks.max(dim=1)
+        
+        positions = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+        relative_positions = positions - start_indices.unsqueeze(1)
+        
+        # Isolate the 3 reading frames within the CDS boundaries
+        f0_mask = cds_masks & (relative_positions % 3 == 0)
+        f1_mask = cds_masks & (relative_positions % 3 == 1)
+        f2_mask = cds_masks & (relative_positions % 3 == 2)
+        
+        frame_masks = [f0_mask, f1_mask, f2_mask]
+        
+        # Unify shape handling for single or multi-channel RPF density
         if pred.shape[2] == 1:
-            pred_sum = (pred.squeeze(-1) * target_eval_mask.float()).sum(dim=1)
-            true_sum = (count_raw_emb.squeeze(-1) * target_eval_mask.float()).sum(dim=1)
+            p_val = pred.squeeze(-1)
+            t_val = count_raw_emb.squeeze(-1)
         else:
-            pred_sum = (pred * target_eval_mask.unsqueeze(-1).float()).sum(dim=[1, 2])
-            true_sum = (count_raw_emb * target_eval_mask.unsqueeze(-1).float()).sum(dim=[1, 2])
-        
-        # Calculate the number of valid tokens within the target region to serve as the denominator
-        target_lengths = target_eval_mask.sum(dim=1).float()
-        safe_target_lengths = torch.clamp(target_lengths.to(pred_sum.device), min=1.0)
+            p_val = pred.sum(dim=-1)
+            t_val = count_raw_emb.sum(dim=-1)
             
-        pred_mean = pred_sum / safe_target_lengths
-        true_mean = true_sum / safe_target_lengths
+        frame_mse_losses = []
         
-        per_sample_macro_loss = F.smooth_l1_loss(pred_mean, true_mean, reduction='none')
+        # Iterate through the 3 reading frames to compute independent Linear-MSE losses
+        for f_mask in frame_masks:
+            # Mask intersection
+            target_eval_mask = count_emb_masks.to(device) & f_mask
+            
+            p_sum = (p_val * target_eval_mask.float()).sum(dim=1)
+            t_sum = (t_val * target_eval_mask.float()).sum(dim=1)
+            
+            t_lengths = target_eval_mask.sum(dim=1).float()
+            safe_t_lengths = torch.clamp(t_lengths, min=1.0)
+            
+            p_mean = p_sum / safe_t_lengths
+            t_mean = t_sum / safe_t_lengths
+            
+            # Compute MSE
+            f_loss = self.te_criterion(p_mean, t_mean)
+            frame_mse_losses.append(f_loss)
+
+        # Average the MSE loss across all 3 frames
+        per_sample_macro_loss = (frame_mse_losses[0] + frame_mse_losses[1] + frame_mse_losses[2]) / 3.0
 
         # ==========================================
         # 3. Fusion
         # ==========================================
+        alpha = 2
+        # Combine Micro local-shape constraint and Macro global-scale constraint
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         
+        # Return the batch mean
         loss = total_sample_loss.mean()
 
         return loss

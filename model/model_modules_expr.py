@@ -1,8 +1,6 @@
 import copy
 import torch
 import torch.nn as nn
-from typing import Optional
-from model.rotary_position_embedding import LlamaRotaryEmbeddingExt
 from model.flash_multi_headed_attention import FlashMultiHeadedAttention
 
 __author__ = "Chunfu Xiao"

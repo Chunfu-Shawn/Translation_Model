@@ -179,12 +179,17 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
             'Tid': tid,
             'Cell_Type': cell_type,
             '5UTR_Length': utr5_len,
+            "Inverse_5UTR_Length": 1000/(utr5_len + 10),
             'CDS_Length': cds_len,
+            'Inverse_CDS_Length': 1000/(cds_len + 10),
             '3UTR_Length': utr3_len,
+            'Inverse_3UTR_Length': 1000/(utr3_len + 10),
             'CAI': codon_freq_sum / cds_len,
             'CDS_GC_Content': cds_gc,
+            "Inverse_CDS_GC_Content": 1 - cds_gc,
             'Kozak_Score': kozak_score,
-            'uAUG_Count': uaug_count
+            'uAUG_Count': uaug_count,
+            'Inverse_uAUG_Count': 10/(uaug_count + 1)
         })
 
     df_all = pd.DataFrame(results)
@@ -198,12 +203,17 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
     # ==========================================
     metrics_to_export = [
         ('5UTR_Length', 'baseline_5utr_length.csv'),
+        ('Inverse_5UTR_Length', 'baseline_inv_5utr_length.csv'),
         ('CDS_Length', 'baseline_cds_length.csv'),
+        ('Inverse_CDS_Length', 'baseline_inv_cds_length.csv'),
         ('3UTR_Length', 'baseline_3utr_length.csv'),
-        ('CAI', 'baseline_cai.csv'), # 相应更改文件名
+        ('Inverse_3UTR_Length', 'baseline_inv_3utr_length.csv'),
+        ('CAI', 'baseline_cai.csv'),
         ('CDS_GC_Content', 'baseline_cds_gc.csv'),
+        ('Inverse_CDS_GC_Content', 'baseline_inv_cds_gc.csv'),
         ('Kozak_Score', 'baseline_kozak_score.csv'),
-        ('uAUG_Count', 'baseline_uaug_count.csv')
+        ('uAUG_Count', 'baseline_uaug_count.csv'),
+        ('Inverse_uAUG_Count', 'baseline_inv_uaug_count.csv')
     ]
     
     print("\n>>> Exporting Baseline CSVs:")

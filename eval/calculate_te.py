@@ -34,7 +34,7 @@ def calculate_morf_mean_signal_ratio(density_array, m_start, m_end, eps=1e-6):
 
 def calculate_morf_mean_signal(density_array, m_start, m_end, eps=1e-6):
     """
-    计算翻译效率 (TE)
+    计算翻译效率 (TE) for frame 0
     """
     if m_start >= len(density_array): 
         return 0.0
@@ -43,7 +43,7 @@ def calculate_morf_mean_signal(density_array, m_start, m_end, eps=1e-6):
     if m_start >= valid_end: 
         return 0.0
 
-    morf_mean = np.mean(density_array[m_start:valid_end]) + eps
+    morf_mean = np.mean(density_array[m_start:valid_end:3]) + eps
 
     return morf_mean
 
