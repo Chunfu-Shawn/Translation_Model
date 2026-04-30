@@ -116,7 +116,7 @@ class AddAdaZeroLayerNorm(nn.Module):
         # torch.tanh restricts output to (-1, 1), multiplied by gamma_scale (e.g., 0.2)
         # ensures (1 + gamma) stays safely within (0.8, 1.2).
         # ==========================================
-        # gamma = torch.tanh(gamma) * self.gamma_scale
+        gamma = torch.tanh(gamma) * self.gamma_scale
         
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)

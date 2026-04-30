@@ -83,6 +83,7 @@ def load_and_aggregate_multicell(data_config, depth_threshold=None, metric="Pear
 
     return pd.DataFrame(aggregated_data)
 
+
 def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Correlation", out_dir = "./"):
     """
     使用 plotnine 绘制 Bar + Errorbar(SEM) + Jitter Points，展示跨细胞类型的模型表现。
@@ -103,7 +104,6 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
         "Cross-batch", "Cross-experiment"
     ]
     
-    
     if cell_types:
         # 如果传入了 cell_types 过滤列表，需要同步将里面的 SW480 替换掉
         cell_types = ['SW480 (Unseen)' if ct == 'SW480' else ct for ct in cell_types]
@@ -111,7 +111,22 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
 
     # 强制转化为有序分类变量
     agg_df['Model'] = pd.Categorical(agg_df['Model'], categories=model_order, ordered=True)
+    
+    # 核心修改 1：让 Unseen 细胞系排在 Categories 的最后一个
+    # 这样在后续基于这个 Categorical 排序时，它就会被放到 DataFrame 的末尾
+    if cell_types is None:
+        cell_types = list(agg_df['Cell_type'].unique())
+        
+    if "SW480 (Unseen)" in cell_types:
+        cell_types.remove("SW480 (Unseen)")
+        cell_types.append("SW480 (Unseen)") # 追加到末尾
+        
     agg_df['Cell_type'] = pd.Categorical(agg_df['Cell_type'], categories=cell_types, ordered=True)
+
+    # 核心修改 2：根据 Categorical 的顺序对 DataFrame 进行排序
+    # 因为 Unseen 在 categories 的最后，所以它的数据会被移动到 DataFrame 的尾部
+    # 这样 geom_jitter 画图时最后画它，就不会被遮挡了
+    agg_df = agg_df.sort_values(by=['Model', 'Cell_type'])
 
     # --- 3. 计算总体均值和 SEM ---
     summary_df = agg_df.groupby('Model', observed=False).agg(
@@ -140,7 +155,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
     unique_cells = agg_df['Cell_type'].unique()
     point_colors = {ct: "#202020" for ct in unique_cells} # 默认其他细胞系为深灰
     if "SW480 (Unseen)" in point_colors:
-        point_colors["SW480 (Unseen)"] = "#E74C3C" # 用显眼的亮红色高亮 Unseen c73813 E74C3C
+        point_colors["SW480 (Unseen)"] = "#E74C3C" # 用显眼的亮红色高亮 Unseen
 
     # --- 5. 绘图 ---
     plot = (
@@ -153,7 +168,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
         # ==========================================
         + geom_jitter(data=agg_df, mapping=aes(y='Mean', shape='Cell_type', color='Cell_type'), 
                       width=0.2, size=3.5, alpha=0.8)
-        + scale_color_manual(values=point_colors) # [NEW] 传入散点颜色配置
+        + scale_color_manual(values=point_colors) 
         + scale_fill_manual(values=color_mapping) 
         # + coord_cartesian(ylim=[0, 0.7])
         + theme_bw()
@@ -168,7 +183,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
             y=f"Translation profile position-wise correlation",
             fill="Model",
             shape="Cell Type", 
-            color="Cell Type" # [NEW] 必须保证 shape 和 color 的标题完全一致，plotnine 才会把它们合并成一个图例
+            color="Cell Type" 
         )
     )
     
@@ -177,12 +192,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
     
     plot.save(save_path, width=6, height=5, dpi=300)
     print(f"Plot saved to: {save_path}")
-    # print(plot)
-import os
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+
 
 def prepare_length_robustness_data(
         dataset, 
@@ -198,7 +208,7 @@ def prepare_length_robustness_data(
     length_records = []
     
     for i in tqdm(range(len(dataset))):
-        uuid, _, _, _, meta_info, seq_emb, _, _ = dataset[i]
+        uuid, _, _, _, meta_info, seq_emb, _ = dataset[i]
         uuid_str = str(uuid)
         parts = uuid_str.split('-')
         if len(parts) < 2: continue

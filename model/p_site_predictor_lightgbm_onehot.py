@@ -63,8 +63,8 @@ class PSitePredictor():
         self.n_thread = cpu_count() if n_thread == -1 else min(n_thread, cpu_count())
 
         # Initialize state attributes
-        self.offset_map = None
-        self.offset_fix = None
+        self.offset_map = {}
+        self.offset_fix = {}
         self.offset_limits = None
         self._feature_names_ = None
         self.predictor = None
@@ -168,7 +168,7 @@ class PSitePredictor():
             raise ValueError("Either offset_limits or offset_map should be provided !")
         
         if hasattr(self.predictor, 'feature_name_'):
-            self._feature_names_ = self.predictor.feature_name_()
+            self._feature_names_ = self.predictor.feature_name_
         else:
             print("Warning: Could not automatically determine feature names from model.")
         
@@ -224,8 +224,10 @@ class PSitePredictor():
             max_len: int = 40,
             prefix: str = "read"):
         
-        if not count_dict:
-            raise ModuleNotFoundError("Read count data not loaded ! Please first run function: load_read_count_data()")
+        if count_dict is None:
+            raise ValueError("count_dict is None.")
+        if len(count_dict) == 0:
+            raise ValueError("P-site dictionary is empty. Prediction may have produced no valid P-site counts.")
         
         print("- Evaluating 3-nt periodicity around TIS and TTS...")
         
@@ -481,12 +483,6 @@ class PSitePredictor():
 
         # construct feature matrix
         n_sample = len(flanking_list)
-
-        # --- ADDED: Protection for empty datasets to avoid reshape ValueError ---
-        if n_sample <= 100:
-            print("Warning: No valid reads left after filtering. Returning empty datasets.")
-            return None, None
-        # ----------------------------------------------------------------------
 
         X_seq = np.array(flanking_list, dtype=np.int8).reshape(n_sample, -1) # (n_reads, seq_feat)
 
@@ -833,16 +829,16 @@ class PSitePredictor():
                             offset = int(offsets[i_local])
                             seq_len = self._base_seq_emb[tid].shape[0]
                             p_pos = pos + offset
-                            if p_pos <= seq_len and read_l not in self.offset_fix:
+
+                            if 1 <= p_pos <= seq_len and read_l not in self.offset_fix:
                                 try:
                                     cnt = self.count_dict[tid][pos][read_l]
-                                except Exception:
+                                except KeyError:
                                     try:
                                         cnt = self.count_dict[tid][read_l][pos]
-                                    except Exception:
+                                    except KeyError:
                                         cnt = 1
-                                    p_site_dict[tid][p_pos][read_l] += cnt
-
+                                p_site_dict[tid][p_pos][read_l] += cnt
                         start_idx = end_idx
 
             # wait producer thread end
@@ -855,7 +851,9 @@ class PSitePredictor():
         else:
             print("\n--- ML prediction skipped. Outputting results based on fix_offset. ---")
         # -----------------------------------------------------------------------------
-
+            
+        print("n tids in p_site_dict:", len(p_site_dict))
+        print("n non-empty tids:", sum(1 for tid in p_site_dict if len(p_site_dict[tid]) > 0))  
         print("\n--- Save P-site counts ---")
         out_path = os.path.join(output_dir, "p_site_count.pkl")
         self._save_pickle_file(p_site_dict, out_path)
