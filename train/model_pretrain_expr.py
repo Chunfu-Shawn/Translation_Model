@@ -496,7 +496,6 @@ class PretrainingTrainer:
         result: Dict[str, torch.Tensor],
         count_raw_emb: torch.Tensor, 
         count_emb_masks: torch.Tensor,
-        region_weights: torch.Tensor,
         cds_masks: torch.Tensor
     ) -> torch.Tensor:
         """
@@ -512,10 +511,10 @@ class PretrainingTrainer:
         # ==========================================
         if pred.shape[2] == 1:
             loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-            loss_all = loss_all * region_weights.to(loss_all.device)
+            # loss_all = loss_all * region_weights.to(loss_all.device)
         else:
             loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-            loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
+            # loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
             
         if loss_all.dim() == 3:
             loss_per_seq = loss_all.sum(dim=[1, 2])
