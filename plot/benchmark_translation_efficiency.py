@@ -9,21 +9,20 @@ from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 from tqdm import tqdm
 from scipy.stats import spearmanr, pearsonr
 
+
 def load_and_calculate_te_correlation(
         data_config, 
         ref_df, 
         metric="mORF_Mean_Density", 
         corr_method="spearman",
-        target_ids=None, # [NEW] Added parameter to pass an array/list of target Transcript IDs
         out_dir="./",
         meta_pkl_path="/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl"
         ):
     """
     Load model prediction results and calculate correlation with the Protein-to-mRNA ratio reference table.
     Supports automatically mapping and aggregating model results from Transcript ID to Gene ID level using meta_pkl_path.
-    Filters out 1% and 99% outliers for both the metric and PTR before calculating correlation.
-    If a model in data_config lacks the specified metric but contains a 'TE' column, it falls back to 'TE'.
-    [NEW] Filters the evaluation to only include the specified `target_ids` for fair cross-model comparison.
+    [NEW] Automatically computes the strict intersection of IDs across ALL models per Cell Type,
+    ensuring every model is evaluated on the exact same set of samples for fair benchmarking.
     """
     aggregated_data = []
     print(f"--- Processing Data (Target Metric: {metric}, Method: {corr_method.capitalize()}) ---")
@@ -35,7 +34,6 @@ def load_and_calculate_te_correlation(
     available_id_cols = [c for c in id_cols_master if c in ref_df.columns]
     val_cols = [c for c in ref_df.columns if c not in available_id_cols]
     
-    # Determine the target merge level
     if any(c in available_id_cols for c in ['Tid', 'EnsemblTranscriptID']):
         ref_merge_key = [c for c in ['Tid', 'EnsemblTranscriptID'] if c in available_id_cols][0]
         target_level = 'Transcript'
@@ -47,11 +45,8 @@ def load_and_calculate_te_correlation(
         
     print(f"  -> Detected target ID level in Reference: {ref_merge_key} ({target_level} Level)")
 
-    # Convert wide table to long format (Melt)
     ref_long = ref_df.melt(id_vars=available_id_cols, value_vars=val_cols, var_name='Cell_Type', value_name='PTR')
     ref_long = ref_long.dropna(subset=['PTR'])
-    
-    # Strip version numbers for consistency
     ref_long['ID_clean'] = ref_long[ref_merge_key].astype(str).str.split('.').str[0]
 
     # ==========================================
@@ -78,34 +73,16 @@ def load_and_calculate_te_correlation(
             raise RuntimeError(f"Failed to load or parse metadata pickle: {e}")
 
     # ==========================================
-    # [NEW] 3. Filter reference table using target_ids
+    # [NEW] 3. Phase 1: Load all models and collect ID sets per Cell Type
     # ==========================================
-    if target_ids is not None:
-        # Clean the input target transcript IDs
-        clean_target_tids = {str(tid).split('.')[0] for tid in target_ids}
-        
-        if target_level == 'Gene':
-            # Map target TIDs to GIDs if the evaluation is at the Gene level
-            final_target_ids = {tid2gene[tid] for tid in clean_target_tids if tid in tid2gene}
-            print(f"  -> [NEW] Mapped {len(clean_target_tids)} target TIDs to {len(final_target_ids)} GIDs for filtering.")
-        else:
-            final_target_ids = clean_target_tids
-            print(f"  -> [NEW] Using {len(final_target_ids)} target TIDs for filtering.")
-            
-        # Filter the reference table before merging with models
-        before_filter = len(ref_long)
-        ref_long = ref_long[ref_long['ID_clean'].isin(final_target_ids)]
-        print(f"  -> [NEW] Filtered Reference targets: {before_filter} -> {len(ref_long)} records.")
-
-    # ==========================================
-    # 4. Iterate through model data, map, aggregate, and merge
-    # ==========================================
+    processed_models = {}      # dict to store {model_name: (merged_df, current_metric)}
+    cell_type_id_sets = {}     # dict to store {cell_type: [set(ids_model_A), set(ids_model_B), ...]}
+    
+    print("\n--- Phase 1: Data Loading & ID Extraction ---")
     for model_name, file_paths in data_config.items():
-        print(f"\nProcessing model: {model_name}")
         if isinstance(file_paths, str):
             file_paths = [file_paths]
             
-        # Read all data chunks for the model
         model_dfs = []
         for file_path in file_paths:
             if not os.path.exists(file_path):
@@ -123,85 +100,90 @@ def load_and_calculate_te_correlation(
             
         combined_df = pd.concat(model_dfs, ignore_index=True)
         
-        # Determine available ID columns in the model data
         has_tid = [c for c in ['Tid', 'EnsemblTranscriptID', 'TranscriptID'] if c in combined_df.columns]
         has_gid = [c for c in ['Gid', 'EnsemblGeneID', 'GeneID'] if c in combined_df.columns]
         
         if 'Cell_Type' not in combined_df.columns:
-            print(f"  [Warning] Missing 'Cell_Type' column in {model_name}. Skipping...")
+            print(f"  [Warning] Missing 'Cell_Type' in {model_name}. Skipping...")
             continue
 
-        # --------- Dynamic metric fallback logic ---------
         current_metric = metric
         if current_metric not in combined_df.columns:
             if 'TE' in combined_df.columns:
-                print(f"  [Info] Metric '{metric}' not found in {model_name}. Defaulting to 'TE'.")
                 current_metric = 'TE'
             else:
-                print(f"  [Warning] Missing metric '{metric}' AND no 'TE' column found in {model_name}. Skipping...")
+                print(f"  [Warning] Missing metric in {model_name}. Skipping...")
                 continue
 
-        # --------- ID mapping logic ---------
         if target_level == 'Gene':
             if has_gid:
-                # Model directly outputs Gene ID
                 combined_df['ID_clean'] = combined_df[has_gid[0]].astype(str).str.split('.').str[0]
             elif has_tid:
-                # Need to convert model's Transcript ID to Gene ID using tid2gene mapping
                 tid_col = has_tid[0]
                 combined_df['clean_tid_temp'] = combined_df[tid_col].astype(str).str.split('.').str[0]
                 combined_df['ID_clean'] = combined_df['clean_tid_temp'].map(tid2gene)
-                
-                unmapped = combined_df['ID_clean'].isna().sum()
-                if unmapped > 0:
-                    print(f"  [Info] Dropped {unmapped} records lacking Gene mapping.")
                 combined_df = combined_df.dropna(subset=['ID_clean'])
             else:
-                print(f"  [Warning] No suitable ID column found to map to Gene level. Skipping...")
                 continue
         else:
-            # Target is Transcript Level
             if has_tid:
                 combined_df['ID_clean'] = combined_df[has_tid[0]].astype(str).str.split('.').str[0]
             else:
-                print(f"  [Warning] Target is Transcript level, but model lacks Tid. Skipping...")
                 continue
 
-        # --------- Aggregate and calculate mean ---------
-        # If multiple identical ID_cleans exist under the same Cell_Type 
-        # (multiple transcripts belonging to the same gene), automatically take the mean
+        # Aggregate and merge with Reference
         combined_df_agg = combined_df.groupby(['ID_clean', 'Cell_Type'], as_index=False)[current_metric].mean()
-        
-        # --------- Merge with the reference table ---------
-        # [NOTE] Since ref_long is already filtered by target_ids, the inner join naturally applies the filter to the model
         merged_df = pd.merge(combined_df_agg, ref_long, on=['ID_clean', 'Cell_Type'], how='inner')
         
         if merged_df.empty:
-            print(f"  [Warning] No matching IDs found between {model_name} and reference table.")
+            print(f"  [Warning] {model_name} yielded 0 matches with Reference.")
             continue
             
-        print(f"  [Info] Matched {len(merged_df)} pairs for analysis using metric '{current_metric}'.")
+        processed_models[model_name] = (merged_df, current_metric)
+        
+        # Record available IDs per cell type for this model
+        for cell_type, group in merged_df.groupby('Cell_Type'):
+            if cell_type not in cell_type_id_sets:
+                cell_type_id_sets[cell_type] = []
+            cell_type_id_sets[cell_type].append(set(group['ID_clean']))
 
-        # --------- Calculate group correlations ---------
+    # ==========================================
+    # [NEW] 4. Phase 2: Compute Strict Intersections
+    # ==========================================
+    print("\n--- Phase 2: Intersecting Common IDs across Models ---")
+    intersected_ids_per_cell = {}
+    expected_model_count = len(processed_models)
+    
+    for cell_type, sets_list in cell_type_id_sets.items():
+        if len(sets_list) < expected_model_count:
+            print(f"  [Warning] Cell '{cell_type}' is missing in some models. Strict intersection might be unfair, but proceeding with available models.")
+        
+        # Take the intersection of all ID sets collected for this cell type
+        common_ids = set.intersection(*sets_list)
+        intersected_ids_per_cell[cell_type] = common_ids
+        print(f"  -> Cell '{cell_type}': Found {len(common_ids)} strictly common IDs across models.")
+
+    # ==========================================
+    # [NEW] 5. Phase 3: Filter, Calculate & Log
+    # ==========================================
+    print("\n--- Phase 3: Calculating Fair Correlations ---")
+    for model_name, (merged_df, current_metric) in processed_models.items():
+        print(f"\nEvaluating: {model_name}")
+        
         for cell_type, group_df in merged_df.groupby('Cell_Type'):
-            group_clean = group_df.dropna(subset=[current_metric, 'PTR'])
+            valid_ids = intersected_ids_per_cell.get(cell_type, set())
             
-            # Calculate and filter 1% and 99% outliers
-            if len(group_clean) > 0:
-                p01_m = group_clean[current_metric].quantile(0.01)
-                p99_m = group_clean[current_metric].quantile(0.99)
-                p01_p = group_clean['PTR'].quantile(0.01)
-                p99_p = group_clean['PTR'].quantile(0.99)
-                
-                # Keep only data within the 1% ~ 99% range
-                valid_mask = (
-                    (group_clean[current_metric] >= p01_m) & (group_clean[current_metric] <= p99_m) &
-                    (group_clean['PTR'] >= p01_p) & (group_clean['PTR'] <= p99_p)
-                )
-                group_clean = group_clean[valid_mask]
+            # Record N before filtering
+            n_before = len(group_df)
             
-            # Need at least 5 genes to calculate correlation reliably
-            if len(group_clean) < 5:
+            # Apply Strict Intersection Filter
+            group_clean = group_df[group_df['ID_clean'].isin(valid_ids)].dropna(subset=[current_metric, 'PTR'])
+            n_after = len(group_clean)
+            
+            print(f"  -> {cell_type:<15} | N Filtered: {n_before:>5} -> {n_after:>5}")
+            
+            if n_after < 5:
+                print(f"     [Skipped] Insufficient samples ({n_after} < 5) after filtering.")
                 continue
                 
             x = group_clean[current_metric].values
@@ -215,19 +197,18 @@ def load_and_calculate_te_correlation(
             aggregated_data.append({
                 'Cell_type': cell_type,
                 'Model': model_name,
-                'Mean': r_val,  # Using 'Mean' key for correlation to adapt to plotting functions
+                'Mean': r_val, 
                 'P_value': p_val,
-                'N': len(group_clean)
+                'N': n_after # Recording the fair, identical N
             })
 
     df = pd.DataFrame(aggregated_data)
     
     os.makedirs(out_dir, exist_ok=True)
-    # File name uses the globally passed target metric to maintain batch naming consistency
     file_suffix = f".{metric}.{corr_method}"
     save_path = os.path.join(out_dir, f"translation_efficiency_metrics{file_suffix}.csv")
     df.to_csv(save_path, index=False)
-    print(f"Correlation efficiency saved to: {save_path}")
+    print(f"\n✅ Correlation efficiency saved to: {save_path}")
 
     return df
 
@@ -255,7 +236,8 @@ def plot_te_correlation_performance(agg_df, cell_types=None, metric_name="mORF M
     model_order = [
         "TRACE", "Encoder", "Convolution", 
         "Optimus-5Prime", "RiboDecode", "RiboNN",
-        "Raw-dataset", "Inverse CDS length", "Inverse 5'UTR length", "Inverse 3'UTR length",
+        "Raw-dataset", "Transcript-Mean", 
+        "Inverse CDS length", "Inverse 5'UTR length", "Inverse 3'UTR length",
         "Inverse CDS GC%", "CAI", "Kozak score", "Inverse uAUG count"
     ]
     
@@ -288,9 +270,9 @@ def plot_te_correlation_performance(agg_df, cell_types=None, metric_name="mORF M
         "RiboNN": "#DDDDDD",
         
         # Baseline 特征 (大地色系/暖金渐变)
-        "Inverse CDS length": "#AF804F",   # 阶梯 1 (最深)
-        "Inverse 5'UTR length": "#B98C57", # 阶梯 2
-        "Inverse 3'UTR length": "#C3975F", # 阶梯 3
+        "Transcript-Mean": "#AF804F",  # 阶梯 1 (最深)
+        "Inverse 5'UTR length": "#B98C57",  # 阶梯 2
+        "Inverse CDS length": "#C3975F",   # 阶梯 3
         "Inverse CDS GC%": "#CDA367",      # 阶梯 4
         "CAI": "#D7AF6F",                  # 阶梯 5
         "Kozak score": "#E1BA77",          # 阶梯 6

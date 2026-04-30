@@ -34,21 +34,30 @@ def replicate_module(module, copies):
 
 class LinearEmbedding(nn.Module):
     '''
-    project sequence and RPF density seperately
+    Project sequence and RPF density safely with non-linearity and normalization.
     '''
-    def __init__(self, d_seq, d_count, output_model):
+    def __init__(self, d_seq, d_count, output_model, p_drop=0.1):
         super().__init__()
         self.seq_emb_layer = nn.Linear(d_seq, output_model)
         self.count_emb_layer = nn.Linear(d_count, output_model)
-        self.unify_emb_layer = nn.Linear(output_model*2, output_model)
+        
+        # 引入 LayerNorm 防止密集信号淹没稀疏信号
+        self.seq_ln = nn.LayerNorm(output_model)
+        self.count_ln = nn.LayerNorm(output_model)
+        
+        self.unify_emb_layer = nn.Sequential(
+            nn.Linear(output_model * 2, output_model),
+            nn.GELU(), # 打破线性塌陷
+            nn.Dropout(p_drop)
+        )
 
     def forward(self, seq_tokens, count_tokens):
-        # input (bs, seq_len, input_model) to output (bs, seq_len, output_model)
-        seq_embeddings = self.seq_emb_layer(seq_tokens)
-        count_embeddings = self.count_emb_layer(count_tokens)
-        embeddings = self.unify_emb_layer(torch.cat([seq_embeddings, count_embeddings], axis=-1))
-
-        return embeddings
+        seq_embeddings = self.seq_ln(self.seq_emb_layer(seq_tokens))
+        count_embeddings = self.count_ln(self.count_emb_layer(count_tokens))
+        
+        # 使用 dim=-1 是 PyTorch 更标准的写法 (代替 axis=-1)
+        concat_emb = torch.cat([seq_embeddings, count_embeddings], dim=-1)
+        return self.unify_emb_layer(concat_emb)
 
 
 class PositionwiseFeedForward(nn.Module):
@@ -109,7 +118,7 @@ class AddAdaZeroLayerNorm(nn.Module):
         # torch.tanh restricts output to (-1, 1), multiplied by gamma_scale (e.g., 0.2)
         # ensures (1 + gamma) stays safely within (0.8, 1.2).
         # ==========================================
-        gamma = torch.tanh(gamma) * self.gamma_scale
+        # gamma = torch.tanh(gamma) * self.gamma_scale
         
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)

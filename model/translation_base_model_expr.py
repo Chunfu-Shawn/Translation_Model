@@ -581,10 +581,10 @@ class TranslationBaseModel(nn.Module):
 
         # 1. Resolve Dynamic Cellular Environment (Transcriptome)
         final_expr_vector = self._resolve_expr_vector(cell_type, expr_vector, bs)
-        final_expr_vector = final_expr_vector.to(self.device)
+        final_expr_vector = final_expr_vector.to(seq_batch.device)
 
         # 2. Resolve Static Evolutionary Baseline (Species)
-        species_idx_batch = self._normalize_species(species, bs).to(self.device)
+        species_idx_batch = self._normalize_species(species, bs).to(seq_batch.device)
         species_embs = self.species_embedding(species_idx_batch) # -> (bs, d_species)
 
         # 3. Concatenate Transcriptome + Species before the bottleneck projection

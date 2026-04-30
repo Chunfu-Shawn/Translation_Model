@@ -67,7 +67,6 @@ class BatchMaskingAdapter:
                                         valid_indices: torch.Tensor,
                                         target_count: int,
                                         generator: torch.Generator):
-        # ... (保持不变) ...
         current_masked_count = torch.sum(emb_mask[batch_idx]).item()
         needed = target_count - current_masked_count
 
@@ -91,7 +90,6 @@ class BatchMaskingAdapter:
 
     def mask_random_single_base_batch(self,
                                       embeddings: torch.Tensor,
-                                      ### MODIFICATION: Support Tensor input for per-sample ratios ###
                                       mask_perc: Union[float, torch.Tensor] = 0.15,
                                       pad_mask: Optional[torch.Tensor] = None,
                                       generator: Optional[torch.Generator] = None):
@@ -123,7 +121,6 @@ class BatchMaskingAdapter:
     def mask_random_trinucleotide_batch(self,
                                         embeddings: torch.Tensor,
                                         cds_starts: List[int],
-                                        ### MODIFICATION: Support Tensor input ###
                                         mask_perc: Union[float, torch.Tensor] = 0.15,
                                         pad_mask: Optional[torch.Tensor] = None,
                                         generator: Optional[torch.Generator] = None):
@@ -176,7 +173,6 @@ class BatchMaskingAdapter:
     def mask_random_motif_batch(self,
                                 occs_list: List[List[tuple]],
                                 embeddings: torch.Tensor,
-                                ### MODIFICATION: Support Tensor input ###
                                 mask_perc: Union[float, torch.Tensor] = 0.15,
                                 pad_mask: Optional[torch.Tensor] = None, 
                                 generator: Optional[torch.Generator] = None):

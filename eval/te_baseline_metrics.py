@@ -1,8 +1,10 @@
 import os
 import pickle
+import torch
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from eval.calculate_te import calculate_morf_mean_signal
 
 # ==========================================
 # 1. 基础权重字典配置
@@ -130,13 +132,12 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
     
     print(f"Extracting 7 baseline features from Dataset (N={len(dataset)})...")
     for i in tqdm(range(len(dataset))):
-        uuid, cell_type_idx, meta_info, seq_emb, count_emb = dataset[i]
+        uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb = dataset[i]
         uuid_str = str(uuid)
         parts = uuid_str.split('-')
         
         if len(parts) < 2: continue
         tid = parts[0]
-        cell_type = parts[1]
         
         lookup_tid = tid
         if lookup_tid not in seqs_dict:
@@ -214,3 +215,104 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
         save_path = os.path.join(out_dir, file_name)
         df_sub.to_csv(save_path, index=False)
         print(f"  - {file_name}")
+
+
+def generate_mean_te_baselines(dataset, out_dir="./results/baselines", unlog_data=True):
+    """
+    遍历 Dataset，计算真实的 TE，并生成两种统计学基线：
+    1. Transcript-Mean: 计算一个转录本在所有细胞类型中的平均翻译强度，并复制到该转录本的每个细胞记录中。
+    2. Cell-Mean: 计算一个细胞类型内所有转录本的平均翻译强度，并复制到该细胞的每个转录本记录中。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    results = []
+    
+    print(f"Extracting true TE from Dataset (N={len(dataset)})...")
+    for i in tqdm(range(len(dataset))):
+        # 兼容你的 dataset 返回结构
+        uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb = dataset[i]
+        uuid_str = str(uuid)
+        parts = uuid_str.split('-')
+        
+        if len(parts) < 2: continue
+        tid = parts[0]
+                
+        cds_s = int(meta_info.get("cds_start_pos", -1))
+        cds_e = int(meta_info.get("cds_end_pos", -1))
+        if cds_s == -1 or cds_e == -1: 
+            continue
+            
+        m_start = max(0, cds_s - 1)
+        m_end = cds_e
+        
+        # 处理 count_emb (真实 Ribo-seq 密度)
+        if isinstance(count_emb, torch.Tensor):
+            truth = count_emb.detach().cpu().numpy()
+        else:
+            truth = count_emb
+            
+        if len(truth.shape) > 1 and truth.shape[1] > 1:
+            truth = np.sum(truth, axis=1)
+        elif len(truth.shape) > 1 and truth.shape[1] == 1:
+            truth = truth.flatten()
+            
+        truth = truth.astype(np.float32)
+
+        # 还原 log 转换的数据 (如果 dataset 里存储的是 log(x+1))
+        if unlog_data:
+            truth = np.expm1(truth)
+            
+        # 计算该样本真实的 TE
+        actual_te = calculate_morf_mean_signal(truth, m_start, m_end)
+        
+        results.append({
+            'Tid': tid,
+            'Cell_Type': cell_type,
+            'Actual_TE': actual_te
+        })
+
+    df_all = pd.DataFrame(results)
+    
+    if df_all.empty:
+        print("No valid Ground Truth TE data extracted.")
+        return
+        
+    print("\nCalculating statistical means...")
+    
+    # ---------------------------------------------------------
+    # 基线 1: Transcript-Mean (同一个转录本跨细胞类型的平均)
+    # ---------------------------------------------------------
+    transcript_mean_df = df_all.groupby('Tid')['Actual_TE'].mean().reset_index()
+    transcript_mean_df.rename(columns={'Actual_TE': 'Transcript_Mean_TE'}, inplace=True)
+    
+    # ---------------------------------------------------------
+    # 基线 2: Cell-Mean (同一个细胞内跨转录本的平均)
+    # ---------------------------------------------------------
+    cell_mean_df = df_all.groupby('Cell_Type')['Actual_TE'].mean().reset_index()
+    cell_mean_df.rename(columns={'Actual_TE': 'Cell_Mean_TE'}, inplace=True)
+
+    # ---------------------------------------------------------
+    # 数据合并：将计算好的全局均值贴回每一个具体的 (Tid, Cell_Type) 样本上
+    # ---------------------------------------------------------
+    df_merged = df_all.merge(transcript_mean_df, on='Tid', how='left')
+    df_merged = df_merged.merge(cell_mean_df, on='Cell_Type', how='left')
+
+    # ==========================================
+    # 3. 批量导出 CSV (统一格式: Tid, Cell_Type, TE)
+    # ==========================================
+    print("\n>>> Exporting Baseline CSVs:")
+    
+    # 导出 Transcript-Mean
+    df_transcript_out = df_merged[['Tid', 'Cell_Type', 'Transcript_Mean_TE']].copy()
+    df_transcript_out.rename(columns={'Transcript_Mean_TE': 'TE'}, inplace=True)
+    t_path = os.path.join(out_dir, 'baseline_transcript_mean.csv')
+    df_transcript_out.to_csv(t_path, index=False)
+    print(f"  - baseline_transcript_mean.csv saved.")
+    
+    # 导出 Cell-Mean
+    df_cell_out = df_merged[['Tid', 'Cell_Type', 'Cell_Mean_TE']].copy()
+    df_cell_out.rename(columns={'Cell_Mean_TE': 'TE'}, inplace=True)
+    c_path = os.path.join(out_dir, 'baseline_cell_mean.csv')
+    df_cell_out.to_csv(c_path, index=False)
+    print(f"  - baseline_cell_mean.csv saved.")
+    
+    print("\n✅ Mean baselines successfully generated!")

@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
@@ -125,7 +126,7 @@ class PretrainingTrainer:
         self._total_steps = max(1, int(self.epoch_num * self.steps_per_epoch // max(1, self.ac_steps)))
         
         # loss criterions
-        self.count_criterion = nn.MSELoss(reduction="none") #nn.SmoothL1Loss(reduction="none", beta=1.0) 
+        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0)  #nn.MSELoss(reduction="none")
 
         # build optimizer & scheduler & scaler
         self.optimizer = self._build_optimizer(lr=self.lr, betas=self.beta, eps=self.epsilon, weight_decay=self.weight_decay)
@@ -464,13 +465,17 @@ class PretrainingTrainer:
             # print(species_list[i], cell_types_masked[i], cell_types[i], expr_batch.mean(dim=1)[i])
         
         # 生成权重矩阵，默认权重为 1
-        region_weights = torch.full((B, L), 1, dtype=torch.float32)
+        # region_weights = torch.full((B, L), 1, dtype=torch.float32)
+        cds_masks = torch.zeros((B, L), dtype=torch.bool)
         for i in range(B):
             s = cds_starts[i]
             e = cds_stops[i]
             if s != -1 and e != -1 and e > s:
                 e_clip = min(e, L)
-                region_weights[i, s:e_clip] = 1.2  # CDS 区域提权到 1.2
+                # region_weights[i, s - 1 : e_clip] = 1.2  # CDS 区域提权到 1.2
+                cds_masks[i, s - 1: e_clip] = True
+            else:
+                cds_masks[i, :] = True
 
         return (
             species_list,
@@ -481,7 +486,7 @@ class PretrainingTrainer:
             count_embs_padded,
             count_embs_masked,
             count_emb_masks,
-            region_weights,  # <--- 新增返回区域权重
+            cds_masks,
             pad_masks
         )
     
@@ -490,41 +495,63 @@ class PretrainingTrainer:
                 result: Dict[str, torch.Tensor],
                 count_raw_emb: torch.Tensor, 
                 count_emb_masks: torch.Tensor,
-                region_weights: torch.Tensor # <--- 新增接收区域权重
+                # region_weights: torch.Tensor,
+                cds_masks: torch.Tensor, # <--- [NEW] Receive the CDS tracking masks
+                alpha: float = 1.0
             ) -> torch.Tensor:
             
-
         pred = result["count"].float()  # (B, L, d_count) 
         count_raw_emb = count_raw_emb.float()
         norm_lengths = count_emb_masks.sum(dim=1).float()          
         
-        # 1. 计算所有位置的基础 Loss
+        # ==========================================
+        # 1. Micro Loss (Token-level Shape)
+        # ==========================================
         if pred.shape[2] == 1:
             loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-            # 乘上区域权重 (CDS: 0.7, UTR: 0.3)
-            loss_all = loss_all * region_weights.to(loss_all.device)
+            # loss_all = loss_all * region_weights.to(loss_all.device)
         else:
             loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-            # unsqueeze(-1) 保持维度对齐 (B, L, d_count)
-            loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
+            # loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
             
-        # ==========================================
-        # 样本级平均 (Instance-Level Averaging)
-        # ==========================================
-        # 2. 将 Loss 坍缩到 Batch 维度 (求每条序列的总 Loss)
         if loss_all.dim() == 3:
-            loss_per_seq = loss_all.sum(dim=[1, 2]) # (B,)
+            loss_per_seq = loss_all.sum(dim=[1, 2])
         else:
-            loss_per_seq = loss_all.sum(dim=1)      # (B,)
+            loss_per_seq = loss_all.sum(dim=1)
 
-        # 3. 防止除以 0 (如果某条序列刚好没有任何 token 被 mask)
         safe_lengths = torch.clamp(norm_lengths.to(loss_per_seq.device), min=1.0)
+        per_sample_micro_loss = loss_per_seq / safe_lengths
         
-        # 4. 计算单条序列的有效平均 Loss (除以全长)
-        per_sample_loss = loss_per_seq / safe_lengths
+        # ==========================================
+        # 2. Macro Loss (Sequence-level TE Constraint)
+        # Calculates mean ONLY over the CDS region (or full length if CDS is absent)
+        # ==========================================
+        # Intersect count_emb_masks with cds_masks to only calculate mean on MASKED tokens WITHIN the CDS.
+        # This prevents cheating by modifying unmasked tokens.
+        target_eval_mask = count_emb_masks.to(cds_masks.device) & cds_masks
         
-        # 5. 最后对整个 Batch 求均值
-        loss = per_sample_loss.mean()
+        if pred.shape[2] == 1:
+            pred_sum = (pred.squeeze(-1) * target_eval_mask.float()).sum(dim=1)
+            true_sum = (count_raw_emb.squeeze(-1) * target_eval_mask.float()).sum(dim=1)
+        else:
+            pred_sum = (pred * target_eval_mask.unsqueeze(-1).float()).sum(dim=[1, 2])
+            true_sum = (count_raw_emb * target_eval_mask.unsqueeze(-1).float()).sum(dim=[1, 2])
+        
+        # Calculate the number of valid tokens within the target region to serve as the denominator
+        target_lengths = target_eval_mask.sum(dim=1).float()
+        safe_target_lengths = torch.clamp(target_lengths.to(pred_sum.device), min=1.0)
+            
+        pred_mean = pred_sum / safe_target_lengths
+        true_mean = true_sum / safe_target_lengths
+        
+        per_sample_macro_loss = F.smooth_l1_loss(pred_mean, true_mean, reduction='none')
+
+        # ==========================================
+        # 3. Fusion
+        # ==========================================
+        total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
+        
+        loss = total_sample_loss.mean()
 
         return loss
 
@@ -556,7 +583,7 @@ class PretrainingTrainer:
             # Unpack the batch
             species_list, _, _, expr_batch, \
             seq_embs_padded, \
-            count_embs_padded, count_embs_masked, count_emb_masks, region_weights, pad_masks = batch_data
+            count_embs_padded, count_embs_masked, count_emb_masks, cds_masks, pad_masks = batch_data
 
             # Move tensors to CUDA
             expr_batch = expr_batch.cuda(non_blocking=True)
@@ -564,7 +591,7 @@ class PretrainingTrainer:
             count_embs_masked = count_embs_masked.cuda(non_blocking=True)
             count_embs_padded = count_embs_padded.cuda(non_blocking=True)
             count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-            region_weights = region_weights.cuda(non_blocking=True)
+            cds_masks = cds_masks.cuda(non_blocking=True)
             pad_masks = pad_masks.cuda(non_blocking=True)
 
             # ==========================================
@@ -587,7 +614,7 @@ class PretrainingTrainer:
                     head_names=["count"]
                 )
                 
-                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, region_weights)
+                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks)
                 acc_loss = loss / self.ac_steps
 
             do_sync = ((batch_idx + 1) % self.ac_steps == 0)
@@ -650,7 +677,7 @@ class PretrainingTrainer:
                 
                 species_list, _, _, expr_batch, \
                 seq_embs_padded, \
-                count_embs_padded, count_embs_masked, count_emb_masks, region_weights, pad_masks = batch_data
+                count_embs_padded, count_embs_masked, count_emb_masks, cds_masks, pad_masks = batch_data
 
                 # Move tensors to CUDA
                 expr_batch = expr_batch.cuda(non_blocking=True)
@@ -658,7 +685,7 @@ class PretrainingTrainer:
                 count_embs_masked = count_embs_masked.cuda(non_blocking=True)
                 count_embs_padded = count_embs_padded.cuda(non_blocking=True)
                 count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-                region_weights = region_weights.cuda(non_blocking=True)
+                cds_masks = cds_masks.cuda(non_blocking=True)
                 pad_masks = pad_masks.cuda(non_blocking=True)
 
                 # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
@@ -672,7 +699,7 @@ class PretrainingTrainer:
                         head_names=["count"],
                         move_inputs_to_device=False # Already moved manually
                     )
-                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, region_weights)
+                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks)
 
                 total_loss += loss.detach()
                 local_loss.append([float(loss)])
