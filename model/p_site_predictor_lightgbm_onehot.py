@@ -819,15 +819,25 @@ class PSitePredictor():
                                     subX.columns = self._feature_names_
 
                         # model predict
-                        pred_labels = self.predictor.predict(subX)
-                        offsets = np.array(self.offset_limits)[pred_labels]
+                        offset_values = np.array(list(self.offset_limits))
+                        proba = self.predictor.predict_proba(subX)
 
                         for i_local, global_idx in enumerate(range(start_idx, end_idx)):
                             tid = tid_list[global_idx]
                             read_l = read_len_list[global_idx]
                             pos = pos_list[global_idx]
-                            offset = int(offsets[i_local])
                             seq_len = self._base_seq_emb[tid].shape[0]
+
+                            if read_l in self.offset_fix:
+                                offset = self.offset_fix[read_l]
+                            else:
+                                # get maximum probability of offset from offset_map
+                                lo, hi = self.offset_map.get(read_l, (offset_values.min(), offset_values.max()))
+                                mask = (offset_values >= lo) & (offset_values <= hi)
+                                if not mask.any():
+                                    continue
+                                offset = offset_values[mask][np.argmax(proba[i_local, mask])]
+
                             p_pos = pos + offset
 
                             if 1 <= p_pos <= seq_len and read_l not in self.offset_fix:

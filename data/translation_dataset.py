@@ -84,7 +84,6 @@ class TranslationDataset(Dataset):
                         data["uuids"].append(str(uuid))
                         data["species"].append(str(grp.attrs.get("species", None)))
                         data["cell_types"].append(str(grp.attrs.get("cell_type", None)))
-                        data["cell_type_idxs"].append(np.int16(grp.attrs.get("cell_type_idx", -1)))
                         data["meta_info"].append(
                             {
                                 "cds_start_pos": np.int16(grp.attrs.get("cds_start_pos", -1)),

@@ -63,10 +63,12 @@ def build_length_position_matrix(counts_dict, tx_cds, result_dir,
 
     return lengths_sorted, mat, rel_positions
 
-def build_length_frame_matrix(counts_dict, tx_cds, 
-                              result_dir,
-                              min_len=21, max_len=40, prefix="read",
-                              offset_dict: dict = {}):
+def build_length_frame_matrix(
+        counts_dict, 
+        tx_cds, 
+        result_dir,
+        min_len=21, max_len=40, prefix="read",
+        offset_dict: dict = {}):
     """
     返回：
       lengths_sorted: list of lengths present (sorted)
@@ -74,7 +76,7 @@ def build_length_frame_matrix(counts_dict, tx_cds,
            each entry is total counts summed across transcripts for that length and relative position.
       total_counts_per_length: np.array shape (n_lengths,) - total counts for each length across window
       rel_positions: np.arange(-left, right+1)
-    counts_dict: dict {tid: {read_len: {pos:count}}} or {tid: {pos:count}}
+    counts_dict: dict {tid: {read_len: {pos:count}}} or {tid: {pos:count}} (1-based)
     tx_cds: dict[tid] with cds_start_pos and cds_end_pos (1-based)
     """
 
@@ -86,19 +88,20 @@ def build_length_frame_matrix(counts_dict, tx_cds,
         cds = tx_cds.get(tid)
         if cds is None:
             continue
-        anchor = cds.get("cds_start_pos", None)
 
-        if anchor is None or anchor <= 0:
-            continue
+        start = cds["cds_start_pos"]
+        end = cds["cds_end_pos"]
 
         any_val = next(iter(raw_counts.values()))
         if isinstance(any_val, dict):
             # nested by length
             for pos, d in raw_counts.items():
+                if not (start <= pos <= end):
+                    continue
                 for rl, c in d.items():
                     if rl < min_len or rl > max_len:
                         continue
-                    frame = (int(pos) - int(anchor) + offset_dict.get(rl, 0)) % 3
+                    frame = (int(pos) - int(start) + offset_dict.get(rl, 0)) % 3
                     # only keep within window
                     length_to_vector[rl][frame] += c
                     length_totals[rl] = length_totals.get(rl, 0) + c
