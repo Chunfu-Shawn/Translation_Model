@@ -543,13 +543,13 @@ class PretrainingTrainer:
         
         frame_masks = [f0_mask, f1_mask, f2_mask]
         
-        # Unify shape handling for single or multi-channel RPF density
+        # Unify shape handling for single or multi-channel RPF density (linear)
         if pred.shape[2] == 1:
-            p_val = pred.squeeze(-1)
-            t_val = count_raw_emb.squeeze(-1)
+            p_val = np.expm1(pred.squeeze(-1))
+            t_val = np.expm1(count_raw_emb.squeeze(-1))
         else:
-            p_val = pred.sum(dim=-1)
-            t_val = count_raw_emb.sum(dim=-1)
+            p_val = np.expm1(pred.sum(dim=-1))
+            t_val = np.expm1(count_raw_emb.sum(dim=-1))
             
         frame_mse_losses = []
         
@@ -564,8 +564,8 @@ class PretrainingTrainer:
             t_lengths = target_eval_mask.sum(dim=1).float()
             safe_t_lengths = torch.clamp(t_lengths, min=1.0)
             
-            p_mean = p_sum / safe_t_lengths
-            t_mean = t_sum / safe_t_lengths
+            p_mean = np.log(p_sum / safe_t_lengths) # normal distribution -3 : 3
+            t_mean = np.log(t_sum / safe_t_lengths) # normal distribution -3 : 3
             
             # Compute MSE
             f_loss = self.te_criterion(p_mean, t_mean)

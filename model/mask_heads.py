@@ -53,8 +53,9 @@ class PsiteDensityHead(nn.Module):
             nn.GELU(),
             nn.Dropout(self.p_drop),
             nn.Linear(self.d_pred_h, self.d_count),
-            nn.Softplus(beta=10) #nn.ReLU()
+            nn.ReLU()
         )
+        # nn.Softplus(beta=10)
 
         if init_xavier:
             self._init_parameters()

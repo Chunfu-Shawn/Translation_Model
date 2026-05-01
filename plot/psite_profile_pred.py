@@ -79,8 +79,8 @@ class PredictionVisualizer:
         print(f"--- Evaluating {uuid} (TID: {tid}, Cell: {cell_type}) ---")
 
         sample = self.dataset[dataset_idx]
-        meta = sample[3]
-        count_emb = sample[5]
+        meta = sample[4]
+        count_emb = sample[6]
         
         if isinstance(count_emb, torch.Tensor):
             truth = count_emb.detach().cpu().numpy()
