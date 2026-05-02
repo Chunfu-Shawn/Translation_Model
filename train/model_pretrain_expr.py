@@ -544,12 +544,14 @@ class PretrainingTrainer:
         frame_masks = [f0_mask, f1_mask, f2_mask]
         
         # Unify shape handling for single or multi-channel RPF density (linear)
+        # safe_pred = torch.clamp(pred, max=10.0) 
+        # safe_raw_emb = torch.clamp(count_raw_emb, max=10.0)
         if pred.shape[2] == 1:
-            p_val = torch.expm1(pred.squeeze(-1))
-            t_val = torch.expm1(count_raw_emb.squeeze(-1))
+            p_val = pred.squeeze(-1)
+            t_val = count_raw_emb.squeeze(-1)
         else:
-            p_val = torch.expm1(pred.sum(dim=-1))
-            t_val = torch.expm1(count_raw_emb.sum(dim=-1))
+            p_val = pred.sum(dim=-1)
+            t_val =count_raw_emb.sum(dim=-1)
             
         frame_mse_losses = []
         
@@ -564,8 +566,8 @@ class PretrainingTrainer:
             t_lengths = target_eval_mask.sum(dim=1).float()
             safe_t_lengths = torch.clamp(t_lengths, min=1.0)
             
-            p_mean = torch.log(p_sum / safe_t_lengths) # normal distribution -3 : 3
-            t_mean = torch.log(t_sum / safe_t_lengths) # normal distribution -3 : 3
+            p_mean = p_sum / safe_t_lengths
+            t_mean = t_sum / safe_t_lengths
             
             # Compute MSE
             f_loss = self.te_criterion(p_mean, t_mean)
@@ -577,7 +579,7 @@ class PretrainingTrainer:
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = 3
+        alpha = 2
         # Combine Micro local-shape constraint and Macro global-scale constraint
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         

@@ -100,7 +100,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
 
     # --- 2. 设置因子的顺序 ---
     model_order = [
-        "TRACE", "Encoder", "Convolution", 
+        "TRACE", "Convolution", #"Encoder"
         "Translatomer", "RiboMIMO (CDS)", # "Riboformer (CDS)",
         "Cross-batch", "Cross-experiment"
     ]
@@ -141,11 +141,10 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
 
     color_mapping = {
         "TRACE": "#2C6B9A",
-        "Encoder": "#555555",
-        "Convolution": "#777777",
-        "Translatomer": "#999999",
+        # "Encoder": "#555555",
+        "Convolution": "#555555",
+        "Translatomer": "#999999", #777777
         "RiboMIMO (CDS)": "#BBBBBB",
-        # "Riboformer (CDS)": "#DDDDDD",
         "Cross-batch": "#AF804F",
         "Cross-experiment": "#EBC67F"
     }
@@ -313,8 +312,9 @@ def plot_length_robustness_line_chart(
     # 颜色配置
     color_mapping = {
         "TRACE": "#2C6B9A",
-        "Convolution": "#777777",
-        "Translatomer": "#999999",
+        # "Encoder": "#555555",
+        "Convolution": "#555555",
+        "Translatomer": "#999999", #777777
         "RiboMIMO (CDS)": "#BBBBBB",
         "Cross-batch": "#AF804F",
         "Cross-experiment": "#EBC67F"

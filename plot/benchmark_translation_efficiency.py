@@ -306,7 +306,8 @@ def plot_te_correlation_performance(
         
         # Baseline 特征 (大地色系/暖金渐变)
         "Transcript-Mean": "#AF804F",  # 阶梯 1 (最深)
-        "Inverse 5'UTR length": "#B98C57",  # 阶梯 2
+        "Inverse 5'UTR length": "#AF804F",  # 阶梯 2
+        "Inverse 3'UTR length": "#B98C57",
         "Inverse CDS length": "#C3975F",   # 阶梯 3
         "Inverse CDS GC%": "#CDA367",      # 阶梯 4
         "CAI": "#D7AF6F",                  # 阶梯 5
