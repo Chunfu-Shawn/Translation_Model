@@ -73,7 +73,7 @@ trainer = PretrainingTrainer(
     lr_warmup_perc = 0.3,
     accumulation_steps = 1,
     balance_classes = False,
-    beta = (0.9, 0.9),
+    beta = (0.9, 0.98),
     epsilon = 1e-9,
     weight_decay = 0.01,
 )

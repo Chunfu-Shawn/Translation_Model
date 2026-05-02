@@ -657,9 +657,10 @@ class PretrainingTrainer:
                 self.scaler.scale(acc_loss).backward()
 
             if do_sync:
-                # self.scaler.unscale_(self.optimizer) # 解开 scale 以计算真实梯度 norm
-                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) # 裁剪梯度，最大 norm 设为 1.0
-                self.scaler.step(self.optimizer)
+                # gradient clipping
+                self.scaler.unscale_(self.optimizer) # 解开 scale 以计算真实梯度 norm
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) # 裁剪梯度，最大 norm 设为 1.0
+                self.scaler.step(self.optimizer) # 步进优化器并更新scalar
                 self.scaler.update() 
                 self.scheduler.step()
                 self.optimizer.zero_grad() 
