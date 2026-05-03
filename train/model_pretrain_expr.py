@@ -127,7 +127,7 @@ class PretrainingTrainer:
         
         # loss criterions
         self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0)  #nn.MSELoss(reduction="none")
-        self.te_criterion = nn.MSELoss(reduction="none")
+        self.te_criterion = nn.SmoothL1Loss(reduction="none", beta=2.0)
 
         # build optimizer & scheduler & scaler
         self.optimizer = self._build_optimizer(lr=self.lr, betas=self.beta, eps=self.epsilon, weight_decay=self.weight_decay)
@@ -579,7 +579,7 @@ class PretrainingTrainer:
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = 2
+        alpha = 3
         # Combine Micro local-shape constraint and Macro global-scale constraint
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         

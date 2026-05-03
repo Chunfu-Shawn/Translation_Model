@@ -28,7 +28,7 @@ human_val_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".valid.
 
 # create model
 base_model = TranslationBaseModel.from_config(
-    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_8h_10l_64env_16ad.yaml"
+    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_8h_10l_64env_8ad.yaml"
     ).cuda(rank)
 # create heads
 base_model.add_head(
@@ -67,7 +67,7 @@ trainer = PretrainingTrainer(
     save_every = 1,
     epoch_num = epoch_num,
     mask_value = 0,
-    mask_perc = {"count": (1.5, 1.5), "species": 0.2, "cell": 0.2},
+    mask_perc = {"count": (0.4, 1.5), "species": 0.2, "cell": 0.2},
     expr_noise_std = 0.1,
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,
