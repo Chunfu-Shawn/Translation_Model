@@ -52,7 +52,7 @@ base_model = DDP(
 )
 
 # trainer
-epoch_num = 20
+epoch_num = 40
 trainer = PretrainingTrainer(
     model = base_model,
     dataset_paths = [human_train_dataset_path,],
