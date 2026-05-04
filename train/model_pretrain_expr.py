@@ -126,8 +126,8 @@ class PretrainingTrainer:
         self._total_steps = max(1, int(self.epoch_num * self.steps_per_epoch // max(1, self.ac_steps)))
         
         # loss criterions
-        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=0.5)  #nn.MSELoss(reduction="none")
-        self.te_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0)
+        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1)  #nn.MSELoss(reduction="none")
+        self.te_criterion = nn.MSELoss(reduction="none")
 
         # build optimizer & scheduler & scaler
         self.optimizer = self._build_optimizer(lr=self.lr, betas=self.beta, eps=self.epsilon, weight_decay=self.weight_decay)
