@@ -569,7 +569,7 @@ class PretrainingTrainer:
             p_mean = p_sum / safe_t_lengths
             t_mean = t_sum / safe_t_lengths
             
-            # Compute SmoothL1
+            # Compute MSE loss
             f_loss = self.te_criterion(p_mean, t_mean)
             frame_mse_losses.append(f_loss)
 
