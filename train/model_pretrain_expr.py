@@ -126,8 +126,8 @@ class PretrainingTrainer:
         self._total_steps = max(1, int(self.epoch_num * self.steps_per_epoch // max(1, self.ac_steps)))
         
         # loss criterions
-        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0)  #nn.MSELoss(reduction="none")
-        self.te_criterion = nn.SmoothL1Loss(reduction="none", beta=2.0)
+        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=0.5)  #nn.MSELoss(reduction="none")
+        self.te_criterion = nn.SmoothL1Loss(reduction="none", beta=1.0)
 
         # build optimizer & scheduler & scaler
         self.optimizer = self._build_optimizer(lr=self.lr, betas=self.beta, eps=self.epsilon, weight_decay=self.weight_decay)
@@ -569,17 +569,17 @@ class PretrainingTrainer:
             p_mean = p_sum / safe_t_lengths
             t_mean = t_sum / safe_t_lengths
             
-            # Compute MSE
+            # Compute SmoothL1
             f_loss = self.te_criterion(p_mean, t_mean)
             frame_mse_losses.append(f_loss)
 
-        # Average the MSE loss across all 3 frames
+        # Average the loss across all 3 frames
         per_sample_macro_loss = (frame_mse_losses[0] + frame_mse_losses[1] + frame_mse_losses[2]) / 3.0
 
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = 3
+        alpha = 2
         # Combine Micro local-shape constraint and Macro global-scale constraint
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         
@@ -659,7 +659,7 @@ class PretrainingTrainer:
             if do_sync:
                 # gradient clipping
                 self.scaler.unscale_(self.optimizer) # 解开 scale 以计算真实梯度 norm
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) # 裁剪梯度，最大 norm 设为 1.0
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0) # 裁剪梯度
                 self.scaler.step(self.optimizer) # 步进优化器并更新scalar
                 self.scaler.update() 
                 self.scheduler.step()

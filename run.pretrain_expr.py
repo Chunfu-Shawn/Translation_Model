@@ -52,7 +52,7 @@ base_model = DDP(
 )
 
 # trainer
-epoch_num = 40
+epoch_num = 20
 trainer = PretrainingTrainer(
     model = base_model,
     dataset_paths = [human_train_dataset_path,],
@@ -67,13 +67,13 @@ trainer = PretrainingTrainer(
     save_every = 1,
     epoch_num = epoch_num,
     mask_value = 0,
-    mask_perc = {"count": (0.4, 1.5), "species": 0.2, "cell": 0.2},
+    mask_perc = {"count": (1.5, 1.5), "species": 0.2, "cell": 0.2},
     expr_noise_std = 0.1,
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,
     accumulation_steps = 1,
     balance_classes = False,
-    beta = (0.9, 0.98),
+    beta = (0.9, 0.99),
     epsilon = 1e-9,
     weight_decay = 0.01,
 )
