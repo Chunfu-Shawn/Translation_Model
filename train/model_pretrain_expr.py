@@ -74,6 +74,7 @@ class PretrainingTrainer:
         print_progress_every: int = 50,
         save_every: int = 5,
         epoch_num: int = 100,
+        patience: int = 100,
         mask_perc: dict = {"count": 0.3, "species": 0.15, "cell": 0.15},
         expr_noise_std: float = 0.1, # Standard deviation of Gaussian noise to inject (10% of Z-score variance)
         learning_rate: float = 1e-5,
@@ -92,6 +93,8 @@ class PretrainingTrainer:
         self.resume = resume
         self.batch_size = batch_size
         self.epoch_num = epoch_num
+        self.patience = patience
+        self.patience_counter = 0
         self.ac_steps = accumulation_steps
         self.lr = learning_rate
         self.lr_warmup_perc = lr_warmup_perc
@@ -786,8 +789,15 @@ class PretrainingTrainer:
             # update best and bookkeeping (only for active heads/mask task)
             val_loss_float = float(val_loss.item())
             is_best = val_loss_float < self.best_val_loss
+            
+            # --- [NEW] Early Stopping Update Logic ---
             if is_best:
                 self.best_val_loss = val_loss_float
+                self.patience_counter = 0 
+            else:
+                self.patience_counter += 1
+                if self.rank == 0:
+                    print(f"[Trainer] Early Stopping Counter: {self.patience_counter} / {self.patience}")
 
             self.training_epoch_data.append({"epoch": epoch+1, "train_loss": float(train_loss.item()), "valid_loss": val_loss})
             self.training_batch_data.append({"epoch": epoch+1, 
@@ -803,3 +813,17 @@ class PretrainingTrainer:
                 
                 with open(os.path.join(self.log_dir, self.model_full_name + ".batch_data.json"), "w") as f:
                     json.dump(self.training_batch_data, f, cls=TensorEncoder)
+
+            # --- [NEW] Early Stopping Trigger ---
+            if self.patience_counter >= self.patience:
+                if self.rank == 0:
+                    print(f"\n[Trainer] 🛑 Early stopping triggered! Validation loss did not improve for {self.patience} consecutive epochs. Stopping at epoch {epoch+1}.")
+                    
+                    # Optional: Force a final save before exiting
+                    self.save_checkpoint(epoch + 1, is_best=False)
+                    with open(os.path.join(self.log_dir, self.model_full_name + ".epoch_data.json"), "w") as f:
+                        json.dump(self.training_epoch_data, f, cls=TensorEncoder)
+                    with open(os.path.join(self.log_dir, self.model_full_name + ".batch_data.json"), "w") as f:
+                        json.dump(self.training_batch_data, f, cls=TensorEncoder)
+                        
+                break

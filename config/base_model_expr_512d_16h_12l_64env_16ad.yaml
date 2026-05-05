@@ -9,7 +9,7 @@ expr_dict_path: None
 n_heads: 16
 number_of_layers: 12
 d_ff: 1024
-adaptive_dim: 8
+adaptive_dim: 16
 gamma_scale: 0.5
 p_drop: 0.1
 model_name: "base_model_expr_512d_16h_12l_64env_8ad"

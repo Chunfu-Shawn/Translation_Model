@@ -28,14 +28,14 @@ human_val_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".valid.
 
 # create model
 base_model = TranslationBaseModel.from_config(
-    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_8h_10l_64env_8ad.yaml"
+    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_512d_16h_12l_64env_16ad.yaml"
     ).cuda(rank)
 # create heads
 base_model.add_head(
     "count",
     PsiteDensityHead.create_from_model(
         base_model,
-        d_pred_h = 384
+        d_pred_h = 512
         ),
     overwrite = True
 )
@@ -52,7 +52,7 @@ base_model = DDP(
 )
 
 # trainer
-epoch_num = 50
+epoch_num = 20
 trainer = PretrainingTrainer(
     model = base_model,
     dataset_paths = [human_train_dataset_path,],
@@ -73,7 +73,7 @@ trainer = PretrainingTrainer(
     lr_warmup_perc = 0.3,
     accumulation_steps = 1,
     balance_classes = False,
-    beta = (0.9, 0.99),
+    beta = (0.9, 0.98),
     epsilon = 1e-9,
     weight_decay = 0.01,
 )
