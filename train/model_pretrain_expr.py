@@ -74,7 +74,7 @@ class PretrainingTrainer:
         print_progress_every: int = 50,
         save_every: int = 5,
         epoch_num: int = 100,
-        patience: int = 100,
+        patience: int = 8,
         mask_perc: dict = {"count": 0.3, "species": 0.15, "cell": 0.15},
         expr_noise_std: float = 0.1, # Standard deviation of Gaussian noise to inject (10% of Z-score variance)
         learning_rate: float = 1e-5,
