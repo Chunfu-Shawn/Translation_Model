@@ -1,8 +1,69 @@
+import copy
 import torch
 import torch.nn as nn
-from typing import Optional
-from model.model_modules import replicate_module, PositionwiseFeedForward, AddNormLayer
+from model.flash_multi_headed_attention import FlashMultiHeadedAttention
 
+__author__ = "Chunfu Xiao"
+__license__ = ""
+__version__="1.0.0"
+__maintainer__ = "Chunfu Xiao"
+__email__ = "chunfushawn@gmail.com"
+
+
+def replicate_module(module, copies):
+    # deepcopy for independent parameters in different layers
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(copies)]) # Module list
+
+class AddNormLayer(nn.Module):
+    # LayerNorm -> sublayer (MHA or FFN) -> dropout -> residual connection
+    def __init__(self, d_model, p_drop):
+        super().__init__()
+        self.LN = nn.LayerNorm(d_model) # normalized to mean 0 and variance 1 for (seq_len, model dimension)
+        self.dropout = nn.Dropout(p=p_drop)
+
+    def forward(self, reps_batch, sublayer_module):
+        # any modules could be packaged by uniform interface (sublayer_module)
+        # residual connections and normalization layer
+        return reps_batch + self.dropout(
+            sublayer_module(self.LN(reps_batch))
+            ) # (bs, seq_len, d_model)
+
+class LinearEmbedding(nn.Module):
+    """
+    Project sequence and RPF density safely with non-linearity and normalization.
+    """
+    def __init__(self, d_seq, d_count, output_model, p_drop=0.1):
+        super().__init__()
+        self.seq_emb_layer = nn.Linear(d_seq, output_model)
+        self.count_emb_layer = nn.Linear(d_count, output_model)
+        
+        self.seq_ln = nn.LayerNorm(output_model)
+        self.count_ln = nn.LayerNorm(output_model)
+        
+        self.unify_emb_layer = nn.Sequential(
+            nn.Linear(output_model * 2, output_model),
+            nn.GELU(), 
+            nn.Dropout(p_drop)
+        )
+
+    def forward(self, seq_tokens, count_tokens):
+        seq_embeddings = self.seq_ln(self.seq_emb_layer(seq_tokens))
+        count_embeddings = self.count_ln(self.count_emb_layer(count_tokens))
+        
+        concat_emb = torch.cat([seq_embeddings, count_embeddings], dim=-1)
+        return self.unify_emb_layer(concat_emb)
+    
+    
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff=2048):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff) # often d_ff > d_model
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.gelu = nn.GELU()
+
+    def forward(self, reps_batch):
+        return self.linear2(self.gelu(self.linear1(reps_batch))) # (bs, seq_len, d_model)
+    
 
 class MLPEncoderLayer(nn.Module):
     def __init__(self, d_model, d_ff, p_drop):
@@ -103,3 +164,40 @@ class ConvEncoderLayer(nn.Module):
         src_reps = self.sublayers[1](src_reps, self.ffn)
 
         return src_reps
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, d_ff, heads, p_drop):
+        super().__init__()
+        # twice "Add & Norm" for one Encoder Layer
+        self.sublayers = replicate_module(AddNormLayer(d_model, p_drop), 2)
+        self.multi_headed_attention = FlashMultiHeadedAttention(d_model, heads, p_drop) # if flash_attn else MultiHeadedAttention(d_model, heads)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff)
+
+        self.d_model = d_model
+
+    def forward(self, src_reps, src_mask):
+        # Define anonymous (lambda) function which only takes src_reps (srb) as input,
+        # this way we have a uniform interface for the sublayer logic.
+        encoder_self_attention = lambda srb: self.multi_headed_attention(srb, srb, attention_mask=src_mask)
+
+        # Self-attention MHA sublayer followed by point-wise feed forward net sublayer
+        ## pre-normalization before MHA and feedforward net sublayer
+        src_reps = self.sublayers[0](src_reps, encoder_self_attention)
+        src_reps = self.sublayers[1](src_reps, self.ffn)
+
+        return src_reps
+    
+
+class Encoder(nn.Module):
+    def __init__(self, encoder_layer, number_of_layers):
+        super().__init__()
+        # multiple Encoder Layers
+        self.encoder_layers = replicate_module(encoder_layer, number_of_layers)
+        self.LN = nn.LayerNorm(encoder_layer.d_model)
+
+    def forward(self, src_embs, src_mask):
+        src_reps = src_embs
+        
+        for encoder_layer in self.encoder_layers:
+            src_reps = encoder_layer(src_reps, src_mask)
+        return self.LN(src_reps)

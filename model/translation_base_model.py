@@ -6,12 +6,11 @@ import torch.nn as nn
 import numpy as np
 import inspect
 from typing import Optional, List, Union, Tuple, Dict, Any
-from config.model_config_v3 import ModelConfig
-from model.model_modules import LinearEmbedding, Encoder
-from model.model_modules_alternate import MLPEncoderLayer
+from config.model_config_expr import ModelConfig
+from model.model_modules import LinearEmbedding, AdaEncoder, AdaZeroEncoderLayer
 
 __author__ = "Chunfu Xiao"
-__version__="1.3.0"
+__version__="1.6.0"
 __email__ = "chunfushawn@gmail.com"
 
 
@@ -47,19 +46,26 @@ class TranslationBaseModel(nn.Module):
     TranslationBaseModel: encoder-based model with pluggable heads and robust input handling.
 
     Improvements over the original:
-      - Accepts single-sample inputs without batch dimension (e.g. shape [seq_len, d_seq]).
-      - Accepts cell_type as string/int/torch.Tensor/numpy/list.
-      - Provides `predict(...)` helper for inference (eval mode + no_grad + device handling).
-      - Keeps add_head/remove_head/list_heads/save_head/load_head APIs.
+      - Uses continuous Transcriptome Profile (d_expr) instead of discrete cell IDs.
+      - Integrates a discrete `species` label to capture evolutionary translation baselines.
+      - Includes a Bottleneck Projector to compress massive d_expr to d_cell_env.
+      - Can automatically lookup `expr_vector` from a registered dictionary via `cell_type` string.
+      - Safe fallback to a mean expression vector for unknown cell types.
     """
     def __init__(
         self,
         d_seq: int,
         d_count: int,
         d_model: int,
-        all_cell_types: List[str],
+        d_expr: int = 40000,
+        d_cell_env: int = 64,
+        all_species: List[str] = ["human", "macaque", "mouse"],
+        d_species: int = 16,
+        n_heads: int = 8,
         number_of_layers: int = 12,
         d_ff: int = 2048,
+        adaptive_dim: int = 32,
+        gamma_scale: float = 0.5,
         p_drop: float = 0.1,
         model_name: str = "base_model",
     ):
@@ -69,9 +75,15 @@ class TranslationBaseModel(nn.Module):
             d_seq=d_seq,
             d_count=d_count,
             d_model=d_model,
-            all_cell_types=all_cell_types,
+            d_expr=d_expr,
+            d_cell_env=d_cell_env,
+            all_species=all_species, 
+            d_species=d_species,
+            n_heads=n_heads,
             number_of_layers=number_of_layers,
             d_ff=d_ff,
+            adaptive_dim=adaptive_dim,
+            gamma_scale=gamma_scale,
             p_drop=p_drop,
             model_name=model_name
         )
@@ -80,30 +92,87 @@ class TranslationBaseModel(nn.Module):
         self.d_seq = d_seq
         self.d_count = d_count
         self.d_model = d_model
+        self.d_expr = d_expr
+        self.d_cell_env = d_cell_env
+        self.d_species = d_species
+
+        self.n_heads = n_heads
+        self.adaptive_dim = adaptive_dim
+        self.gamma_scale = gamma_scale
+
+        # ==========================================
+        # Dynamic Species Dictionary Mapping
+        # ==========================================
+        self.all_species = all_species if all_species else []
+        # Total classes = defined species + 1 (reserved index 0 for 'unknown')
+        self.num_species = len(self.all_species) + 1
+        # Create case-insensitive mapping: e.g., {"human": 1, "macaque": 2, "mouse": 3}
+        self.species_mapping = {sp.lower(): idx + 1 for idx, sp in enumerate(self.all_species)}
 
         # embeds source data into high-dimensional potent embedding vectors
         self.src_emb = LinearEmbedding(self.d_seq, self.d_count, self.d_model)
 
-        # cell type handling
-        self.num_provided_cells = len(all_cell_types)
-        self.num_cells = self.num_provided_cells + 1 # Total embeddings needed = N + 1
-        # mapping: token string -> index [1 .. num_classes-1]
-        self.cell_type_mapping = dict(
-            zip(
-                all_cell_types, 
-                range(1, self.num_cells) # Start from 1
-            )
+        # ==========================================
+        # Species Embedding Layer
+        # Maps discrete species ID (e.g., 0 for Human, 1 for Mouse) to a dense vector
+        # Index 0 is reserved for 'Unknown/Generic' species
+        # ==========================================
+        self.species_embedding = nn.Embedding(self.num_species, self.d_species, padding_idx=0)
+
+        # ==========================================
+        # Gene expression + Species projector
+        # Now accepts d_expr + d_species as input to the bottleneck
+        # ==========================================
+        self.expr_projector = nn.Sequential(
+            nn.Dropout(min(p_drop * 2, 0.9)),
+            nn.Linear(self.d_expr + self.d_species, self.d_cell_env, bias=False),
+            nn.LayerNorm(self.d_cell_env),
+            nn.GELU(),
+            nn.Linear(self.d_cell_env, self.adaptive_dim)
         )
 
         # Pass num_classes to Encoder/Layer for AdaLayerNorm embedding initialization
-        encoder_layer = MLPEncoderLayer(d_model, d_ff, p_drop)
-        self.encoder = Encoder(encoder_layer, number_of_layers)
+        encoder_layer = AdaZeroEncoderLayer(d_model, d_ff, n_heads, p_drop, self.adaptive_dim, self.gamma_scale)
+        self.encoder = AdaEncoder(encoder_layer, number_of_layers)
 
         # pluggable heads
         self.heads = nn.ModuleDict() # key -> head module
         
         # initialize parameters (Xavier for weight tensors by default)
         self._init_parameters()
+
+        self.register_buffer("mean_expr_vector", torch.zeros(self.d_expr)) 
+        self.cell_expr_dict = {} 
+
+    # -----------------------------
+    # Expression Dictionary Manager
+    # -----------------------------
+    def load_expression_dict(self, expr_dict: Dict[str, Union[torch.Tensor, np.ndarray, list]]):
+        """
+        Load a dictionary mapping cell type names to their expression vectors.
+        It automatically calculates the mean vector as a fallback.
+        """
+        self.cell_expr_dict = {}
+        all_vectors = []
+        for cell_name, vec in expr_dict.items():
+            tensor_vec = self._ensure_tensor(vec, dtype=torch.float32)
+            if tensor_vec.shape[-1] != self.d_expr:
+                raise ValueError(f"Vector for {cell_name} has wrong dimension. Expected {self.d_expr}, got {tensor_vec.shape[-1]}")
+            
+            # 挤压多余的维度，确保是一维向量
+            tensor_vec = tensor_vec.view(-1)
+            self.cell_expr_dict[cell_name] = tensor_vec
+            all_vectors.append(tensor_vec)
+        
+        # 计算并更新 fallback 使用的平均表达向量
+        if all_vectors:
+            stacked_vecs = torch.stack(all_vectors)
+            mean_vec = stacked_vecs.mean(dim=0)
+            # 使用 copy_ 保证 Buffer 正常更新，且与模型在同一设备
+            self.mean_expr_vector.copy_(mean_vec)
+            print(f"[Model] Successfully loaded {len(self.cell_expr_dict)} cell type expression profiles. Mean vector updated.")
+        else:
+            print("[Model] Warning: Provided expression dictionary is empty.")
 
     # -------------------------
     # initialization utilities
@@ -179,7 +248,7 @@ class TranslationBaseModel(nn.Module):
             raise TypeError("config must be a dict, ModelConfig, or a path to a JSON/YAML file.")
 
         # Basic validation & required keys
-        required = {"d_seq", "d_count", "d_model", "all_cell_types"}
+        required = {"d_seq", "d_count", "d_model", "d_expr", "d_cell_env"}
         missing = required - cfg_dict.keys()
         if missing:
             raise ValueError(f"Missing required config keys: {missing}")
@@ -189,43 +258,72 @@ class TranslationBaseModel(nn.Module):
             d_seq=int(cfg_dict["d_seq"]),
             d_count=int(cfg_dict["d_count"]),
             d_model=int(cfg_dict["d_model"]),
-            all_cell_types=list(cfg_dict["all_cell_types"]),
+            d_expr=int(cfg_dict["d_expr"]),
+            d_cell_env=int(cfg_dict["d_cell_env"]),
+            all_species=list(cfg_dict.get("all_species", ["human", "mouse", "macaque"])),
+            d_species=int(cfg_dict.get("d_species", 16)),
+            n_heads=int(cfg_dict.get("n_heads", 8)),
             number_of_layers=int(cfg_dict.get("number_of_layers", 6)),
             d_ff=int(cfg_dict.get("d_ff", 2048)),
+            adaptive_dim=int(cfg_dict.get("adaptive_dim", 32)),
+            gamma_scale=float(cfg_dict.get("gamma_scale", 0.5)),
             p_drop=float(cfg_dict.get("p_drop", 0.1)),
+            expr_dict_path=cfg_dict.get("expr_dict_path", None), 
             model_name=cfg_dict.get("model_name"),
             seed=cfg_dict.get("seed"),
         )
 
     @classmethod
     def from_config(cls, config: Union[Dict[str, Any], ModelConfig, str]) -> "TranslationBaseModel":
-        """
-        Construct a TranslationBaseModel from a config dict, ModelConfig instance, or path to JSON/YAML file.
-
-        Example:
-            model = TranslationBaseModel.from_config("configs/my_model.yaml")
-            or
-            cfg = {"d_seq":4, "d_count":10, "d_model":512, "all_cell_types": ["A","B",...]}
-            model = TranslationBaseModel.from_config(cfg)
-        """
         cfg = cls._normalize_config(config)
 
-        # optional: set random seed for reproducibility if provided
         if cfg.seed is not None:
             torch.manual_seed(int(cfg.seed))
 
         print(f"==> Create model using config from {config}: {cfg}")
 
-        return cls(
+        # 1. 实例化模型
+        model = cls(
             d_seq=cfg.d_seq,
             d_count=cfg.d_count,
             d_model=cfg.d_model,
-            all_cell_types=cfg.all_cell_types,
+            d_expr=cfg.d_expr,
+            d_cell_env=cfg.d_cell_env,
+            all_species=cfg.all_species,
+            d_species=cfg.d_species,
+            n_heads=cfg.n_heads,
             number_of_layers=cfg.number_of_layers,
             d_ff=cfg.d_ff,
+            adaptive_dim=cfg.adaptive_dim,
+            gamma_scale=cfg.gamma_scale,
             p_drop=cfg.p_drop,
             model_name=cfg.model_name
         )
+
+        if cfg.expr_dict_path is not None:
+            if not os.path.isfile(cfg.expr_dict_path):
+                print(f"[Warning] expr_dict_path '{cfg.expr_dict_path}' not found. Skipping auto-load.")
+            else:
+                print(f"[Model] Auto-loading expression dict from {cfg.expr_dict_path}...")
+                
+                # 兼容多种格式的字典文件 (JSON / Pickle / PyTorch .pt)
+                if cfg.expr_dict_path.endswith('.json'):
+                    import json
+                    with open(cfg.expr_dict_path, 'r') as f:
+                        expr_dict = json.load(f)
+                elif cfg.expr_dict_path.endswith(('.pkl', '.pickle')):
+                    import pickle
+                    with open(cfg.expr_dict_path, 'rb') as f:
+                        expr_dict = pickle.load(f)
+                elif cfg.expr_dict_path.endswith('.pt'):
+                    expr_dict = torch.load(cfg.expr_dict_path, map_location='cpu')
+                else:
+                    raise ValueError("Unsupported file format for expr_dict_path. Use .json, .pkl, or .pt")
+                
+                # 调用模型内置的方法挂载数据
+                model.load_expression_dict(expr_dict)
+
+        return model
 
     def save_config(self, path: str, as_yaml: bool = False) -> None:
         """
@@ -344,73 +442,105 @@ class TranslationBaseModel(nn.Module):
 
         return seq_batch, count_batch, src_mask_batched, was_squeezed
     
-    def _normalize_cell_type(self, cell_type: Any, batch_size: int) -> torch.LongTensor:
+    def _resolve_expr_vector(self, cell_type: Any, expr_vector: Any, batch_size: int) -> torch.Tensor:
         """
-        Normalize cell_type inputs into a long tensor of shape (batch_size,).
-        If unknown or missing -> returns 0 (Default/Mean).
-        If known -> returns Index from 1 to N.
-        Accepts:
-          - single str -> convert to index or num_cells for unknown
-          - single int -> validate or map to num_cells if out-of-range
-          - list / np.ndarray / torch.Tensor -> length must be batch_size or 1 (will broadcast)
-        Unknown entries map to self.num_cells (reserved index).
+        Resolves the final (bs, d_expr) continuous tensor to be used by the model.
+        Priority:
+          1. Explicit `expr_vector` provided by user (e.g. during training with Dataloader).
+          2. Lookup from `cell_type` strings using internal dictionary.
+          3. Fallback to `self.mean_expr_vector` for unknowns or missing inputs.
         """
-        # helper to convert single element to index
+        # Case 1: User explicitly provided the raw expression vector
+        if expr_vector is not None:
+            tensor_expr = self._ensure_tensor(expr_vector, dtype=torch.float32)
+            if tensor_expr.dim() == 1: # Single sample case
+                if tensor_expr.shape[0] != self.d_expr:
+                    raise ValueError(f"expr_vector has wrong dimension {tensor_expr.shape[0]}, expected {self.d_expr}")
+                return tensor_expr.unsqueeze(0).expand(batch_size, -1).clone()
+            elif tensor_expr.dim() == 2: # Batched case
+                if tensor_expr.shape != (batch_size, self.d_expr):
+                    raise ValueError(f"expr_vector has wrong shape {tuple(tensor_expr.shape)}, expected {(batch_size, self.d_expr)}")
+                return tensor_expr
+            else:
+                raise ValueError("Unsupported expr_vector shape.")
+
+        # Case 2: User provided cell_type identifier, we need to look it up
+        # We need to construct a (bs, d_expr) tensor
+        output_expr_batch = torch.empty((batch_size, self.d_expr), dtype=torch.float32, device=self.mean_expr_vector.device)
+        
+        # Helper to fetch a single vector
+        def _get_vec(name):
+            if isinstance(name, str) and name in self.cell_expr_dict:
+                return self.cell_expr_dict[name].to(self.mean_expr_vector.device)
+            # Fallback for unknown
+            return self.mean_expr_vector
+
+        if cell_type is None:
+             output_expr_batch[:] = self.mean_expr_vector
+        elif isinstance(cell_type, str):
+             vec = _get_vec(cell_type)
+             output_expr_batch[:] = vec
+        elif isinstance(cell_type, (list, tuple, np.ndarray)):
+             if len(cell_type) == 1:
+                 vec = _get_vec(cell_type[0] if isinstance(cell_type, list) else cell_type.item())
+                 output_expr_batch[:] = vec
+             elif len(cell_type) == batch_size:
+                 for i, ct in enumerate(cell_type):
+                     output_expr_batch[i] = _get_vec(ct)
+             else:
+                 raise ValueError(f"Length of cell_type array ({len(cell_type)}) must match batch_size ({batch_size}) or 1.")
+        else:
+             # Unrecognized type, use mean
+             output_expr_batch[:] = self.mean_expr_vector
+             
+        return output_expr_batch
+    
+    # ==========================================
+    # String-Aware Species Normalization
+    # Resolves strings/lists into batched Long indices using species_mapping
+    # ==========================================
+    def _normalize_species(self, species: Any, batch_size: int) -> torch.LongTensor:
+        """
+        Normalize species inputs (strings, ints, lists) into a long tensor of shape (batch_size,).
+        If unknown or None -> returns 0 (Generic/Fallback).
+        """
+        # Helper to convert a single item (str or int) to the correct dictionary index
         def _single_to_index(val) -> int:
             if isinstance(val, str):
-                # Return 0 (default) if not found
-                return self.cell_type_mapping.get(val, 0)
+                return self.species_mapping.get(val.lower(), 0)
             try:
                 ival = int(val)
+                if 0 <= ival < self.num_species:
+                    return ival
             except Exception:
-                return 0 # Default on error
+                pass
+            return 0
+
+        if species is None:
+            return torch.zeros((batch_size,), dtype=torch.long)
             
-            # If ival is already in the range [0, num_classes-1], respect it
-            # This allows user to manually pass 0 for default, or 1..N for specific
-            if 0 <= ival < self.num_cells:
-                return ival
-            return 0 # Default if out of bounds
-
-        # If torch tensor
-        if isinstance(cell_type, torch.Tensor):
-            if cell_type.numel() == 1:
-                idx = _single_to_index(cell_type.item())
+        if isinstance(species, str):
+            idx = _single_to_index(species)
+            return torch.full((batch_size,), idx, dtype=torch.long)
+            
+        if isinstance(species, (list, tuple, np.ndarray)):
+            if len(species) == 1:
+                idx = _single_to_index(species[0] if isinstance(species, list) else species.item())
                 return torch.full((batch_size,), idx, dtype=torch.long)
-            if cell_type.dim() == 1:
-                if cell_type.numel() == batch_size:
-                    return cell_type.to(dtype=torch.long) # Assume user passes correct indices
-                if cell_type.numel() == 1:
-                    idx = _single_to_index(cell_type.item())
-                    return torch.full((batch_size,), idx, dtype=torch.long)
-                raise ValueError(f"cell_type tensor length {cell_type.numel()} != batch_size {batch_size}")
-            raise ValueError("Unsupported cell_type tensor shape.")
-
-        # numpy array
-        if isinstance(cell_type, np.ndarray):
-            arr = cell_type.flatten()
-            if arr.size == 1:
-                idx = _single_to_index(arr.item())
-                return torch.full((batch_size,), idx, dtype=torch.long)
-            if arr.size == batch_size:
-                mapped = [_single_to_index(x) for x in arr.tolist()]
+            if len(species) == batch_size:
+                mapped = [_single_to_index(x) for x in species]
                 return torch.tensor(mapped, dtype=torch.long)
-            raise ValueError(f"cell_type array length {arr.size} != batch_size {batch_size}")
-
-        # python list/tuple
-        if isinstance(cell_type, (list, tuple)):
-            if len(cell_type) == 1:
-                idx = _single_to_index(cell_type[0])
+            raise ValueError(f"Length of species array ({len(species)}) must match batch_size ({batch_size}) or 1.")
+            
+        if isinstance(species, torch.Tensor):
+            if species.numel() == 1:
+                idx = _single_to_index(species.item())
                 return torch.full((batch_size,), idx, dtype=torch.long)
-            if len(cell_type) == batch_size:
-                mapped = [_single_to_index(x) for x in cell_type]
-                return torch.tensor(mapped, dtype=torch.long)
-            raise ValueError(f"cell_type list length {len(cell_type)} != batch_size {batch_size}")
+            if species.dim() == 1 and species.numel() == batch_size:
+                return species.to(dtype=torch.long).clamp(0, self.num_species - 1)
 
-        # scalar int/str or None
-        if cell_type is None:
-            return torch.zeros((batch_size,), dtype=torch.long) # All defaults
-
-        idx = _single_to_index(cell_type)
+        # Fallback for unexpected scalars
+        idx = _single_to_index(species)
         return torch.full((batch_size,), idx, dtype=torch.long)
     
     # -------------------------
@@ -420,26 +550,18 @@ class TranslationBaseModel(nn.Module):
         self,
         seq_batch: torch.Tensor,
         count_batch: torch.Tensor,
-        cell_type_idx: torch.LongTensor,
+        cell_type: Optional[Any] = None, 
+        expr_vector: torch.Tensor = None,
+        species: Optional[Any] = None,
         src_mask: Optional[torch.Tensor] = None,
         head_names: Optional[List[str]] = None, 
         head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
         **kwargs
     ):
         """
-        Strict forward that requires:
-          - seq_batch: torch.Tensor, shape (bs, seq_len, d_seq), dim == 3
-          - count_batch: torch.Tensor, shape (bs, seq_len, d_count), dim == 3
-          - cell_type_idx: torch.LongTensor, shape (bs,), dtype long
-          - src_mask: Optional[torch.BoolTensor], shape (bs, seq_len) or None
-
-        This function will:
-          - validate dtypes/shapes,
-          - call embedding/prompt/encoder,
-          - return encoder outputs or head outputs.
-
-        Note: predict(...) is the convenience wrapper that converts numpy/lists/scalars
-        and single-sample shapes into tensors and then calls forward(...).
+        Strict forward.
+        You must provide EITHER `expr_vector` (shape: bs, d_expr) OR `cell_type` (for dict lookup).
+        Optionally provide `species` (shape: bs) to inject evolutionary baselines.
         """
 
         # --- basic type checks ---
@@ -447,8 +569,8 @@ class TranslationBaseModel(nn.Module):
             raise TypeError("forward() expects seq_batch as torch.Tensor (dim==3). Use predict() for flexible inputs.")
         if not isinstance(count_batch, torch.Tensor):
             raise TypeError("forward() expects count_batch as torch.Tensor (dim==3). Use predict() for flexible inputs.")
-        if not isinstance(cell_type_idx, torch.Tensor):
-            raise TypeError("forward() expects cell_type_idx as torch.LongTensor. Use predict() for flexible inputs.")
+        if not isinstance(expr_vector, torch.Tensor):
+            raise TypeError("forward() expects expr_vector as torch.Tensor. Use predict() for flexible inputs.")
         if seq_batch.dim() != 3:
             raise ValueError(f"seq_batch must have dim==3 (bs, seq_len, d_seq). Got shape {tuple(seq_batch.shape)}")
         if count_batch.dim() != 3:
@@ -456,6 +578,18 @@ class TranslationBaseModel(nn.Module):
         
         bs = seq_batch.shape[0]
         seq_len = seq_batch.shape[1]
+
+        # 1. Resolve Dynamic Cellular Environment (Transcriptome)
+        final_expr_vector = self._resolve_expr_vector(cell_type, expr_vector, bs)
+        final_expr_vector = final_expr_vector.to(seq_batch.device)
+
+        # 2. Resolve Static Evolutionary Baseline (Species)
+        species_idx_batch = self._normalize_species(species, bs).to(seq_batch.device)
+        species_embs = self.species_embedding(species_idx_batch) # -> (bs, d_species)
+
+        # 3. Concatenate Transcriptome + Species before the bottleneck projection
+        # This allows the projector to interpret expression levels in the context of the specific species
+        combined_env_features = torch.cat([final_expr_vector, species_embs], dim=-1) # -> (bs, d_expr + d_species)
 
         # src_mask validation if provided
         if src_mask is not None:
@@ -468,16 +602,15 @@ class TranslationBaseModel(nn.Module):
             # ensure boolean dtype
             if src_mask.dtype != torch.bool:
                 src_mask = src_mask.bool()
-
-        # cell_type_idx validation
-        if cell_type_idx.dim() != 1 or cell_type_idx.shape[0] != bs:
-            raise ValueError("cell_type_idx must be a 1D long tensor of shape (bs,)")
         
         # compute embeddings (expects shapes (bs, seq_len, d_seq) & (bs, seq_len, d_count))
         src_embs = self.src_emb(seq_batch, count_batch)  # -> (bs, seq_len, d_model)
 
-        # encode
-        src_reps = self.encoder(src_embs, src_mask)
+        # 4. Create the final Compact Style from the concatenated features
+        compact_style = self.expr_projector(combined_env_features) # -> (bs, adaptive_dim)
+
+        # encode (pass compact_style for AdaLayerNorm)
+        src_reps = self.encoder(src_embs, src_mask, compact_style)
 
         # if user requested no heads, return raw representations (optionally squeeze later)
         if not head_names:
@@ -518,6 +651,8 @@ class TranslationBaseModel(nn.Module):
         seq_batch: Union[torch.Tensor, np.ndarray, list, tuple],
         count_batch: Union[torch.Tensor, np.ndarray, list, tuple] = None,
         cell_type: Any = None,
+        expr_vector: Any = None,
+        species: Any = None,
         src_mask: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         head_names: Optional[List[str]] = None,
         head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -538,8 +673,12 @@ class TranslationBaseModel(nn.Module):
         # 2). normalize inputs and preserve whether user passed a single sample
         seq_batch, count_batch, src_mask, was_squeezed = self._ensure_batch_dim_input(seq_batch, count_batch, src_mask)
         bs = seq_batch.shape[0]
-        # normalize cell_type to tensor of shape (bs,)
-        cell_type_idx = self._normalize_cell_type(cell_type, bs)
+
+        # process expr_vector and cell_type
+        final_expr = self._resolve_expr_vector(cell_type, expr_vector, bs)
+
+        # resolve species
+        species_idx = self._normalize_species(species, bs)
 
         # 3) move tensor inputs to model device 
         if move_inputs_to_device:
@@ -550,12 +689,19 @@ class TranslationBaseModel(nn.Module):
                 count_batch = count_batch.to(model_device)
             if isinstance(src_mask, torch.Tensor):
                 src_mask = src_mask.to(model_device)
-            if isinstance(cell_type_idx, torch.Tensor):
-                cell_type_idx = cell_type_idx.to(model_device)
+            species_idx = species_idx.to(model_device)
 
         # 4) run forward under no_grad
         with torch.no_grad():
-            outputs = self.forward(seq_batch, count_batch, cell_type_idx, src_mask, head_names, head_inputs)
+            outputs = self.forward(
+                seq_batch=seq_batch, 
+                count_batch=count_batch, 
+                expr_vector=final_expr, 
+                species=species_idx,
+                src_mask=src_mask, 
+                head_names=head_names, 
+                head_inputs=head_inputs
+            )
 
         # 5) If forward produced batched outputs but input was single-sample,
         #    forward() should already support returning batched output consistently.
@@ -577,7 +723,6 @@ class TranslationBaseModel(nn.Module):
     # -------------------------
     # head management helpers
     # -------------------------
-    
     def add_head(self, name: str, 
                  head_module: nn.Module, 
                  overwrite: bool = False, 

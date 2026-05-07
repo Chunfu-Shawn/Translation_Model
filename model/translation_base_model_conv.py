@@ -7,8 +7,7 @@ import numpy as np
 import inspect
 from typing import Optional, List, Union, Tuple, Dict, Any
 from config.model_config_conv import ModelConfig
-from model.model_modules import LinearEmbedding, Encoder
-from model.model_modules_alternate import ConvEncoderLayer
+from model.model_modules_alternate import LinearEmbedding, ConvEncoderLayer, Encoder
 
 
 __author__ = "Chunfu Xiao"
