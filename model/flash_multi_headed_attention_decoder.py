@@ -4,7 +4,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, Literal, Any
 from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func, flash_attn_with_kvcache
 from flash_attn.bert_padding import unpad_input, pad_input
-from model.rotary_position_embedding import LlamaRotaryEmbeddingExt
+from model.position_embedding import LlamaRotaryEmbeddingExt
 
 
 class FlashMultiHeadedAttention(nn.Module):

@@ -127,7 +127,7 @@ class PretrainingTrainer:
         self._total_steps = max(1, int(self.epoch_num * self.steps_per_epoch // max(1, self.ac_steps)))
         
         # loss criterions
-        self.count_criterion = nn.SmoothL1Loss(reduction="none", beta=1)  #nn.MSELoss(reduction="none")
+        self.dynamcis_criterion = nn.SmoothL1Loss(reduction="none", beta=1)  #nn.MSELoss(reduction="none")
         self.te_criterion = nn.MSELoss(reduction="none")
 
         # build optimizer & scheduler & scaler
@@ -466,7 +466,8 @@ class PretrainingTrainer:
         result: Dict[str, torch.Tensor],
         count_raw_emb: torch.Tensor, 
         count_emb_masks: torch.Tensor,
-        cds_masks: torch.Tensor
+        cds_masks: torch.Tensor,
+        cds_weight_factor: float = 1.5
     ) -> torch.Tensor:
         """
         Calculates the joint loss combining Token-level Micro Loss and Frame-aware Macro Loss.
@@ -474,17 +475,27 @@ class PretrainingTrainer:
         """
         pred = result["count"].float()  # (B, L, d_count) 
         count_raw_emb = count_raw_emb.float()
-        norm_lengths = count_emb_masks.sum(dim=1).float()          
+        
+        # ---------------------------------------------------------
+        # 动态生成 CDS 权重矩阵
+        # CDS 区域权重为 1.5，UTR 区域为 1.0
+        # ---------------------------------------------------------
+        token_weights = torch.where(cds_masks, cds_weight_factor, 1.0).to(pred.device)
+        
+        # 计算加权后的有效长度 (CDS 算作多个 token) 以便后续做均值
+        weighted_masks = count_emb_masks.float() * token_weights
+        norm_lengths = weighted_masks.sum(dim=1)
         
         # ==========================================
         # 1. Micro Loss (Token-level Shape Constraint)
         # ==========================================
         if pred.shape[2] == 1:
-            loss_all = self.count_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) * count_emb_masks.float()
-            # loss_all = loss_all * region_weights.to(loss_all.device)
+            loss_all = self.dynamcis_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) 
+            # 乘上 mask 并叠加上 CDS 专属权重
+            loss_all = loss_all * count_emb_masks.float() * token_weights
         else:
-            loss_all = self.count_criterion(pred, count_raw_emb) * count_emb_masks.unsqueeze(-1).float()
-            # loss_all = loss_all * region_weights.to(loss_all.device).unsqueeze(-1)
+            loss_all = self.dynamcis_criterion(pred, count_raw_emb) 
+            loss_all = loss_all * count_emb_masks.unsqueeze(-1).float() * token_weights.unsqueeze(-1)
             
         if loss_all.dim() == 3:
             loss_per_seq = loss_all.sum(dim=[1, 2])
@@ -514,14 +525,12 @@ class PretrainingTrainer:
         frame_masks = [f0_mask, f1_mask, f2_mask]
         
         # Unify shape handling for single or multi-channel RPF density (linear)
-        # safe_pred = torch.clamp(pred, max=10.0) 
-        # safe_raw_emb = torch.clamp(count_raw_emb, max=10.0)
         if pred.shape[2] == 1:
             p_val = pred.squeeze(-1)
             t_val = count_raw_emb.squeeze(-1)
         else:
             p_val = pred.sum(dim=-1)
-            t_val =count_raw_emb.sum(dim=-1)
+            t_val = count_raw_emb.sum(dim=-1)
             
         frame_mse_losses = []
         

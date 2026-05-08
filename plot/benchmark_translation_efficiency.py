@@ -362,18 +362,16 @@ def plot_te_correlation_performance(
 
 def load_and_calculate_polysome_correlation(
         data_config: dict, 
-        ref_dfs: dict,           # Accept multiple datasets in dictionary format {"Dataset_A": df_A, "Dataset_B": df_B}
-        target_cell_types=None,  # [MODIFIED] Cell lines corresponding to ref_dfs; supports list, dict, or string
+        ref_dfs: dict,           
+        target_cell_types=None,  
         model_metric="mORF_Mean_Density", 
         ref_metric="High_vs_Low_FC", 
         corr_method="spearman",
-        target_ids=None,         # [NEW] Array/list of target Transcript IDs to evaluate on
         meta_pkl_path="/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl"):
     """
     Load model prediction results and calculate correlation with multiple Polysome profiling reference tables.
-    Supports intelligent metric fallback for both model outputs (TE) and reference metrics (Ribosome_Load).
-    Supports assigning specific cell lines to each reference dataset for precise extraction.
-    [NEW] Filters the evaluation to only include the specified `target_ids` for fair cross-model comparison.
+    [NEW] Automatically computes the strict intersection of IDs across ALL models for each (Dataset, Cell Type) pair,
+    guaranteeing that every model is evaluated on the exact same set of transcripts/genes for fair benchmarking.
     """
     aggregated_data = []
     print(f"--- Processing Data ---")
@@ -381,7 +379,6 @@ def load_and_calculate_polysome_correlation(
     print(f"  Target Ref Metric   : {ref_metric} (Fallback: Ribosome_Load)")
     print(f"  Method              : {corr_method.capitalize()}")
 
-    # [MODIFIED] Validate target_cell_types and build mapping dictionary
     target_cell_map = {}
     if target_cell_types is not None:
         if isinstance(target_cell_types, list):
@@ -400,7 +397,6 @@ def load_and_calculate_polysome_correlation(
     id_cols_master = ['Tid', 'EnsemblTranscriptID', 'Gid', 'EnsemblGeneID', 'gene_name']
     
     for ref_name, ref_df in ref_dfs.items():
-        # Determine the metric used for the current dataset
         current_ref_metric = ref_metric
         if current_ref_metric not in ref_df.columns:
             if "Ribosome_Load" in ref_df.columns:
@@ -410,7 +406,6 @@ def load_and_calculate_polysome_correlation(
                 print(f"  [Warning] Missing metric '{ref_metric}' AND 'Ribosome_Load' in {ref_name}. Skipping this dataset.")
                 continue
 
-        # Identify the primary ID column
         ref_merge_key = next((col for col in id_cols_master if col in ref_df.columns), None)
         if not ref_merge_key:
             print(f"  [Warning] No valid ID column found in {ref_name}. Skipping...")
@@ -418,10 +413,11 @@ def load_and_calculate_polysome_correlation(
             
         target_level = 'Transcript' if ref_merge_key in ['Tid', 'EnsemblTranscriptID'] else 'Gene'
         
-        # Extract, remove version numbers, and aggregate
         ref_clean = ref_df[[ref_merge_key, current_ref_metric]].copy()
         ref_clean = ref_clean.dropna(subset=[current_ref_metric])
         ref_clean['ID_clean'] = ref_clean[ref_merge_key].astype(str).str.split('.').str[0]
+        
+        # Aggregate multiple TIDs targeting same GID in reference
         ref_clean = ref_clean.groupby('ID_clean', as_index=False)[current_ref_metric].mean()
         
         processed_refs[ref_name] = {
@@ -432,7 +428,7 @@ def load_and_calculate_polysome_correlation(
         print(f"  -> Ready Reference [{ref_name}]: ID = {ref_merge_key} ({target_level}), Metric = {current_ref_metric}")
 
     if not processed_refs:
-        raise ValueError("No valid reference datasets processed. Please check your reference data structures.")
+        raise ValueError("No valid reference datasets processed.")
 
     # ==========================================
     # 2. Preload metadata mapping if required
@@ -456,32 +452,16 @@ def load_and_calculate_polysome_correlation(
             raise RuntimeError(f"Failed to load metadata pickle: {e}")
 
     # ==========================================
-    # [NEW] 2.5 Filter reference datasets using target_ids
+    # 3. Phase 1: Load Models & Collect ID Sets
     # ==========================================
-    if target_ids is not None:
-        clean_target_tids = {str(tid).split('.')[0] for tid in target_ids}
-        
-        for ref_name, ref_info in processed_refs.items():
-            ref_level = ref_info['level']
-            ref_df = ref_info['df']
-            
-            if ref_level == 'Gene':
-                # Map target TIDs to GIDs for Gene-level references
-                final_target_ids = {tid2gene[tid] for tid in clean_target_tids if tid in tid2gene}
-            else:
-                final_target_ids = clean_target_tids
-                
-            before_filter = len(ref_df)
-            ref_info['df'] = ref_df[ref_df['ID_clean'].isin(final_target_ids)]
-            print(f"  -> [NEW] Filtered Reference [{ref_name}] targets: {before_filter} -> {len(ref_info['df'])} records.")
-
-    # ==========================================
-    # 3. Iterate through models and align with references
-    # ==========================================
+    # Stores {model_name: {ref_name: merged_df}}
+    processed_models = {}  
+    # Stores {(ref_name, cell_type): [set(ids_model_A), set(ids_model_B), ...]}
+    global_id_sets = {}    
+    
+    print("\n--- Phase 1: Data Loading & Initial Mapping ---")
     for idx, (model_name, file_paths) in enumerate(data_config.items()):
-        print(f"\nProcessing model: {model_name}")
-        
-        # --- Read model data ---
+        print(f"Processing model: {model_name}")
         if isinstance(file_paths, str):
             file_paths = [file_paths]
             
@@ -495,21 +475,19 @@ def load_and_calculate_polysome_correlation(
             continue
         combined_df_raw = pd.concat(model_dfs, ignore_index=True)
         
-        # --- Model metric fallback logic ---
         current_model_metric = model_metric
         if current_model_metric not in combined_df_raw.columns:
             if 'TE' in combined_df_raw.columns:
                 current_model_metric = 'TE'
-                print(f"  [Info] Metric '{model_metric}' not found in {model_name}. Defaulting to 'TE'.")
             else:
                 print(f"  [Warning] Missing metric '{model_metric}' and 'TE' in {model_name}. Skipping...")
                 continue
                 
         if 'Cell_Type' not in combined_df_raw.columns:
-            print(f"  [Warning] Missing 'Cell_Type' column in {model_name}. Skipping...")
             continue
 
-        # --------- Inner Loop: Compare against each reference dataset ---------
+        processed_models[model_name] = {}
+        
         for ref_name, ref_info in processed_refs.items():
             ref_level = ref_info['level']
             ref_metric_name = ref_info['metric']
@@ -517,18 +495,16 @@ def load_and_calculate_polysome_correlation(
             
             combined_df = combined_df_raw.copy()
             
-            # [MODIFIED] Extract specified cell type data for the current reference dataset
+            # Extract target cell type
             target_cell = target_cell_map.get(ref_name)
             if target_cell:
                 combined_df = combined_df[combined_df['Cell_Type'] == target_cell]
                 if combined_df.empty:
-                    print(f"  [Warning] Target cell '{target_cell}' not found in {model_name}. Skipping {ref_name}...")
                     continue
             
             has_tid = [c for c in ['Tid', 'EnsemblTranscriptID', 'TranscriptID'] if c in combined_df.columns]
             has_gid = [c for c in ['Gid', 'EnsemblGeneID', 'GeneID'] if c in combined_df.columns]
 
-            # Determine mapping strategy based on reference level
             if ref_level == 'Gene':
                 if has_gid:
                     combined_df['ID_clean'] = combined_df[has_gid[0]].astype(str).str.split('.').str[0]
@@ -538,36 +514,81 @@ def load_and_calculate_polysome_correlation(
                     combined_df = combined_df.dropna(subset=['ID_clean'])
                 else:
                     continue
-            else: # Transcript level
+            else: 
                 if has_tid:
                     combined_df['ID_clean'] = combined_df[has_tid[0]].astype(str).str.split('.').str[0]
                 else:
                     continue
 
-            # Aggregate model data and merge with current reference dataset
+            # Aggregate Model & Merge with Reference
             combined_df_agg = combined_df.groupby(['ID_clean', 'Cell_Type'], as_index=False)[current_model_metric].mean()
             merged_df = pd.merge(combined_df_agg, ref_clean, on='ID_clean', how='inner')
             
             if merged_df.empty:
                 continue
 
-            # Calculate correlation for each cell line
+            processed_models[model_name][ref_name] = (merged_df, current_model_metric, ref_metric_name)
+            
+            # Record mapped IDs
             for cell_type, group_df in merged_df.groupby('Cell_Type'):
                 group_clean = group_df.dropna(subset=[current_model_metric, ref_metric_name])
-                
-                # Filter 1% and 99% extreme outliers
-                if len(group_clean) > 0:
-                    p01_m = group_clean[current_model_metric].quantile(0.01)
-                    p99_m = group_clean[current_model_metric].quantile(0.99)
-                    p01_p = group_clean[ref_metric_name].quantile(0.01)
-                    p99_p = group_clean[ref_metric_name].quantile(0.99)
-                    
-                    valid_mask = (
-                        (group_clean[current_model_metric] >= p01_m) & (group_clean[current_model_metric] <= p99_m) &
-                        (group_clean[ref_metric_name] >= p01_p) & (group_clean[ref_metric_name] <= p99_p)
-                    )
-                    group_clean = group_clean[valid_mask]
+                key = (ref_name, cell_type)
+                if key not in global_id_sets:
+                    global_id_sets[key] = []
+                global_id_sets[key].append(set(group_clean['ID_clean']))
 
+    # ==========================================
+    # 4. Phase 2: Compute Strict Intersections
+    # ==========================================
+    print("\n--- Phase 2: Intersecting Common IDs across Models ---")
+    intersected_ids_dict = {}
+    expected_model_count = len(processed_models)
+    
+    for key, sets_list in global_id_sets.items():
+        ref_name, cell_type = key
+        if len(sets_list) < expected_model_count:
+            print(f"  [Warning] Dataset '{ref_name}' (Cell: {cell_type}) missing in some models.")
+        
+        # Take the intersection of all sets collected for this (Dataset, Cell) pair
+        common_ids = set.intersection(*sets_list)
+        intersected_ids_dict[key] = common_ids
+        print(f"  -> {ref_name:<20} | {cell_type:<10} | Fair IDs found: {len(common_ids)}")
+
+    # ==========================================
+    # 5. Phase 3: Filter & Calculate Correlations
+    # ==========================================
+    print("\n--- Phase 3: Calculating Fair Correlations ---")
+    for model_name, ref_dict in processed_models.items():
+        print(f"\nEvaluating: {model_name}")
+        
+        for ref_name, (merged_df, current_model_metric, ref_metric_name) in ref_dict.items():
+            for cell_type, group_df in merged_df.groupby('Cell_Type'):
+                
+                valid_ids = intersected_ids_dict.get((ref_name, cell_type), set())
+                group_clean_raw = group_df.dropna(subset=[current_model_metric, ref_metric_name])
+                n_before = len(group_clean_raw)
+                
+                # Apply Strict Intersection Filter
+                group_clean = group_clean_raw[group_clean_raw['ID_clean'].isin(valid_ids)]
+                n_after = len(group_clean)
+                
+                print(f"  -> {ref_name:<15} ({cell_type}) | N Filtered: {n_before:>5} -> {n_after:>5}")
+
+                if n_after < 5:
+                    continue
+
+                # Quantile filtering (if needed, ensure it's applied after intersection)
+                p01_m = group_clean[current_model_metric].quantile(0.01)
+                p99_m = group_clean[current_model_metric].quantile(0.99)
+                p01_p = group_clean[ref_metric_name].quantile(0.01)
+                p99_p = group_clean[ref_metric_name].quantile(0.99)
+                
+                valid_mask = (
+                    (group_clean[current_model_metric] >= p01_m) & (group_clean[current_model_metric] <= p99_m) &
+                    (group_clean[ref_metric_name] >= p01_p) & (group_clean[ref_metric_name] <= p99_p)
+                )
+                group_clean = group_clean[valid_mask]
+                
                 if len(group_clean) < 5:
                     continue
 
@@ -579,153 +600,13 @@ def load_and_calculate_polysome_correlation(
                 else:
                     r_val, p_val = pearsonr(x, y)
                     
-                # Print the number of IDs used for correlation
-                print(f"  -> [{ref_name} | {cell_type}] Tids used for correlation: {len(group_clean)}")
-                    
                 aggregated_data.append({
                     'Dataset': ref_name,           
                     'Cell_type': cell_type,
                     'Model': model_name,
                     'Mean': r_val,
                     'P_value': p_val,
-                    'N': len(group_clean)
+                    'N': len(group_clean) # Logging the exact number of used samples
                 })
 
     return pd.DataFrame(aggregated_data)
-
-
-def plot_polysome_correlation_heatmap(agg_df, out_dir="./", corr_method="Spearman", suffix=""):
-    """
-    绘制相关性热图：
-    - Y 轴：不同模型与 Baseline
-    - X 轴：不同的多聚核糖体数据集
-    - 颜色：模型在给定数据集所有细胞系中的平均相关性。
-    """
-    if agg_df.empty:
-        print("No data to plot.")
-        return
-        
-    os.makedirs(out_dir, exist_ok=True)
-    agg_df = agg_df.copy()
-    
-    # 汇总：计算给定模型在特定数据集下的平均表现
-    heatmap_df = agg_df.groupby(['Model', 'Dataset'], observed=False)['Mean'].mean().reset_index()
-
-    # 设置 Y 轴模型顺序
-    model_order = [
-        "TRACE", "Encoder", "Convolution", 
-        "Optimus-5Prime", "RiboDecode", "RiboNN", 
-        "Raw-dataset", 
-        "CDS length", "5'UTR length", "3'UTR length",
-        "CDS GC%", "CAI", "Kozak score", "uAUG count"
-    ]
-    
-    # 提取实际存在的模型
-    valid_models = [m for m in model_order if m in heatmap_df['Model'].unique()]
-
-    # 将长表转换为宽表 (Pivot)，行是 Model，列是 Dataset
-    pivot_df = heatmap_df.pivot(index='Model', columns='Dataset', values='Mean')
-    
-    # 按照设定的顺序进行排序 (Seaborn 会自然地从上往下绘制)
-    pivot_df = pivot_df.loc[valid_models]
-
-    # 补充完整的 color_mapping
-    color_mapping = {
-        # 深度学习模型 (冷色调 + 灰度渐变)
-        "TRACE": "#2C6B9A", "Encoder": "#555555", "Convolution": "#777777",
-        "Optimus-5Prime": "#999999",
-        "RiboDecode": "#BBBBBB",
-        "RiboNN": "#DDDDDD",
-        "Raw-dataset": "#A0A0A0",
-        
-        # Baseline 特征 (大地色系/暖金渐变)
-        "CDS length": "#AF804F",           
-        "5'UTR length": "#B98C57", 
-        "3'UTR length": "#C3975F", 
-        "CDS GC%": "#CDA367",      
-        "CAI": "#D7AF6F",                  
-        "Kozak score": "#E1BA77",          
-        "uAUG count": "#EBC67F"    
-    }
-    
-    # 提取当前数据包含的颜色列表
-    row_colors = [color_mapping[m] for m in pivot_df.index]
-
-    # 根据数据集的数量动态调整画布宽高
-    num_datasets = len(pivot_df.columns)
-    plot_width = max(5, num_datasets * 0.8 + 2) # 稍微加宽一点适应更大的字体
-    plot_height = len(valid_models) * 0.6 + 2
-
-    # 使用 GridSpec 分割画面：[极窄的Bar区, 宽阔的热图区]
-    fig, (ax_bar, ax_heatmap) = plt.subplots(
-        ncols=2,
-        figsize=(plot_width, plot_height),
-        gridspec_kw={'width_ratios': [0.03, 1], 'wspace': 0.02} 
-    )
-
-    # 1. 绘制左侧的 Color Bar
-    bar_matrix = np.arange(len(valid_models)).reshape(-1, 1)
-    bar_cmap = ListedColormap(row_colors)
-
-    sns.heatmap(
-        bar_matrix,
-        cmap=bar_cmap,
-        cbar=False,           # 不需要图例
-        annot=False,
-        linewidths=1,         # 确保高度方向与右侧热图的网格间隙 100% 对齐
-        linecolor='white', 
-        ax=ax_bar
-    )
-    
-    # 将模型名称（Y轴文本）放置在这个极细的 Color Bar 左侧
-    ax_bar.set_yticks(np.arange(len(valid_models)) + 0.5)
-    # [MODIFIED] 同步放大 Y 轴模型的字体以保持协调
-    ax_bar.set_yticklabels(valid_models, rotation=0, fontsize=14) 
-    ax_bar.set_xticks([])     
-    ax_bar.tick_params(left=False) 
-
-    # 2. 绘制右侧的主热图
-    main_cmap = LinearSegmentedColormap.from_list("blue_white_red", ["#2C6B9A", "#FFFFFF", "#E74C3C"])
-
-    sns.heatmap(
-        pivot_df,
-        cmap=main_cmap,
-        center=0,
-        annot=True,
-        fmt=".2f",
-        annot_kws={"size": 14},
-        linewidths=1, 
-        linecolor='white',
-        # [MODIFIED] 使用 shrink 参数将 Color bar 的高度缩短为 30%
-        cbar_kws={'shrink': 0.3, 'aspect': 8}, 
-        ax=ax_heatmap
-    )
-    
-    # [MODIFIED] 获取刚才画的图例对象，单独设置其 Label 大小，防止字体太小
-    cbar = ax_heatmap.collections[0].colorbar
-    if cbar:
-        cbar.set_label(f'{corr_method} correlation coefficient', size=14)
-        cbar.ax.tick_params(labelsize=12) # 调整图例刻度的字体
-        cbar.set_ticks([-0.5, -0.25, 0, 0.25, 0.5])
-
-    # 隐藏热图的 Y 轴标签（因为已经在左侧 Color Bar 处画了）
-    ax_heatmap.set_yticks([])
-    ax_heatmap.set_ylabel('')
-    ax_heatmap.set_xlabel('')
-    
-    # [MODIFIED] 调整 X 轴标签方向和字体大小 (放大至 14)
-    ax_heatmap.tick_params(axis='x', rotation=45, labelsize=14, bottom=False)
-    
-    # 将 x 轴标签对齐方式修改为右对齐，防止被截断
-    for tick in ax_heatmap.get_xticklabels():
-        tick.set_horizontalalignment('right')
-
-    # ==========================================================
-    # 保存图片
-    # ==========================================================
-    file_suffix = f".{suffix}" if suffix else ""
-    save_path = os.path.join(out_dir, f"polysome_multidataset_heatmap{file_suffix}.pdf")
-    
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Heatmap saved to: {save_path}")
