@@ -89,7 +89,7 @@ def evaluate_region_specificity(
     print(f"\n>>> Analyzing region specificity...")
     
     for i in tqdm(range(len(truth_dataset))):
-        uuid, cell_type_idx, meta_info, seq_emb, count_emb = truth_dataset[i]
+        uuid, species, cell_type, expr_array, meta_info, seq_emb, count_emb = truth_dataset[i]
         uuid_str = str(uuid)
         
         parts = uuid_str.split('-')

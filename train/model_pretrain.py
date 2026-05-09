@@ -467,7 +467,7 @@ class PretrainingTrainer:
         count_raw_emb: torch.Tensor, 
         count_emb_masks: torch.Tensor,
         cds_masks: torch.Tensor,
-        cds_weight_factor: float = 1.5
+        cds_weight_factor: float = 1.2
     ) -> torch.Tensor:
         """
         Calculates the joint loss combining Token-level Micro Loss and Frame-aware Macro Loss.

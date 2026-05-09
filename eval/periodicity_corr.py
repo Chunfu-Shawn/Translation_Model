@@ -167,7 +167,7 @@ def evaluate_periodicity_correlation(
     print(f"Extracting Ground Truth periodicity from Dataset...")
     gt_records = {}
     for i in tqdm(range(len(dataset))):
-        uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb, te_scale = dataset[i]
+        uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb = dataset[i]
         uuid_str = str(uuid)
         parts = uuid_str.split('-')
         if len(parts) < 2: continue
