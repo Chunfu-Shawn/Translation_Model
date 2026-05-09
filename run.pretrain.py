@@ -22,9 +22,13 @@ human_dataset_name = "human_7c_8k_depth0.1_cov0.1_rpm1"
 human_train_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".train.h5")
 human_val_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".valid.h5")
 ## macaque
-# macaque_dataset_name = "macaque_4c_15k_depth0.1_cov0.1_rpm1"
-# macaque_train_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".train.h5")
-# macaque_val_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".valid.h5")
+macaque_dataset_name = "macaque_4c_15k_depth0.1_cov0.1_rpm1"
+macaque_train_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".train.h5")
+macaque_val_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".valid.h5")
+## mouse
+mouse_dataset_name = "mouse_3c_15k_depth0.1_cov0.1_rpm1"
+mouse_train_dataset_path = os.path.join(dataset_dir, mouse_dataset_name + ".train.h5")
+mouse_val_dataset_path = os.path.join(dataset_dir, mouse_dataset_name + ".valid.h5")
 
 # create model
 base_model = TranslationBaseModel.from_config(
@@ -54,9 +58,9 @@ base_model = DDP(
 epoch_num = 40
 trainer = PretrainingTrainer(
     model = base_model,
-    dataset_paths = [human_train_dataset_path,],
-    val_dataset_paths = [human_val_dataset_path],
-    dataset_name = "human_7c_8k_depth0.1_cov0.1_rpm1",
+    dataset_paths = [human_train_dataset_path, macaque_train_dataset_path, mouse_train_dataset_path],
+    val_dataset_paths = [human_val_dataset_path, macaque_val_dataset_path, mouse_val_dataset_path],
+    dataset_name = "hm_mc_ms_7c_8k_depth0.1_cov0.1_rpm1",
     batch_size = 22,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
