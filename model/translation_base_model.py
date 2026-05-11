@@ -650,9 +650,9 @@ class TranslationBaseModel(nn.Module):
         self,
         seq_batch: Union[torch.Tensor, np.ndarray, list, tuple],
         count_batch: Union[torch.Tensor, np.ndarray, list, tuple] = None,
+        species: Any = None,
         cell_type: Any = None,
         expr_vector: Any = None,
-        species: Any = None,
         src_mask: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         head_names: Optional[List[str]] = None,
         head_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -674,11 +674,11 @@ class TranslationBaseModel(nn.Module):
         seq_batch, count_batch, src_mask, was_squeezed = self._ensure_batch_dim_input(seq_batch, count_batch, src_mask)
         bs = seq_batch.shape[0]
 
-        # process expr_vector and cell_type
-        final_expr = self._resolve_expr_vector(cell_type, expr_vector, bs)
-
         # resolve species
         species_idx = self._normalize_species(species, bs)
+
+        # process expr_vector and cell_type
+        final_expr = self._resolve_expr_vector(cell_type, expr_vector, bs)
 
         # 3) move tensor inputs to model device 
         if move_inputs_to_device:

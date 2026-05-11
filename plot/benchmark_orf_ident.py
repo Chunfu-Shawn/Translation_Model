@@ -328,15 +328,16 @@ def plot_tradeoff_benchmark(
     print(f"✅ Benchmark Complete! Trade-off plot saved to: {save_path}")
 
 
-
 def plot_multi_model_top_k_precision(
         manifest: list, 
         out_dir: str = "./results/benchmark", 
+        min_k: Optional[int] = None,
         max_k: Optional[int] = None
 ):
     """
     绘制多模型 Top-K Precision 对比折线图。
     支持输入已计算好的 Precision@K 表，或统一评估表。
+    支持自定义 X 轴展示范围 (min_k, max_k)。
     """
     print("\nCalculating and aggregating Precision@K for multiple models...")
     os.makedirs(out_dir, exist_ok=True)
@@ -384,23 +385,27 @@ def plot_multi_model_top_k_precision(
         
     # 合并所有模型数据
     plot_df = pd.concat(all_pk_data, ignore_index=True)
-    
-    # 限制 X 轴范围 (Zoom-in)
-    if max_k is not None:
-        plot_df = plot_df[plot_df['K'] <= max_k]
         
     # =================================================================
-    # [NEW] 智能按模型平滑 (Smart Smoothing per Model)
+    # 智能按模型平滑 (Smart Smoothing per Model)
+    # [注意] 必须在截断范围之前做平滑，否则起点的滑动窗口会缺失历史数据
     # =================================================================
-    smoothing_window = 50  # 你可以根据需要调大或调小这个窗口
+    smoothing_window = 50  
     
     def apply_smoothing(group):
-        # 使用 min_periods=1 保证最开头的几个点不会变成 NaN
         group['Precision_Smooth'] = group['Precision'].rolling(window=smoothing_window, min_periods=1).mean()
         return group
         
     print(f"Applying rolling average smoothing (window={smoothing_window})...")
     plot_df = plot_df.groupby('Model', group_keys=False).apply(apply_smoothing)
+
+    # =================================================================
+    # [MODIFIED] 限制 X 轴范围 (Zoom-in) - 移至平滑之后
+    # =================================================================
+    if min_k is not None:
+        plot_df = plot_df[plot_df['K'] >= min_k]
+    if max_k is not None:
+        plot_df = plot_df[plot_df['K'] <= max_k]
 
     # =================================================================
     # 智能按模型降采样 (Smart Downsampling per Model)
@@ -425,63 +430,64 @@ def plot_multi_model_top_k_precision(
     plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=model_order, ordered=True)
 
     # =================================================================
-    # [MODIFIED] 颜色与线型分配引擎 (Color & Linetype Mapping)
+    # 颜色与线型分配引擎 (Color & Linetype Mapping)
     # =================================================================
     color_mapping = {}
-    linetype_mapping = {}  # [NEW] 存储每个模型的线型
+    linetype_mapping = {} 
     
     gray_idx, brown_idx = 0, 0
     grays = ["#555555", "#777777", "#999999", "#BBBBBB", "#DDDDDD", "#E5E5E5"]
     browns = ["#AF804F", "#B98C57", "#C3975F", "#CDA367", "#D7AF6F", "#E1BA77", "#EBC67F"]
     
     for m_name in plot_df['Model'].cat.categories:
-        # 1. 我们的模型
         if "TRACE" in m_name:
             color_mapping[m_name] = "#2C6B9A"
-            linetype_mapping[m_name] = "solid"    # [NEW] 独享实线
-            
-        # 2. Baseline 系列
+            linetype_mapping[m_name] = "solid"
         elif "ORF-structure" in m_name or "Baseline" in m_name:
             color_mapping[m_name] = browns[brown_idx % len(browns)]
-            linetype_mapping[m_name] = "dashed"   # [NEW] 降级虚线
+            linetype_mapping[m_name] = "dashed" 
             brown_idx += 1
-            
-        # 3. 其他竞争模型
         else:
             color_mapping[m_name] = grays[gray_idx % len(grays)]
-            linetype_mapping[m_name] = "dashed"   # [NEW] 降级虚线
+            linetype_mapping[m_name] = "dashed"  
             gray_idx += 1
             
-    print("Applied Color & Linetype Mapping for Precision@K:")
-    for k in color_mapping.keys():
-        print(f"  {k}: {color_mapping[k]} | {linetype_mapping[k]}")
-    # =================================================================
-    
     print("Generating Multi-Model Precision@K line chart...")
     
+    # =================================================================
+    # [MODIFIED] 动态生成图表标题和文件名
+    # =================================================================
+    if min_k is not None and max_k is not None:
+        title_suffix = f"(K: {min_k} to {max_k})"
+        file_suffix = f"{min_k}_to_{max_k}"
+    elif min_k is not None:
+        title_suffix = f"(K >= {min_k})"
+        file_suffix = f"{min_k}_to_All"
+    elif max_k is not None:
+        title_suffix = f"(Top {max_k})"
+        file_suffix = f"1_to_{max_k}"
+    else:
+        title_suffix = "(All Predictions)"
+        file_suffix = "All"
+
     # =================================================================
     # 绘图逻辑
     # =================================================================
     p = (
         ggplot(plot_df, aes(x='K', y='Precision_Smooth', color='Model'))
-        # [MODIFIED] 将线型映射加入到 geom_line 中
         + geom_line(aes(linetype='Model'), size=1.5, alpha=0.85)
-        
         + scale_color_manual(values=color_mapping)
-        # [NEW] 传入线型字典，并隐藏线型的图例（防止图例臃肿）
         + scale_linetype_manual(values=linetype_mapping, guide=None)
-        
         + scale_y_continuous(limits=(0, 1.05))
-        + scale_x_log10() # 使用对数坐标看头部趋势更清晰
+        + scale_x_log10() 
         + theme_classic()
         + labs(
-            title=f"Precision@K Benchmark {'(Top ' + str(max_k) + ')' if max_k else '(All Predictions)'}",
+            title=f"Precision@K Benchmark {title_suffix}",
             x="Top K Predicted ORFs (Log Scale, Ranked by Conf. Score)",
             y="Precision (Proportion of True Positives)"
         )
         + theme(
-            figure_size=(8, 5),
-            # panel_border=element_rect(color="black", size=1.5),
+            figure_size=(7, 5),
             axis_title=element_text(size=12, face="bold"),
             axis_text=element_text(size=10),
             legend_position="right",
@@ -490,7 +496,7 @@ def plot_multi_model_top_k_precision(
         )
     )
     
-    filename = f"Benchmark_TopK_Precision_Curve_{'All' if max_k is None else max_k}.pdf"
+    filename = f"Benchmark_TopK_Precision_Curve_{file_suffix}.pdf"
     save_path = os.path.join(out_dir, filename)
     p.save(save_path, dpi=300, verbose=False)
     

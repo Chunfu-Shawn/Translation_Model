@@ -131,7 +131,7 @@ def save_count_predictions(
                     seq_batch=b_seq, 
                     count_batch=masked_batch,
                     species=b_species,
-                    cell_type=b_cell_types, 
+                    expr_vector=b_expr_vectors, 
                     src_mask=src_mask, 
                     head_names=["count"]
                     )

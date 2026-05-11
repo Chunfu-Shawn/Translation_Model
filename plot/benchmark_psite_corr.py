@@ -287,8 +287,8 @@ def plot_length_robustness_line_chart(
     # --- 1. 动态设定分箱策略 (Binning) ---
     if bins is None or labels is None:
         if x_value == "Full_Length":
-            bins = [0, 500, 1000, 2000, 3000, 4000, 6000, 8000, 10000, np.inf]
-            labels = ['<500', '500-1k', '1k-2k', '2k-3k', '3k-4k', '4k-6k', '6k-8k', '8k-10k', '>10k']
+            bins = [0, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, np.inf]
+            labels = ['<500', '500-1k', '1k-2k', '2k-3k', '3k-4k', '4k-5k', '4k-6k', '6k-8k', '>8k']
         else:
             bins = [0, 50, 100, 200, 500, np.inf]
             labels = ['<50', '50-100', '100-200', '200-500', '>500']
@@ -328,8 +328,8 @@ def plot_length_robustness_line_chart(
     # Matplotlib 双子图魔法
     # =================================================================
     # 创建上下两张图，比例 1:3，共享 X 轴
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 5.5), 
-                                   gridspec_kw={'height_ratios': [1, 3]}, sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 5), 
+                                   gridspec_kw={'height_ratios': [1, 4]}, sharex=True)
     
     # 让两张图贴紧
     plt.subplots_adjust(hspace=0.08) 

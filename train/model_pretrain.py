@@ -478,7 +478,6 @@ class PretrainingTrainer:
         
         # ---------------------------------------------------------
         # 动态生成 CDS 权重矩阵
-        # CDS 区域权重为 1.5，UTR 区域为 1.0
         # ---------------------------------------------------------
         token_weights = torch.where(cds_masks, cds_weight_factor, 1.0).to(pred.device)
         
