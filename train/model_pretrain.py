@@ -462,13 +462,13 @@ class PretrainingTrainer:
         )
     
     def count_task_criterion(
-        self,
-        result: Dict[str, torch.Tensor],
-        count_raw_emb: torch.Tensor, 
-        count_emb_masks: torch.Tensor,
-        cds_masks: torch.Tensor,
-        cds_weight_factor: float = 1.2
-    ) -> torch.Tensor:
+            self,
+            result: Dict[str, torch.Tensor],
+            count_raw_emb: torch.Tensor, 
+            count_emb_masks: torch.Tensor,
+            cds_masks: torch.Tensor,
+            cds_weight_factor: float = 1.2
+        ) -> torch.Tensor:  
         """
         Calculates the joint loss combining Token-level Micro Loss and Frame-aware Macro Loss.
         Operating purely in linear scale (No Log/ReLU transformation).
@@ -488,12 +488,13 @@ class PretrainingTrainer:
         # ==========================================
         # 1. Micro Loss (Token-level Shape Constraint)
         # ==========================================
+        # Assume self.dynamics_criterion is defined in your class (e.g., SmoothL1Loss)
         if pred.shape[2] == 1:
-            loss_all = self.dynamcis_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) 
+            loss_all = self.dynamics_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) 
             # 乘上 mask 并叠加上 CDS 专属权重
             loss_all = loss_all * count_emb_masks.float() * token_weights
         else:
-            loss_all = self.dynamcis_criterion(pred, count_raw_emb) 
+            loss_all = self.dynamics_criterion(pred, count_raw_emb) 
             loss_all = loss_all * count_emb_masks.unsqueeze(-1).float() * token_weights.unsqueeze(-1)
             
         if loss_all.dim() == 3:
@@ -533,8 +534,12 @@ class PretrainingTrainer:
             
         frame_mse_losses = []
         
+        # 我们需要把 Frame 0 的均值单独保存下来，用于稍后的 Ranking Loss
+        f0_p_mean = None
+        f0_t_mean = None
+        
         # Iterate through the 3 reading frames to compute independent Linear-MSE losses
-        for f_mask in frame_masks:
+        for i, f_mask in enumerate(frame_masks):
             # Mask intersection
             target_eval_mask = count_emb_masks.to(device) & f_mask
             
@@ -547,22 +552,57 @@ class PretrainingTrainer:
             p_mean = p_sum / safe_t_lengths
             t_mean = t_sum / safe_t_lengths
             
-            # Compute MSE loss
+            # 记录 Frame 0 的均值
+            if i == 0:
+                f0_p_mean = p_mean
+                f0_t_mean = t_mean
+            
+            # Compute MSE loss (Assume self.te_criterion is nn.MSELoss)
             f_loss = self.te_criterion(p_mean, t_mean)
             frame_mse_losses.append(f_loss)
 
-        # Average the loss across all 3 frames
+        # Average the MSE loss across all 3 frames
         per_sample_macro_loss = (frame_mse_losses[0] + frame_mse_losses[1] + frame_mse_losses[2]) / 3.0
+        
+        # ==========================================
+        # 3. Pairwise Ranking Loss (仅针对 Frame 0 的 TE)
+        # 强迫模型学会转录本之间正确的强弱排序
+        # ==========================================
+        ranking_loss = torch.tensor(0.0, device=device)
+        
+        if B > 1:
+            # 设定排序的容忍度 (Margin)。只有当真实的 TE 差异大于这个值时，我们才强制要求模型进行排序。
+            # 这可以防止模型在极微小的噪点差异上浪费梯度。
+            margin = 0.05
+            
+            # 使用 Broadcasting 进行两两作差
+            # (B, 1) - (1, B) -> (B, B) 矩阵，位置 [i, j] 的值代表 样本 i 减去 样本 j 的差值
+            p_diff = f0_p_mean.unsqueeze(1) - f0_p_mean.unsqueeze(0)
+            t_diff = f0_t_mean.unsqueeze(1) - f0_t_mean.unsqueeze(0)
+            
+            # 找出所有真实差异大于 margin 的有效配对
+            # valid_mask 也是一个 (B, B) 的布尔矩阵
+            valid_mask = t_diff > margin
+            
+            if valid_mask.any():
+                # 计算预测的 Ranking 误差
+                # 如果真实 t_diff > margin，我们希望预测的 p_diff 至少大于 0 (最好也能达到 margin)
+                # 使用 relu(margin - p_diff)，如果 p_diff > margin，则没有 loss；否则产生惩罚。
+                # 只在有效的 valid_mask 位置上计算均值
+                rank_err = F.relu(margin - p_diff)
+                ranking_loss = rank_err[valid_mask].mean()
 
         # ==========================================
-        # 3. Fusion
+        # 4. Fusion
         # ==========================================
-        alpha = 2
-        # Combine Micro local-shape constraint and Macro global-scale constraint
+        alpha = 2.0  # Macro MSE Loss 的权重
+        beta = 1.0   # Pairwise Ranking Loss 的权重
+        
+        # 结合 Micro local-shape, Macro global-scale, 以及 Batch Ranking
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         
-        # Return the batch mean
-        loss = total_sample_loss.mean()
+        # 最终的 batch loss
+        loss = total_sample_loss.mean() + beta * ranking_loss
 
         return loss
 

@@ -271,7 +271,7 @@ def plot_te_correlation_performance(
     model_order = [
         "TRACE", "Encoder", "Convolution", 
         "Optimus-5Prime", "RiboDecode", "RiboNN",
-        "Raw-dataset", "Transcript-Mean", 
+        "Raw-dataset",  "Mean density",  "TE scale", "Transcript-Mean", 
         "Inverse CDS length", "Inverse 5'UTR length", "Inverse 3'UTR length",
         "Inverse CDS GC%", "CAI", "Kozak score", "Inverse uAUG count"
     ]

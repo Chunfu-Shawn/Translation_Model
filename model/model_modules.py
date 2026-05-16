@@ -84,7 +84,7 @@ class AddAdaZeroLayerNorm(nn.Module):
     """
     Adaptive Layer Normalization with Gating (adaLN-Zero) with Information Bottleneck.
     """
-    def __init__(self, d_model, p_drop, adaptive_dim=16, gamma_scale=0.2):
+    def __init__(self, d_model, p_drop, adaptive_dim=16, gamma_scale=1):
         super().__init__()
         self.d_model = d_model
         self.gamma_scale = gamma_scale
@@ -104,7 +104,7 @@ class AddAdaZeroLayerNorm(nn.Module):
         style = self.adaLN_modulation(compact_style)        
         gamma, beta, alpha = style.chunk(3, dim=-1)         
         
-        gamma = torch.tanh(gamma) # * self.gamma_scale
+        gamma = torch.tanh(gamma) * self.gamma_scale
         
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)

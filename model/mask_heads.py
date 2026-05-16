@@ -53,7 +53,7 @@ class PsiteDensityHead(nn.Module):
             nn.GELU(),
             nn.Dropout(self.p_drop),
             nn.Linear(self.d_pred_h, self.d_count),
-            nn.Softplus(beta=10) # nn.ReLU()
+            nn.ReLU() # nn.Softplus(beta=10)
         )
 
         if init_xavier:
@@ -65,10 +65,10 @@ class PsiteDensityHead(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
-                    # if m.out_features == self.d_count: # 最后一层
-                    #     nn.init.constant_(m.bias, 0.1) # 初始化为微小正数防死
-                    # else:
-                    nn.init.zeros_(m.bias)
+                    if m.out_features == self.d_count: # 最后一层
+                        nn.init.constant_(m.bias, 0.1) # 初始化为微小正数防死
+                    else:
+                        nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
                 if m.weight is not None:
                     nn.init.ones_(m.weight)

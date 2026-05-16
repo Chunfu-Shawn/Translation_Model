@@ -118,10 +118,11 @@ def calculate_kozak_score(full_seq, cds_start):
 # 3. 核心提取引擎
 # ==========================================
 
-def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/baselines"):
+# [MODIFIED] 在参数中加入了 unlog_data，与你的 Analyzer 保持一致
+def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/baselines", unlog_data=True):
     """
-    遍历 Dataset，计算 7 大基线特征：
-    CDS/5'UTR/3'UTR Length, Codon Freq Sum, uAUG Count, Kozak Score, CDS GC%
+    遍历 Dataset，计算大基线特征，并提取 meta_info 中的 te_scale 以及真实的 mORF_Mean_Density：
+    CDS/5'UTR/3'UTR Length, Codon Freq Sum, uAUG Count, Kozak Score, CDS GC%, te_scale, mORF_Mean_Density
     """
     os.makedirs(out_dir, exist_ok=True)
     print(f"Loading sequence dictionary from {seq_pkl_path}...")
@@ -130,7 +131,7 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
         
     results = []
     
-    print(f"Extracting 7 baseline features from Dataset (N={len(dataset)})...")
+    print(f"Extracting baseline features from Dataset (N={len(dataset)})...")
     for i in tqdm(range(len(dataset))):
         uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb = dataset[i]
         uuid_str = str(uuid)
@@ -164,16 +165,42 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
         cds_len = len(cds_seq)
         if cds_len <= 0: continue
             
-        # 2. 计算各项特征
+        # 2. 计算各项序列特征
         utr5_len = len(utr5_seq)
         utr3_len = len(utr3_seq)
         
-        # [MODIFIED] 直接对频率相加
         codon_freq_sum = calculate_codon_freq_sum(cds_seq)
-        
         cds_gc = calculate_gc_content(cds_seq)
         kozak_score = calculate_kozak_score(full_seq, m_start) 
         uaug_count = utr5_seq.replace('U', 'T').count('ATG')
+        
+        te_scale_val = meta_info.get("te_scale", np.nan)
+        if te_scale_val is not None and not pd.isna(te_scale_val):
+            te_scale_val = float(te_scale_val)
+
+        # ==========================================
+        # [NEW] 从 count_emb 提取真实的 mORF_Mean_Density
+        # ==========================================
+        if isinstance(count_emb, torch.Tensor):
+            density = count_emb.detach().cpu().numpy()
+        else:
+            density = count_emb
+
+        # 还原 Log (兼容 expm1 训练数据)
+        if unlog_data:
+            density = np.expm1(density.astype(np.float32))
+        
+        # 维度压缩兼容性处理 (L, 10) -> (L,) 或 (L, 1) -> (L,)
+        if len(density.shape) > 1 and density.shape[1] > 1:
+            density_profile = np.sum(density, axis=1)
+        elif len(density.shape) > 1 and density.shape[1] == 1:
+            density_profile = density.flatten()
+        else:
+            density_profile = density
+            
+        # 计算该样本在其真实环境下的翻译效率
+        morf_mean_density = calculate_morf_mean_signal(density_profile, m_start, m_end)
+
         
         results.append({
             'Tid': tid,
@@ -189,7 +216,9 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
             "Inverse_CDS_GC_Content": 1 - cds_gc,
             'Kozak_Score': kozak_score,
             'uAUG_Count': uaug_count,
-            'Inverse_uAUG_Count': 10/(uaug_count + 1)
+            'Inverse_uAUG_Count': 10/(uaug_count + 1),
+            'te_scale': te_scale_val,
+            'mORF_Mean_Density': morf_mean_density
         })
 
     df_all = pd.DataFrame(results)
@@ -213,13 +242,17 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
         ('Inverse_CDS_GC_Content', 'baseline_inv_cds_gc.csv'),
         ('Kozak_Score', 'baseline_kozak_score.csv'),
         ('uAUG_Count', 'baseline_uaug_count.csv'),
-        ('Inverse_uAUG_Count', 'baseline_inv_uaug_count.csv')
+        ('Inverse_uAUG_Count', 'baseline_inv_uaug_count.csv'),
+        ('te_scale', 'baseline_te_scale.csv'),
+        ('mORF_Mean_Density', 'baseline_morf_mean_density.csv')  # [NEW] 添加密度导出配置
     ]
     
     print("\n>>> Exporting Baseline CSVs:")
     for col_name, file_name in metrics_to_export:
         df_sub = df_all[['Tid', 'Cell_Type', col_name]].copy()
         df_sub = df_sub.dropna(subset=[col_name])
+        
+        # 将所有的评估指标列都统一重命名为 'TE'，方便无缝送入你后续的相关性代码
         df_sub.rename(columns={col_name: 'TE'}, inplace=True)
         
         save_path = os.path.join(out_dir, file_name)
