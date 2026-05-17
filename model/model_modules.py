@@ -104,7 +104,7 @@ class AddAdaZeroLayerNorm(nn.Module):
         style = self.adaLN_modulation(compact_style)        
         gamma, beta, alpha = style.chunk(3, dim=-1)         
         
-        gamma = torch.tanh(gamma) * self.gamma_scale
+        # gamma = torch.tanh(gamma) * self.gamma_scale
         
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)

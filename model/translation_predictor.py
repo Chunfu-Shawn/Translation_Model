@@ -4,7 +4,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
-from typing import Dict, Optional
+# =================================================================
+# [MODIFIED] 引入 List 和 Union 以支持多种类型输入
+# =================================================================
+from typing import Dict, Optional, List, Union
 from tqdm import tqdm
 
 from eval.save_prediction_results import _prepare_prediction_dataloader
@@ -13,31 +16,50 @@ from utils import unwrap_model, clean_up_memory
 # =================================================================
 # 工具函数: Fasta 解析
 # =================================================================
-def read_fasta(file_path: str) -> Dict[str, str]:
-    """读取 Fasta 文件并返回 {tid: sequence} 字典"""
+def read_fasta(file_paths: Union[str, List[str]]) -> Dict[str, str]:
+    """读取单个或多个 Fasta 文件并返回合并后的 {tid: sequence} 字典"""
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+        
     seq_dict = {}
-    curr_tid = ""
-    curr_seq = []
-    with open(file_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith('>'):
-                if curr_tid:
-                    seq_dict[curr_tid] = "".join(curr_seq)
-                # 提取 > 后面的 ID，通常以空格分隔取第一部分
-                curr_tid = line[1:].split()[0]
-                curr_seq = []
-            else:
-                curr_seq.append(line.upper())
-        if curr_tid:
-            seq_dict[curr_tid] = "".join(curr_seq)
-    print(f"Loaded {len(seq_dict)} sequences from {file_path}")
+    total_files = len(file_paths)
+    
+    for file_path in file_paths:
+        if not os.path.exists(file_path):
+            print(f"[Warning] Fasta file not found: {file_path}. Skipping...")
+            continue
+            
+        print(f"Reading Fasta File: {file_path}")
+        curr_tid = ""
+        curr_seq = []
+        file_seq_count = 0
+        
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('>'):
+                    if curr_tid:
+                        seq_dict[curr_tid] = "".join(curr_seq)
+                        file_seq_count += 1
+                    # 提取 > 后面的 ID，通常以空格分隔取第一部分
+                    curr_tid = line[1:].split()[0]
+                    curr_seq = []
+                else:
+                    curr_seq.append(line.upper())
+                    
+            if curr_tid:
+                seq_dict[curr_tid] = "".join(curr_seq)
+                file_seq_count += 1
+                
+        print(f"  -> Loaded {file_seq_count} sequences from this file.")
+        
+    print(f"✅ Successfully loaded a total of {len(seq_dict)} unique sequences from {total_files} file(s).")
     return seq_dict
 
 # =================================================================
-# 零样本推理 Dataset
+# 零样本推理 Dataset (保持不变)
 # =================================================================
 class DeNovoSequenceDataset(Dataset):
     """
@@ -76,8 +98,8 @@ class DeNovoSequenceDataset(Dataset):
             
             # 清理 ID，防止带版本号或复合格式影响后续映射
             tid_clean = str(tid).split('|')[0]
-            if tid_clean.startswith('ENS') and '.' in tid_clean:
-                tid_clean = tid_clean.split('.')[0]
+            # if tid_clean.startswith('ENS') and '.' in tid_clean:
+            #     tid_clean = tid_clean.split('.')[0]
                 
             uuid = f"{tid_clean}-{self.species}-{self.cell_type}-Prediction"
             self.uuids.append(uuid)
@@ -123,12 +145,13 @@ def collate_fn_denovo(batch):
 class TranslationProfilePredictor:
     def __init__(self, 
                  model: torch.nn.Module, 
-                 fasta_file: str):
+                 fasta_files: Union[str, List[str]]):
         self.model = model
-        self.fasta_file = fasta_file
+        self.fasta_files = fasta_files
 
-        print(f"\nReading Fasta File: {self.fasta_file}")
-        self.seq_dict = read_fasta(self.fasta_file)
+        print(f"\nInitializing Fasta parsing pipeline...")
+        # 传入单一字符串或列表都可以被正确解析和合并
+        self.seq_dict = read_fasta(self.fasta_files)
 
     def run(
             self,
@@ -152,7 +175,7 @@ class TranslationProfilePredictor:
         pred_pkl_path = os.path.join(out_dir, f"predictions_count.{self.model.model_name}.{suffix}.pkl")
 
         # ========================================================
-        # [NEW] 目标转录本过滤逻辑
+        # 目标转录本过滤逻辑
         # ========================================================
         if target_tids is not None:
             target_set = set(target_tids)
