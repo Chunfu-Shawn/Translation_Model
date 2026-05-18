@@ -535,7 +535,7 @@ class PretrainingTrainer:
         frame_mse_losses = []
         
         # Iterate through the 3 reading frames to compute independent Linear-MSE losses
-        for i, f_mask in enumerate(frame_masks):
+        for _, f_mask in enumerate(frame_masks):
             # Mask intersection
             target_eval_mask = count_emb_masks.to(device) & f_mask
             
@@ -553,14 +553,17 @@ class PretrainingTrainer:
             frame_mse_losses.append(f_loss)
 
         # Average the MSE loss across all 3 frames
-        per_sample_macro_loss = (frame_mse_losses[0] + frame_mse_losses[1] + frame_mse_losses[2]) / 3.0
+        w0 = 2.0
+        w1 = 1.0
+        w2 = 1.0
+        per_sample_macro_loss = (w0 * frame_mse_losses[0] + w1 * frame_mse_losses[1] + w2 * frame_mse_losses[2]) / (w0 + w1 + w2)
 
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = 4.0  # Macro MSE Loss 的权重
+        alpha = 6.0  # Macro MSE Loss 的权重
         
-        # 结合 Micro local-shape, Macro global-scale, 以及 Batch Ranking
+        # 结合 Micro local-shape 与 Macro global-scale
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         
         # 最终的 batch loss
