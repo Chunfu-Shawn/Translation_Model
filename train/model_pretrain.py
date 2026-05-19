@@ -561,7 +561,7 @@ class PretrainingTrainer:
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = 6.0  # Macro MSE Loss 的权重
+        alpha = 4.0  # Macro MSE Loss 的权重
         
         # 结合 Micro local-shape 与 Macro global-scale
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
