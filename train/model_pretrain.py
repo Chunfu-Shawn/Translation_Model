@@ -545,8 +545,8 @@ class PretrainingTrainer:
             t_lengths = target_eval_mask.sum(dim=1).float()
             safe_t_lengths = torch.clamp(t_lengths, min=1.0)
             
-            p_mean = np.log(np.expm1(p_sum / safe_t_lengths)*3)
-            t_mean = np.log(np.expm1(t_sum / safe_t_lengths)*3)
+            p_mean = p_sum / safe_t_lengths
+            t_mean = t_sum / safe_t_lengths
             
             # Compute MSE loss (Assume self.te_criterion is nn.MSELoss)
             f_loss = self.te_criterion(p_mean, t_mean)
@@ -558,7 +558,7 @@ class PretrainingTrainer:
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = 0.5  # Macro MSE Loss 的权重
+        alpha = 4.0  # Macro MSE Loss 的权重
         
         # 结合 Micro local-shape 与 Macro global-scale
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
