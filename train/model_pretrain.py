@@ -553,7 +553,12 @@ class PretrainingTrainer:
             frame_mse_losses.append(f_loss)
 
         # Average the MSE loss across all 3 frames
-        per_sample_macro_loss = (frame_mse_losses[0] + frame_mse_losses[1] + frame_mse_losses[2]) / 3
+        w0 = 2.0
+        w1 = 1.0
+        w2 = 1.0
+        per_sample_macro_loss = (w0 * frame_mse_losses[0] + w1 * frame_mse_losses[1] + w2 * frame_mse_losses[2]) / (w0 + w1 + w2)
+
+        # per_sample_macro_loss = (frame_mse_losses[0] + frame_mse_losses[1] + frame_mse_losses[2]) / 3
 
         # ==========================================
         # 3. Fusion
