@@ -55,13 +55,13 @@ base_model = DDP(
 )
 
 # trainer
-epoch_num = 40
+epoch_num = 50
 trainer = PretrainingTrainer(
     model = base_model,
     dataset_paths = [human_train_dataset_path], # [human_train_dataset_path, macaque_train_dataset_path, mouse_train_dataset_path],
     val_dataset_paths = [human_val_dataset_path], #[human_val_dataset_path, macaque_val_dataset_path, mouse_val_dataset_path],
     dataset_name = "human_7c_8k_depth0.1_cov0.1_rpm1",
-    batch_size = 29,
+    batch_size = 45,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
     world_size = world_size,
@@ -70,7 +70,8 @@ trainer = PretrainingTrainer(
     save_every = 1,
     epoch_num = epoch_num,
     mask_value = 0,
-    mask_perc = {"count": (0.4, 2.0), "species": 0.15, "cell": 0.15},
+    mask_perc = {"count": (0.4, 1.5), "species": 0.15, "cell": 0.15},
+    alpha_limit = (0.2, 4.0),
     expr_noise_std = 0.1,
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,

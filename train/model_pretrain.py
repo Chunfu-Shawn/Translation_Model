@@ -76,6 +76,7 @@ class PretrainingTrainer:
         epoch_num: int = 100,
         patience: int = 8,
         mask_perc: dict = {"count": 0.3, "species": 0.15, "cell": 0.15},
+        alpha_limit: Tuple[float, float] = (0.2, 4.0),
         expr_noise_std: float = 0.1, # Standard deviation of Gaussian noise to inject (10% of Z-score variance)
         learning_rate: float = 1e-5,
         lr_warmup_perc: float = 0.2,
@@ -112,6 +113,8 @@ class PretrainingTrainer:
         self.mask_perc = mask_perc
         self.current_mask_range = self.mask_perc.get("count", (0, 0.2))
         self.balance_classes = balance_classes
+        self.alpha_limit = alpha_limit
+        self.current_alpha = 4.0
 
         # Build dataset and sampler dynamically
         self.dataset, self.sampler = self._build_dataset_and_sampler(dataset_paths, is_train=True)
@@ -563,10 +566,9 @@ class PretrainingTrainer:
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = 4.0  # Macro MSE Loss 的权重
         
         # 结合 Micro local-shape 与 Macro global-scale
-        total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
+        total_sample_loss = per_sample_micro_loss + self.current_alpha * per_sample_macro_loss
         
         # 最终的 batch loss
         loss = total_sample_loss.mean()
@@ -750,6 +752,8 @@ class PretrainingTrainer:
         saves checkpoints and logs losses.
         """
         start_epoch = int(self.start_epoch)
+        min_alpha = min(self.alpha_limit)
+        max_alpha = max(self.alpha_limit)
         for epoch in range(start_epoch, self.epoch_num):
             if self.rank == 0:
                 print(f"[Trainer] === Starting epoch {epoch+1}/{self.epoch_num} ===")
@@ -762,8 +766,17 @@ class PretrainingTrainer:
                 total_epoch = math.floor(self.epoch_num * self.lr_warmup_perc)
                 current_mask_range = get_dynamic_mask_ratio(epoch, total_epoch, start, end)
                 self.current_mask_range = current_mask_range
+
+            # update alpha
+            warmup_epochs = math.floor(self.epoch_num * 0.3) # 前 30% epoch 用于预热
+            if epoch < warmup_epochs:
+                progress = epoch / max(1, warmup_epochs)
+                self.current_alpha = min_alpha + progress * (max_alpha - min_alpha)
+            else:
+                self.current_alpha = max_alpha
+
             if self.rank == 0:
-                print(f"[Trainer] === Epoch {epoch+1} Curriculum: Mask Ratio Range set to {self.current_mask_range}")
+                print(f"[Trainer] === Epoch {epoch+1} Curriculum: Mask Range {self.current_mask_range}, TE Alpha: {self.current_alpha:.3f}")
 
             train_loss, train_batch_loss = self.train_epoch(epoch)
             val_loss, val_batch_loss = self.eval_epoch(epoch)
@@ -772,7 +785,7 @@ class PretrainingTrainer:
             val_loss_float = float(val_loss.item())
             is_best = val_loss_float < self.best_val_loss
             
-            # --- [NEW] Early Stopping Update Logic ---
+            # --- Early Stopping Update Logic ---
             if is_best:
                 self.best_val_loss = val_loss_float
                 self.patience_counter = 0 
