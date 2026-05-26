@@ -470,7 +470,8 @@ class PretrainingTrainer:
             count_raw_emb: torch.Tensor, 
             count_emb_masks: torch.Tensor,
             cds_masks: torch.Tensor,
-            cds_weight_factor: float = 1.2
+            cds_weight_factor: float = 1.2,
+            is_eval: bool = False
         ) -> torch.Tensor:  
         """
         Calculates the joint loss combining Token-level Micro Loss and Frame-aware Macro Loss.
@@ -566,9 +567,9 @@ class PretrainingTrainer:
         # ==========================================
         # 3. Fusion
         # ==========================================
-        
+        alpha = max(self.alpha_limit) if is_eval else self.current_alpha
         # 结合 Micro local-shape 与 Macro global-scale
-        total_sample_loss = per_sample_micro_loss + self.current_alpha * per_sample_macro_loss
+        total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         
         # 最终的 batch loss
         loss = total_sample_loss.mean()
@@ -634,7 +635,7 @@ class PretrainingTrainer:
                     head_names=["count"]
                 )
                 
-                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks)
+                loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks, is_eval=False)
                 acc_loss = loss / self.ac_steps
 
             do_sync = ((batch_idx + 1) % self.ac_steps == 0)
@@ -720,7 +721,7 @@ class PretrainingTrainer:
                         head_names=["count"],
                         move_inputs_to_device=False # Already moved manually
                     )
-                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks)
+                    loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks, is_eval=True)
 
                 total_loss += loss.detach()
                 local_loss.append([float(loss)])
@@ -758,17 +759,16 @@ class PretrainingTrainer:
             if self.rank == 0:
                 print(f"[Trainer] === Starting epoch {epoch+1}/{self.epoch_num} ===")
 
+            warmup_epochs = math.floor(self.epoch_num * self.lr_warmup_perc)
             # update mask ratio
             if isinstance(self.mask_perc["count"], (tuple, list)):
                 if len(self.mask_perc["count"]) == 2:
                     start = self.mask_perc["count"][0]
                     end = self.mask_perc["count"][1]
-                total_epoch = math.floor(self.epoch_num * self.lr_warmup_perc)
-                current_mask_range = get_dynamic_mask_ratio(epoch, total_epoch, start, end)
+                current_mask_range = get_dynamic_mask_ratio(epoch, warmup_epochs, start, end)
                 self.current_mask_range = current_mask_range
 
             # update alpha
-            warmup_epochs = math.floor(self.epoch_num * 0.3) # 前 30% epoch 用于预热
             if epoch < warmup_epochs:
                 progress = epoch / max(1, warmup_epochs)
                 self.current_alpha = min_alpha + progress * (max_alpha - min_alpha)

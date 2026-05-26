@@ -177,7 +177,7 @@ if __name__ == "__main__":
     # Config file paths
     ortholog_csv = "/home/user/data3/rbase/genome_ref/Homolog/human_macaque_mouse_orthologs.tsv" 
     
-    human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts.txt"
+    human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts_All_0522.txt"
     macque_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/macaque_featureCounts.txt"
     mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_featureCounts.txt"
     
@@ -224,7 +224,7 @@ if __name__ == "__main__":
         min_tpm_threshold=0
     )
 
-    print("\n========== Phase 2: Aligning Mouse Data ==========")
+    print("\n========== Phase 3: Aligning Mouse Data ==========")
     mouse_pt = os.path.join(out_dir, "mouse_expression_dict.pt")
     build_cross_species_expression_dict(
         file_path=mouse_counts, 
