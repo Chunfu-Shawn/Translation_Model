@@ -70,7 +70,8 @@ def prepare_ortholog_mapping(ortho_csv_path):
 
 
 def build_cross_species_expression_dict(
-    file_path, 
+    file_path,
+    output_tpm_path,
     output_pt_path, 
     id_mapping, 
     reference_anchor_ids=None, # Reference gene list to ensure consistent dimensions across species
@@ -96,6 +97,8 @@ def build_cross_species_expression_dict(
     # ==========================================
     print(f"Calculating RPK, TPM, and robust Z-score (excluding TPM <= {min_tpm_threshold} from distribution stats)...")
     zscore_cols = []
+    tpm_df = pd.DataFrame()
+    tpm_df['Geneid'] = df['Clean_Geneid']
     
     for col in sample_cols:
         # Calculate native RPK
@@ -104,7 +107,10 @@ def build_cross_species_expression_dict(
         scaling_factor = rpk.sum() / 1e6  
         # Calculate TPM
         tpm = rpk / scaling_factor
-        
+
+        # Assign to the new DataFrame
+        tpm_df[col] = tpm
+
         # Log2 smoothing
         log_tpm = np.log2(tpm + 1.0)
         
@@ -130,6 +136,17 @@ def build_cross_species_expression_dict(
         z_col_name = f"{col}_Zscore"
         df[z_col_name] = z_score
         zscore_cols.append(z_col_name)
+
+    # ----------------------
+    # Save the TPM matrix
+    # -----------------------
+    os.makedirs(os.path.dirname(output_tpm_path) or '.', exist_ok=True)
+    # Save to CSV (without the numeric index, using Geneid as the first column)
+    tpm_df.to_csv(output_tpm_path, index=False)
+    
+    print(f"✅ Successfully saved global TPM matrix [{len(tpm_df)} genes x {len(sample_cols)} samples] to:")
+    print(f"   {output_tpm_path}")
+
 
     # ==========================================
     # 2. Map to Ortholog Anchor IDs
@@ -177,7 +194,7 @@ if __name__ == "__main__":
     # Config file paths
     ortholog_csv = "/home/user/data3/rbase/genome_ref/Homolog/human_macaque_mouse_orthologs.tsv" 
     
-    human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts_All_0522.txt"
+    human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_gene_counts_all_samples.txt"
     macque_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/macaque_featureCounts.txt"
     mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_featureCounts.txt"
     
@@ -190,9 +207,11 @@ if __name__ == "__main__":
     # Phase 1: Process Human data to establish the "Global Reference Coordinates"
     # ---------------------------------------------------------
     print("\n========== Phase 1: Establishing Human Reference Coordinates ==========")
+    human_tpm = os.path.join(out_dir, "human_expression_tpm.csv")
     human_pt = os.path.join(out_dir, "human_expression_dict.pt")
     _, global_anchor_ids = build_cross_species_expression_dict(
         file_path=human_counts, 
+        output_tpm_path=human_tpm,
         output_pt_path=human_pt, 
         id_mapping=id_mapping,
         reference_anchor_ids=None, # Set to None to let the script define the universe via Human data
@@ -215,9 +234,11 @@ if __name__ == "__main__":
     # Phase 2: Process other species, forcibly aligning to the reference coordinates
     # ---------------------------------------------------------
     print("\n========== Phase 2: Aligning Macaque Data ==========")
+    macaque_tpm = os.path.join(out_dir, "macaque_expression_tpm.csv")
     macaque_pt = os.path.join(out_dir, "macaque_expression_dict.pt")
     build_cross_species_expression_dict(
         file_path=macque_counts, 
+        output_tpm_path=macaque_tpm,
         output_pt_path=macaque_pt, 
         id_mapping=id_mapping,
         reference_anchor_ids=global_anchor_ids, # Forcible alignment
@@ -225,10 +246,12 @@ if __name__ == "__main__":
     )
 
     print("\n========== Phase 3: Aligning Mouse Data ==========")
+    mouse_tpm = os.path.join(out_dir, "mouse_expression_tpm.csv")
     mouse_pt = os.path.join(out_dir, "mouse_expression_dict.pt")
     build_cross_species_expression_dict(
         file_path=mouse_counts, 
-        output_pt_path=mouse_pt, 
+        output_tpm_path=mouse_tpm,
+        output_pt_path=mouse_pt,
         id_mapping=id_mapping,
         reference_anchor_ids=global_anchor_ids, # Forcible alignment
         min_tpm_threshold=0

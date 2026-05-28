@@ -610,3 +610,151 @@ def load_and_calculate_polysome_correlation(
                 })
 
     return pd.DataFrame(aggregated_data)
+
+
+def plot_polysome_correlation_bar(
+        agg_df: pd.DataFrame, 
+        out_dir: str = "./", 
+        metric_name: str = "Translation dynamics position-wise correlation",
+        suffix: str = ""):
+    """
+    绘制模型在 Polysome 数据集上的相关性 Bar + Jitter 图。
+    高度还原示例图的美学风格：Bar 代表均值，误差棒代表 SEM，点代表具体的 Dataset (形状) 和 Cell_type (颜色)。
+    """
+    if agg_df.empty:
+        print("No data to plot.")
+        return
+        
+    os.makedirs(out_dir, exist_ok=True)
+    plot_df = agg_df.copy()
+
+    # =================================================================
+    # 1. 计算均值和标准误 (SEM) 供 Bar 和 Errorbar 使用
+    # =================================================================
+    summary_df = plot_df.groupby('Model', observed=False).agg(
+        Overall_Mean=('Mean', 'mean'),
+        SEM=('Mean', lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0)
+    ).reset_index()
+    
+    summary_df['ymin'] = summary_df['Overall_Mean'] - summary_df['SEM']
+    summary_df['ymax'] = summary_df['Overall_Mean'] + summary_df['SEM']
+
+    # =================================================================
+    # 2. 模型排序与颜色分配 (高度还原图例颜色)
+    # =================================================================
+    model_order = [
+        "TRACE", "Convolution", 
+        "RiboNN", "RiboDecode", "Optimus-5Prime",
+        "CAI", "Kozak score"
+    ]
+    # 兼容传入数据中实际存在的模型
+    valid_models = [m for m in model_order if m in plot_df['Model'].unique()]
+    for m in plot_df['Model'].unique():
+        if m not in valid_models:
+            valid_models.append(m)
+            
+    plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=valid_models, ordered=True)
+    summary_df['Model'] = pd.Categorical(summary_df['Model'], categories=valid_models, ordered=True)
+
+    model_colors = {
+        "TRACE": "#2C6B9A", # 2C6B9A
+        # "Encoder": "#555555",
+        "Convolution": "#637D96",
+        "RiboNN": "#555555",
+        "RiboDecode": "#777777", #999999
+        "Optimus-5Prime": "#BBBBBB",
+        "CAI": "#AF804F",
+        "Kozak score": "#EBC67F"
+    }
+    
+    # =================================================================
+    # 3. 细胞系颜色分配 (高亮 Unseen 细胞系)
+    # =================================================================
+    # 获取所有的细胞系，并将包含 unseen 的放在最后面
+    unique_cells = plot_df['Cell_type'].unique().tolist()
+    unseen_cells = [c for c in unique_cells if 'unseen' in c.lower()]
+    seen_cells = [c for c in unique_cells if c not in unseen_cells]
+    ordered_cells = seen_cells + unseen_cells
+    
+    plot_df['Cell_type'] = pd.Categorical(plot_df['Cell_type'], categories=ordered_cells, ordered=True)
+    print(seen_cells, unseen_cells)
+        
+    # 颜色映射：已见的统一深灰，未见的统一砖红色
+    cell_colors = {}
+    for ct in seen_cells:
+        cell_colors[ct] = "#202020"
+    for ct in unseen_cells:
+        cell_colors[ct] = "#D6715E"
+
+    # =================================================================
+    # [NEW] 3.5. 数据集形状分配
+    # =================================================================
+    # 获取所有的数据集名称
+    if 'Dataset' not in plot_df.columns:
+        raise ValueError("The input DataFrame must contain a 'Dataset' column for shape mapping.")
+        
+    unique_datasets = plot_df['Dataset'].unique().tolist()
+    plot_df['Dataset'] = pd.Categorical(plot_df['Dataset'], categories=unique_datasets, ordered=True)
+    
+    # 形状映射：plotnine 内置形状 ('o'=圆, '^'=上三角, 's'=方块, 'D'=菱形, 'v'=下三角, '*'=星号, 'p'=五边形)
+    shapes_pool = ['o', '^', 's', 'D', 'v', 'p', 'h', '8']
+    dataset_shapes = {}
+    for i, ds in enumerate(unique_datasets):
+        dataset_shapes[ds] = shapes_pool[i % len(shapes_pool)]
+
+    # =================================================================
+    # 4. 绘图逻辑
+    # =================================================================
+    print(f"Generating Polysome Bar Chart...")
+    
+    p = (
+        ggplot()
+        # 底层：绘制 Bar 图 (均值)
+        + geom_col(
+            data=summary_df, 
+            mapping=aes(x='Model', y='Overall_Mean', fill='Model'), 
+            width=0.7
+        )
+        # 中层：绘制误差棒 (SEM)
+        + geom_errorbar(
+            data=summary_df, 
+            mapping=aes(x='Model', ymin='ymin', ymax='ymax'), 
+            width=0.2, 
+            size=0.8, 
+            color="black"
+        )
+        # 顶层：绘制散点 (代表各个 Cell_type/Dataset 的实际值)
+        + geom_jitter(
+            data=plot_df, 
+            mapping=aes(x='Model', y='Mean', shape='Dataset', color='Cell_type'), 
+            width=0.2, 
+            size=3.5, 
+            stroke=0.8,
+            alpha=0.8
+        )
+        # 美学映射
+        + scale_fill_manual(values=model_colors, guide=None) # 隐藏模型的 fill 图例
+        + scale_shape_manual(values=dataset_shapes, name="Dataset") 
+        + scale_color_manual(values=cell_colors, name="Cell type")
+        + theme_bw()
+        + labs(
+            x="",
+            y=f"{metric_name} correlation with ribosome load"
+        )
+        + theme(
+            axis_text_x=element_text(angle=45, hjust=1, size=12, color="black"),
+            axis_text_y=element_text(size=12, color="black"),
+            axis_title_y=element_text(size=14, margin={'r': 10}),
+            panel_grid_major_x=element_blank(), # 去除纵向网格线
+            legend_position="right",
+            legend_title=element_text(size=13, fontweight='bold'),
+            legend_text=element_text(size=11)
+        )
+    )
+
+    file_suffix = f".{suffix}" if suffix else ""
+    save_path = os.path.join(out_dir, f"polysome_multidataset_correlation_bar{file_suffix}.pdf")
+    p.save(save_path, width=6, height=5, dpi=300, verbose=False)
+    print(f"✅ Bar chart saved to: {save_path}")
+
+    return summary_df

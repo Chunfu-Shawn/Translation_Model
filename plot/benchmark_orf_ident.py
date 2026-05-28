@@ -501,3 +501,207 @@ def plot_multi_model_top_k_precision(
     p.save(save_path, dpi=300, verbose=False)
     
     print(f"✅ Multi-Model Precision@K Chart successfully saved to: {save_path}")
+
+
+def plot_top_k_precision_bar(
+        manifest: list, 
+        target_k: int,
+        out_dir: str = "./results/benchmark", 
+        suffix: str = ""
+):
+    """
+    绘制指定 Top-K 的 Precision Bar + Jitter 图。
+    Bar 代表模型的平均 Precision，误差棒代表 SEM。
+    点代表每一次具体的评估，形状映射为 Dataset，颜色映射为 Cell_type。
+    """
+    print(f"\nCalculating Precision@{target_k} for multiple models...")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    records = []
+    
+    # =================================================================
+    # 1. 精准提取每个评估文件在 target_k 处的 Precision
+    # =================================================================
+    for cfg in manifest:
+        model_name = cfg['model']
+        csv_path = cfg['path']
+        dataset_name = cfg.get('dataset', 'Unknown_Dataset')
+        cell_type = cfg.get('cell_type', 'Unknown_Cell')
+        score_col = cfg.get('score_col', 'score') 
+        
+        if not os.path.exists(csv_path):
+            print(f"  [Warning] File not found: {csv_path}. Skipping...")
+            continue
+            
+        df = pd.read_csv(csv_path)
+        prec_val = np.nan
+        
+        # 情况 A: 已经是计算好的 Precision@K 统计表
+        if 'Precision' in df.columns and 'K' in df.columns:
+            if target_k in df['K'].values:
+                prec_val = df.loc[df['K'] == target_k, 'Precision'].values[0]
+            else:
+                # 如果模型预测数量不足 target_k，使用最大 K 处的真阳性数量重新计算
+                max_k_avail = df['K'].max()
+                if 'TP_Count' in df.columns:
+                    max_tp = df.loc[df['K'] == max_k_avail, 'TP_Count'].values[0]
+                    prec_val = max_tp / target_k
+                else:
+                    prec_val = (df['Precision'].iloc[-1] * max_k_avail) / target_k
+                    
+        # 情况 B: 原始评分预测表
+        elif 'y_true' in df.columns and score_col in df.columns:
+            df_sorted = df.sort_values(by=score_col, ascending=False).reset_index(drop=True)
+            df_sorted = df_sorted[df_sorted[score_col] >= 0].copy()
+            
+            if df_sorted.empty:
+                prec_val = 0.0
+            else:
+                if len(df_sorted) >= target_k:
+                    prec_val = df_sorted['y_true'].iloc[:target_k].sum() / target_k
+                else:
+                    # 惩罚预测数量不足 target_k 的情况
+                    prec_val = df_sorted['y_true'].sum() / target_k
+        else:
+            print(f"  [Warning] {csv_path} lacks required columns.")
+            continue
+            
+        records.append({
+            'Model': model_name,
+            'Dataset': dataset_name,
+            'Cell_type': cell_type,
+            'Precision': prec_val
+        })
+        
+    if not records:
+        raise ValueError("No valid Top-K data processed. Please check your manifest.")
+        
+    plot_df = pd.DataFrame(records)
+
+    # =================================================================
+    # 2. 计算均值和标准误 (SEM)
+    # =================================================================
+    summary_df = plot_df.groupby('Model', observed=False).agg(
+        Overall_Mean=('Precision', 'mean'),
+        SEM=('Precision', lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0)
+    ).reset_index()
+    
+    summary_df['ymin'] = summary_df['Overall_Mean'] - summary_df['SEM']
+    summary_df['ymax'] = summary_df['Overall_Mean'] + summary_df['SEM']
+
+    # =================================================================
+    # 3. 模型排序与颜色分配 
+    # =================================================================
+    model_order = [
+        "TRACE", "Convolution", 
+        "TranslationAI", "RiboTIE", "RibORF", "RiboTISH",
+        "ORF-structure"
+    ]
+    valid_models = [m for m in model_order if m in plot_df['Model'].unique()]
+    for m in plot_df['Model'].unique():
+        if m not in valid_models:
+            valid_models.append(m)
+            
+    plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=valid_models, ordered=True)
+    summary_df['Model'] = pd.Categorical(summary_df['Model'], categories=valid_models, ordered=True)
+
+    # 模型 Bar 颜色映射
+    model_colors = {
+        "TRACE": "#2C6B9A",
+        "Convolution": "#637D96",
+        "TranslationAI": "#999999",
+        "RiboTIE": "#555555",
+        "RibORF": "#777777",
+        "RiboTISH": "#BBBBBB",
+        "ORF-structure": "#AF804F",
+        # "Kozak score": "#EBC67F"
+    }
+    # 兜底默认颜色
+    for m in valid_models:
+        if m not in model_colors:
+            model_colors[m] = "#C0C0C0"
+            
+    # =================================================================
+    # 4. 细胞系颜色分配 (高亮 Unseen)
+    # =================================================================
+    unique_cells = plot_df['Cell_type'].unique().tolist()
+    unseen_cells = [c for c in unique_cells if 'unseen' in str(c).lower()]
+    seen_cells = [c for c in unique_cells if c not in unseen_cells]
+    ordered_cells = seen_cells + unseen_cells
+    
+    plot_df['Cell_type'] = pd.Categorical(plot_df['Cell_type'], categories=ordered_cells, ordered=True)
+        
+    cell_colors = {}
+    for ct in seen_cells:
+        cell_colors[ct] = "#202020"
+    for ct in unseen_cells:
+        cell_colors[ct] = "#D6715E"
+
+    # =================================================================
+    # 5. 数据集形状分配
+    # =================================================================
+    unique_datasets = plot_df['Dataset'].unique().tolist()
+    plot_df['Dataset'] = pd.Categorical(plot_df['Dataset'], categories=unique_datasets, ordered=True)
+    
+    shapes_pool = ['o', '^', 's', 'D', 'v', 'p', 'h', '8']
+    dataset_shapes = {}
+    for i, ds in enumerate(unique_datasets):
+        dataset_shapes[ds] = shapes_pool[i % len(shapes_pool)]
+
+    # =================================================================
+    # 6. 绘图逻辑
+    # =================================================================
+    print(f"Generating Precision@{target_k} Bar Chart...")
+    
+    p = (
+        ggplot()
+        # 底层：绘制 Bar 图 (均值)
+        + geom_col(
+            data=summary_df, 
+            mapping=aes(x='Model', y='Overall_Mean', fill='Model'), 
+            width=0.7
+        )
+        # 中层：绘制误差棒 (SEM)
+        + geom_errorbar(
+            data=summary_df, 
+            mapping=aes(x='Model', ymin='ymin', ymax='ymax'), 
+            width=0.2, 
+            size=0.8, 
+            color="black"
+        )
+        # 顶层：绘制散点 (代表各个 Cell_type/Dataset 的实际值)
+        + geom_jitter(
+            data=plot_df, 
+            mapping=aes(x='Model', y='Precision', shape='Dataset', color='Cell_type'), 
+            width=0.15, 
+            size=3.0, 
+            stroke=0.8,
+            alpha=0.85
+        )
+        # 美学映射
+        + scale_fill_manual(values=model_colors, guide=None) 
+        + scale_shape_manual(values=dataset_shapes, name="Dataset") 
+        + scale_color_manual(values=cell_colors, name="Cell type")
+        # + scale_y_continuous(limits=(0, 1.05)) # Precision 最大为 1
+        + theme_bw()
+        + labs(
+            x="",
+            y=f"Precision @ K={target_k}"
+        )
+        + theme(
+            axis_text_x=element_text(angle=45, hjust=1, size=12, color="black"),
+            axis_text_y=element_text(size=12, color="black"),
+            axis_title_y=element_text(size=14, margin={'r': 10}),
+            panel_grid_major_x=element_blank(), 
+            legend_position="right",
+            legend_title=element_text(size=13, fontweight='bold'),
+            legend_text=element_text(size=11)
+        )
+    )
+
+    file_suffix = f".{suffix}" if suffix else ""
+    save_path = os.path.join(out_dir, f"precision_at_{target_k}_bar{file_suffix}.pdf")
+    p.save(save_path, width=7, height=5, dpi=300, verbose=False)
+    print(f"✅ Bar chart saved to: {save_path}")
+
+    return summary_df, plot_df

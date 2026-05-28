@@ -1,17 +1,72 @@
 import os
 import pickle
+import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
-# =================================================================
-# [MODIFIED] 引入 List 和 Union 以支持多种类型输入
-# =================================================================
 from typing import Dict, Optional, List, Union
 from tqdm import tqdm
 
 from eval.save_prediction_results import _prepare_prediction_dataloader
 from utils import unwrap_model, clean_up_memory
+
+
+def get_active_transcripts(
+    tpm_csv_path: str, 
+    mapping_csv_path: str, 
+    cell_type: str, 
+    min_tpm: float = 0.5
+) -> np.ndarray:
+    """
+    Reads the TPM CSV matrix and a Gene-to-Transcript mapping table.
+    Returns an array of Transcript IDs corresponding to genes that have 
+    a TPM value greater than the specified threshold in the target cell type.
+    """
+    print(f"Loading TPM matrix from: {tpm_csv_path}")
+    
+    # Load TPM data (assuming the first column is the Gene ID, e.g., 'Geneid' or 'Anchor_ID')
+    try:
+        df = pd.read_csv(tpm_csv_path, index_col=0)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load TPM CSV. Ensure the path is correct: {e}")
+
+    # Validate that the requested cell type exists in the columns
+    if cell_type not in df.columns:
+        available_cells = ", ".join(df.columns.tolist()[:5]) + "..."
+        raise ValueError(f"Cell type '{cell_type}' not found in the matrix. Available columns include: {available_cells}")
+
+    # 1. Filter genes based on the TPM threshold
+    active_mask = df[cell_type] > min_tpm
+    active_gene_ids = df[active_mask].index.values
+
+    print(f"Found {len(active_gene_ids)} active genes with TPM > {min_tpm} in {cell_type}.")
+
+    # 2. Load the Gene-to-Transcript mapping table
+    print(f"Loading mapping table from: {mapping_csv_path}")
+    try:
+        # The mapping table provided appears to be tab-separated
+        mapping_df = pd.read_csv(mapping_csv_path, sep='\t')
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Mapping CSV: {e}")
+        
+    # Ensure required columns exist in the mapping table
+    gene_col = 'Gene stable ID'
+    tx_col = 'Transcript stable ID'
+    if gene_col not in mapping_df.columns or tx_col not in mapping_df.columns:
+        raise ValueError(f"Mapping table must contain '{gene_col}' and '{tx_col}' columns.")
+        
+    # 3. Map active Gene IDs to Transcript IDs
+    # Filter the mapping dataframe to only include rows where the Gene ID is in our active list
+    active_mapping = mapping_df[mapping_df[gene_col].isin(active_gene_ids)]
+    
+    # Extract unique Transcript IDs
+    active_transcript_ids = active_mapping[tx_col].unique()
+    
+    print(f"Mapped to {len(active_transcript_ids)} unique active transcripts.")
+    
+    return active_transcript_ids
+
 
 # =================================================================
 # 工具函数: Fasta 解析
@@ -142,6 +197,16 @@ def collate_fn_denovo(batch):
 # =================================================================
 # 主引擎: 仅预测翻译图谱
 # =================================================================
+import os
+import pickle
+import numpy as np
+import torch
+from typing import Optional, Union, List
+from tqdm import tqdm
+
+from eval.save_prediction_results import _prepare_prediction_dataloader
+from utils import unwrap_model, clean_up_memory
+
 class TranslationProfilePredictor:
     def __init__(self, 
                  model: torch.nn.Module, 
@@ -175,15 +240,32 @@ class TranslationProfilePredictor:
         pred_pkl_path = os.path.join(out_dir, f"predictions_count.{self.model.model_name}.{suffix}.pkl")
 
         # ========================================================
-        # 目标转录本过滤逻辑
+        # [MODIFIED] 目标转录本过滤逻辑 (ENST 去除版本号)
         # ========================================================
         if target_tids is not None:
-            target_set = set(target_tids)
+            # 1. 预处理 target_tids：如果是 ENST 开头，去除版本号
+            cleaned_target_tids = []
+            for t in target_tids:
+                t_str = str(t).split('|')[0]
+                if t_str.startswith("ENST") and "." in t_str:
+                    cleaned_target_tids.append(t_str.split(".")[0])
+                else:
+                    cleaned_target_tids.append(t_str)
+                    
+            target_set = set(cleaned_target_tids)
             filtered_seq_dict = {}
+            
+            # 2. 预处理 Fasta 字典里的 keys
             for tid, seq in self.seq_dict.items():
-                # 同样清理 Fasta 头里的版本号或管道符
-                clean_tid = str(tid).split('|')[0] #.split('.')[0]
+                # 清理管道符
+                clean_tid = str(tid).split('|')[0]
+                
+                # [NEW] 如果 FASTA 中的 ID 是 ENST 开头，同样去除版本号进行比对
+                if clean_tid.startswith("ENST") and "." in clean_tid:
+                    clean_tid = clean_tid.split(".")[0]
+                    
                 if clean_tid in target_set:
+                    # 注意：放入字典的 key 仍然使用原始的 tid，避免破坏后续写入预测结果和 pkl 的映射一致性
                     filtered_seq_dict[tid] = seq
             
             print(f"Filtered Fasta: Keeping {len(filtered_seq_dict)} sequences matching target Tids "

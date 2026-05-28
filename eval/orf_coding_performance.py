@@ -1,11 +1,12 @@
 import os
-import pandas as pd
 import numpy as np
-from typing import List, Optional
-from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
-from plotnine import *
+import pandas as pd
+from typing import Dict, List, Optional
+from tqdm import tqdm
 import seaborn as sns
 import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+from plotnine import *
 
 # =====================================================================
 # Module 1: Data Loading and Preprocessing
@@ -14,21 +15,24 @@ def load_and_filter_data(
         pred_csv_path: str, 
         gt_csv_path: str, 
         target_transcript_ids: Optional[List[str]] = None,
-        # =================================================================
-        # [MODIFIED] 引入上下界参数，替代原本单一的 ORF_length_limit
-        # =================================================================
         min_orf_len: Optional[int] = None,
         max_orf_len: Optional[int] = None):
     """Read, clean, and filter data based on target transcripts and exact length ranges."""
     print(f"Loading Ground Truth from: {gt_csv_path}")
     try:
         gt_df = pd.read_csv(gt_csv_path, sep='\t')
-        if 'PacBio_ID' not in gt_df.columns:
+        if 'Tid' not in gt_df.columns:
             gt_df = pd.read_csv(gt_csv_path, sep=',')
     except Exception as e:
         raise ValueError(f"Error reading GT: {e}")
         
-    gt_df['Tid_clean'] = gt_df['PacBio_ID'].astype(str)
+    # =================================================================
+    # [MODIFIED] 去除 GT 中 ENST 开头 ID 的版本号
+    # =================================================================
+    gt_df['Tid_clean'] = gt_df['Tid'].astype(str).apply(
+        lambda x: x.split('.')[0] if x.startswith('ENST') else x
+    )
+    
     gt_df['start_gt'] = gt_df['CDS_Start_0based']
     gt_df['stop_gt'] = gt_df['CDS_End_0based']
     gt_df['length'] = gt_df['stop_gt'] - gt_df['start_gt']
@@ -39,20 +43,29 @@ def load_and_filter_data(
     if 'score' not in pred_df.columns:
         raise ValueError("Validation Error: The predictions file MUST contain a 'score' column for evaluation.")
 
-    pred_df['Tid_clean'] = pred_df['Tid'].astype(str)
+    # =================================================================
+    # [MODIFIED] 去除 Predictions 中 ENST 开头 ID 的版本号
+    # =================================================================
+    pred_df['Tid_clean'] = pred_df['Tid'].astype(str).apply(
+        lambda x: x.split('.')[0] if x.startswith('ENST') else x
+    )
+    
     if 'length' not in pred_df.columns:
         pred_df['length'] = pred_df['stop'] - pred_df['start']
 
     # 1. Filter by transcript IDs
     if target_transcript_ids is not None:
         print(f"Filtering datasets to {len(target_transcript_ids)} target transcripts...")
-        target_set = set(str(t) for t in target_transcript_ids)
+        # =================================================================
+        # [NEW] 同样清理传入的 target_transcript_ids，保证两端能够完美 match
+        # =================================================================
+        target_set = set(
+            str(t).split('.')[0] if str(t).startswith('ENST') else str(t) 
+            for t in target_transcript_ids
+        )
         gt_df = gt_df[gt_df['Tid_clean'].isin(target_set)].copy()
         pred_df = pred_df[pred_df['Tid_clean'].isin(target_set)].copy()
         
-    # =================================================================
-    # [NEW] 鲁棒且优雅的双向长度过滤逻辑 (适用于小肽评估)
-    # =================================================================
     if min_orf_len is not None or max_orf_len is not None:
         # 参数校验
         if min_orf_len is not None and max_orf_len is not None and min_orf_len > max_orf_len:
@@ -235,7 +248,6 @@ def evaluate_and_plot_binned(eval_df: pd.DataFrame, eval_metrics: List[str], dis
     """Bin by length and execute raw TP/FP/FN classification based on coordinate NMS matching."""
     print("\nCalculating Binned AUCs and Raw Classifications across ORF Lengths...")
     
-    # 动态分箱：如果过滤后样本极度集中，可能会导致 qcut 报错，需要加上错误处理
     try:
         q_bins = pd.qcut(eval_df['length'], q=8, duplicates='drop')
         unique_intervals = sorted(q_bins.cat.categories, key=lambda x: x.left)
@@ -321,9 +333,6 @@ def evaluate_orf_level_predictions(
         pred_csv_path: str, 
         gt_csv_path: str, 
         target_transcript_ids: Optional[List[str]] = None,
-        # =================================================================
-        # [MODIFIED] 修改主函数的签名为 min/max 长度限定
-        # =================================================================
         min_orf_len: Optional[int] = None,
         max_orf_len: Optional[int] = None,
         out_dir: str = "./results/eval",
@@ -421,7 +430,7 @@ def calculate_top_k_precision(
     
     # 1. Load Ground Truth
     gt_df = pd.read_csv(gt_csv_path, sep='\t' if '\t' in open(gt_csv_path).readline() else ',')
-    gt_df['Tid_clean'] = gt_df['PacBio_ID'].astype(str)
+    gt_df['Tid_clean'] = gt_df['Tid'].astype(str)
     gt_df['start_gt'] = gt_df['CDS_Start_0based']
     gt_df['stop_gt'] = gt_df['CDS_End_0based']
     gt_df['length'] = gt_df['stop_gt'] - gt_df['start_gt'] # [NEW] 确保计算了GT长度
