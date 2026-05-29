@@ -495,7 +495,6 @@ class PretrainingTrainer:
         # Assume self.dynamics_criterion is defined in your class (e.g., SmoothL1Loss)
         if pred.shape[2] == 1:
             loss_all = self.dynamics_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) 
-            # 乘上 mask 并叠加上 CDS 专属权重
             loss_all = loss_all * count_emb_masks.float() * token_weights
         else:
             loss_all = self.dynamics_criterion(pred, count_raw_emb) 
@@ -528,7 +527,6 @@ class PretrainingTrainer:
         
         frame_masks = [f0_mask, f1_mask, f2_mask]
         
-        # Unify shape handling for single or multi-channel RPF density (linear)
         if pred.shape[2] == 1:
             p_val = pred.squeeze(-1)
             t_val = count_raw_emb.squeeze(-1)
@@ -553,21 +551,32 @@ class PretrainingTrainer:
             t_mean = t_sum / safe_t_lengths
             
             # Compute MSE loss (Assume self.te_criterion is nn.MSELoss)
-            f_loss = self.te_criterion(p_mean, t_mean)
+            f_loss = self.te_criterion(p_mean, t_mean) # shape: (B,)
             frame_mse_losses.append(f_loss)
 
-        # Average the MSE loss across all 3 frames
-        w0 = 2.0
+        # ---------------------------------------------------------
+        # 动态权重：反推是否有 CDS
+        # 如果一个转录本的 cds_masks 在有效长度内全为 True，说明它没有 CDS (或者被设为了全 True)
+        # 注意：需要结合 count_emb_masks (有效序列长度) 来判断
+        # ---------------------------------------------------------
+        # 只在有效序列长度内检查，如果 cds_masks 包含 False，说明有真实的 UTR 和 CDS 边界
+        has_utr = (~cds_masks & count_emb_masks.bool().to(device)).any(dim=1) # shape: (B,)
+        
+        # 有 CDS (has_utr为True) 则 w0=1.5，没有 CDS 则 w0=1.0
+        w0 = torch.where(has_utr, 1.5, 1.0).to(device) # shape: (B,)
         w1 = 1.0
         w2 = 1.0
-        per_sample_macro_loss = (w0 * frame_mse_losses[0] + w1 * frame_mse_losses[1] + w2 * frame_mse_losses[2]) / (w0 + w1 + w2)
-
-        # per_sample_macro_loss = (frame_mse_losses[0] + frame_mse_losses[1] + frame_mse_losses[2]) / 3
+        
+        # 向量化加权平均
+        w_sum = w0 + w1 + w2 # shape: (B,)
+        per_sample_macro_loss = (w0 * frame_mse_losses[0] + w1 * frame_mse_losses[1] + w2 * frame_mse_losses[2]) / w_sum
 
         # ==========================================
         # 3. Fusion
         # ==========================================
-        alpha = max(self.alpha_limit) if is_eval else self.current_alpha
+        # 假设 self.alpha_limit 和 self.current_alpha 在你的类中已定义
+        alpha = max(self.alpha_limit) if is_eval else getattr(self, 'current_alpha', 4.0)
+        
         # 结合 Micro local-shape 与 Macro global-scale
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         
