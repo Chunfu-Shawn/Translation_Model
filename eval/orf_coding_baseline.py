@@ -6,6 +6,17 @@ from typing import Dict, List, Optional
 from tqdm import tqdm
 
 # =================================================================
+# [NEW] 安全清理 ID 的辅助函数 (复用之前的稳健逻辑)
+# =================================================================
+def safe_clean_id(raw_id: str) -> str:
+    """仅去除 ENST/ENSG 的版本号，保留 PacBio/MSTRG 的完整结构"""
+    clean_id = str(raw_id).split('|')[0]
+    if (clean_id.startswith('ENST') or clean_id.startswith('ENSG')) and '.' in clean_id:
+        clean_id = clean_id.split('.')[0]
+    return clean_id
+
+
+# =================================================================
 # Util: Fast Fasta Parser
 # =================================================================
 def read_fasta(file_path: str) -> Dict[str, str]:
@@ -20,7 +31,10 @@ def read_fasta(file_path: str) -> Dict[str, str]:
             if line.startswith('>'):
                 if curr_id:
                     seq_dict[curr_id] = "".join(curr_seq).replace('U', 'T')
-                curr_id = line[1:].split()[0].split('|')[0] 
+                
+                # [MODIFIED] 使用安全 ID 清理
+                raw_id = line[1:].split()[0]
+                curr_id = safe_clean_id(raw_id)
                 curr_seq = []
             else:
                 curr_seq.append(line.upper())
@@ -84,7 +98,7 @@ class BaselineSequenceORFCaller:
                             'stop': stop_pos,
                             'length': orf_len,
                             'start_codon': start_codon,
-                            'score': float(baseline_score) # 必须包含 score 列供下游评估
+                            'score': float(baseline_score) 
                         })
                     break 
         return candidates
@@ -92,7 +106,7 @@ class BaselineSequenceORFCaller:
     def fast_nms(self, cands: List[dict], iou_threshold: float = 0.3) -> List[dict]:
         """Non-Maximum Suppression to resolve spatial overlaps."""
         keep = []
-        # 按基线得分降序排列
+        # NMS 始终依赖序列基线得分 (局部去重最优解)
         cands.sort(key=lambda x: x['score'], reverse=True)
         
         for i, cand in enumerate(cands):
@@ -149,10 +163,58 @@ class BaselineSequenceORFCaller:
 # Main Pipeline: Batch Processing & Saving
 # =================================================================
 class BaselineORFIdentifier:
-    def __init__(self, fasta_file: str):
+    def __init__(self, 
+                 fasta_file: str,
+                 cell_type: str,
+                 tpm_csv_path: Optional[str] = None,
+                 tpm_level: str = 'gene',
+                 mapping_csv_path: Optional[str] = None):
+                 
         self.fasta_file = fasta_file
+        self.cell_type = cell_type
+        self.tpm_level = tpm_level.lower()
+        self.has_tpm = tpm_csv_path is not None and os.path.exists(tpm_csv_path)
+        
         print("Loading Fasta File for Baseline Analysis...")
         self.seq_dict = read_fasta(self.fasta_file)
+        
+        # =================================================================
+        # [NEW] 建立 Transcript -> Gene Mapping (复用机制)
+        # =================================================================
+        self.tx2gene = {}
+        if mapping_csv_path and os.path.exists(mapping_csv_path):
+            print(f"Loading Gene-Transcript Mapping from {mapping_csv_path}...")
+            try:
+                m_df = pd.read_csv(mapping_csv_path, sep='\t')
+                g_col, t_col = 'Gene stable ID', 'Transcript stable ID'
+                if g_col in m_df.columns and t_col in m_df.columns:
+                    for _, r in m_df.iterrows():
+                        g_id = safe_clean_id(str(r[g_col]))
+                        t_id = safe_clean_id(str(r[t_col]))
+                        self.tx2gene[t_id] = g_id
+            except Exception as e:
+                print(f"  [Error] Failed to load Mapping CSV: {e}")
+                
+        # =================================================================
+        # [NEW] 加载 TPM 矩阵
+        # =================================================================
+        print(f"Loading TPM Expression Matrix (Level: {self.tpm_level})...")
+        self.tpm_dict = {}
+        if self.has_tpm:
+            try:
+                t_df = pd.read_csv(tpm_csv_path, index_col=0)
+                t_df.index = t_df.index.to_series().astype(str).apply(safe_clean_id)
+                t_df = t_df.groupby(t_df.index).mean() # 去重合并
+                
+                if self.cell_type in t_df.columns:
+                    self.tpm_dict = t_df[self.cell_type].to_dict()
+                    print(f"  -> Loaded TPM for {len(self.tpm_dict)} {self.tpm_level}s in '{self.cell_type}'.")
+                else:
+                    print(f"  [Warning] Cell type '{self.cell_type}' not found. Disabling TPM integration.")
+                    self.has_tpm = False
+            except Exception as e:
+                print(f"  [Error] Failed to load TPM matrix: {e}")
+                self.has_tpm = False
 
     def run(self, 
             out_dir: str = "./results/baseline", 
@@ -165,12 +227,11 @@ class BaselineORFIdentifier:
         all_records = []
         
         if target_tids is not None:
-            target_set = set(target_tids)
+            # [MODIFIED] 清理 target_tids
+            target_set = set(safe_clean_id(t) for t in target_tids)
             filtered_seq_dict = {}
             for tid, seq in self.seq_dict.items():
-                # 同样清理 Fasta 头里的版本号或管道符
-                clean_tid = str(tid).split('|')[0] #.split('.')[0]
-                if clean_tid in target_set:
+                if tid in target_set:
                     filtered_seq_dict[tid] = seq
             
             print(f"Filtered Fasta: Keeping {len(filtered_seq_dict)} sequences matching target Tids "
@@ -186,15 +247,33 @@ class BaselineORFIdentifier:
         print(f"\nStarting Sequence-Based Baseline Calling for {len(seq_dict)} transcripts...")
         for tid, sequence in tqdm(seq_dict.items()):
             
-            # 1. 提取并打分
+            # 1. 提取并使用序列特征打分
             cands = caller.extract_and_score_candidates(sequence)
             
-            # 2. 停止密码子折叠 & NMS 去重
+            # 2. 停止密码子折叠 & NMS 去重 (依靠内部的 sequence score 去重)
             final_cands = caller.collapse_and_nms(cands, iou_threshold=0.3)
             
-            # 3. 记录
+            # =================================================================
+            # 提取表达量 TPM 并生成 transcription_score 基线
+            # =================================================================
+            gene_id = self.tx2gene.get(tid, tid)
+            query_id = tid if self.tpm_level == 'transcript' else gene_id
+            
+            if self.has_tpm:
+                tpm_val = float(self.tpm_dict.get(query_id, 0.0))
+                if pd.isna(tpm_val) or tpm_val < 0: tpm_val = 0.0
+                log_tpm = np.log2(tpm_val + 1.0)
+            else:
+                tpm_val = np.nan
+                log_tpm = 0.0 # 若无TPM，表达基线得分为 0
+            
+            # 3. 记录并解绑分数
             for cand in final_cands:
                 cand['Tid'] = tid
+                # [MODIFIED] 明确分数的用途
+                cand['seq_score'] = cand['score'] # 保留序列打分
+                cand['transcription_score'] = log_tpm      # 全新的纯表达量打分
+                cand['tpm'] = tpm_val
                 all_records.append(cand)
                 
         if not all_records:
@@ -203,14 +282,16 @@ class BaselineORFIdentifier:
             
         final_df = pd.DataFrame(all_records)
         
-        # 保留关键列，完美兼容下游的 Precision@K 和 AUC 评估代码
-        cols = ['Tid', 'start', 'stop', 'length', 'start_codon', 'score']
-        final_df = final_df[cols].sort_values(by=['Tid', 'score'], ascending=[True, False])
+        # =================================================================
+        # [MODIFIED] 补充导出的列名，默认以 transcription_score 倒序，作为表达量基线的呈现
+        # =================================================================
+        cols = ['Tid', 'start', 'stop', 'length', 'start_codon', 'seq_score', 'transcription_score', 'tpm']
+        final_df = final_df[cols].sort_values(by=['transcription_score', 'seq_score'], ascending=[False, False])
         
-        save_path = os.path.join(out_dir, "sequence_baseline_called_orfs.csv")
+        save_path = os.path.join(out_dir, f"baseline_called_orfs.{self.cell_type}.csv")
         final_df.to_csv(save_path, index=False)
         
-        print(f"\n🎉 Baseline Sequence Calling Completed! Found {len(final_df)} ORFs.")
+        print(f"\n🎉 Baseline Calling Completed! Found {len(final_df)} ORFs.")
         print(f"Results saved to: {save_path}")
         
         return final_df

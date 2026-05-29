@@ -18,15 +18,15 @@ torch.backends.cudnn.benchmark = True
 # load dataset
 dataset_dir = '/home/user/data3/rbase/translation_model/data/dataset/'
 ## human
-human_dataset_name = "human_7c_8k_depth0.1_cov0.1_rpm1"
+human_dataset_name = "human_7c_6k_depth0.1_cov0.1_rpm1"
 human_train_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".train.h5")
 human_val_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".valid.h5")
 ## macaque
-macaque_dataset_name = "macaque_4c_8k_depth0.1_cov0.1_rpm1"
+macaque_dataset_name = "macaque_4c_6k_depth0.1_cov0.1_rpm1"
 macaque_train_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".train.h5")
 macaque_val_dataset_path = os.path.join(dataset_dir, macaque_dataset_name + ".valid.h5")
 ## mouse
-mouse_dataset_name = "mouse_3c_8k_depth0.1_cov0.1_rpm1"
+mouse_dataset_name = "mouse_3c_6k_depth0.1_cov0.1_rpm1"
 mouse_train_dataset_path = os.path.join(dataset_dir, mouse_dataset_name + ".train.h5")
 mouse_val_dataset_path = os.path.join(dataset_dir, mouse_dataset_name + ".valid.h5")
 
@@ -58,9 +58,9 @@ base_model = DDP(
 epoch_num = 50
 trainer = PretrainingTrainer(
     model = base_model,
-    dataset_paths = [human_train_dataset_path], # [human_train_dataset_path, macaque_train_dataset_path, mouse_train_dataset_path],
-    val_dataset_paths = [human_val_dataset_path], #[human_val_dataset_path, macaque_val_dataset_path, mouse_val_dataset_path],
-    dataset_name = "human_7c_8k_depth0.1_cov0.1_rpm1",
+    dataset_paths = [human_train_dataset_path], #, macaque_train_dataset_path, mouse_train_dataset_path],
+    val_dataset_paths = [human_val_dataset_path], #, macaque_val_dataset_path, mouse_val_dataset_path],
+    dataset_name = "human_7c_6k_depth0.1_cov0.1_rpm1",
     batch_size = 50,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
@@ -71,7 +71,7 @@ trainer = PretrainingTrainer(
     epoch_num = epoch_num,
     mask_value = 0,
     mask_perc = {"count": (0.4, 1.5), "species": 0.15, "cell": 0.15},
-    alpha_limit = (1.0, 5.0),
+    alpha_limit = (4.0, 4.0),
     expr_noise_std = 0.1,
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,

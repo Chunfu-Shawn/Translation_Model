@@ -1,8 +1,20 @@
 import os
-import pandas as pd
 import numpy as np
-from plotnine import *
+import pandas as pd
 from typing import Optional
+from plotnine import *
+
+
+GLOBAL_MODEL_COLORS = {
+    "TRACE": "#2C6B9A",
+    "Convolution": "#637D96",
+    "TranslationAI": "#555555",
+    "RiboTIE": "#777777",
+    "RibORF": "#BBBBBB",
+    "RiboTISH": "#999999",
+    "ORF-structure": "#AF804F",
+    "Transcription-level": "#EBC67F"
+}
 
 
 def plot_model_benchmark(
@@ -19,9 +31,6 @@ def plot_model_benchmark(
     
     records = []
     
-    # =========================================================
-    # 内部辅助函数：统一定义如何从 CSV 提取 ROC-AUC 和 PR-AUC
-    # =========================================================
     def extract_auc_metrics(df, target_feature):
         if target_feature and 'Feature' in df.columns:
             sub_df = df[df['Feature'] == target_feature]
@@ -31,16 +40,12 @@ def plot_model_benchmark(
             row = df.sort_values(by='PR-AUC', ascending=False).iloc[0]
         return row['ROC-AUC'], row['PR-AUC']
         
-    # =========================================================
-    # [MODIFIED] 极简的智能文件读取引擎 (与 TP-Precision 保持完全一致)
-    # =========================================================
     for cfg in manifest:
         model_name = cfg['model']
-        model_type = cfg['type']  # 'w/ Ribo-seq' 或 'w/o Ribo-seq'
+        model_type = cfg['type']  
         target_feature = cfg.get('feature', None)
         
         if model_type == 'w/o Ribo-seq':
-            # 深度无关模型 (单点文件)：读取后将分数广播到所有 depth_levels
             csv_path = cfg['path']
             if not os.path.exists(csv_path):
                 print(f"  [Warning] File not found: {csv_path}. Skipping...")
@@ -59,13 +64,11 @@ def plot_model_benchmark(
                 print(f"  [Warning] Feature '{target_feature}' not found in {csv_path}.")
                 
         elif model_type == 'w/ Ribo-seq':
-            # 深度依赖模型 (动态轨迹)：自动按 depth 向量遍历母目录
             base_dir = cfg['base_dir']
             file_name = cfg.get('file_name', 'overall_metrics.csv')
             target_depths = cfg.get('depths', depth_levels)
             
             for d in target_depths:
-                # 智能路径拼接：base_dir / 深度(例如1M) / file_name
                 csv_path = os.path.join(base_dir, d, file_name)
                 if not os.path.exists(csv_path):
                     print(f"  [Warning] File not found: {csv_path}. Skipping...")
@@ -81,16 +84,13 @@ def plot_model_benchmark(
                     })
                 else:
                     print(f"  [Warning] Feature '{target_feature}' not found in {csv_path}.")
-    # =========================================================
             
     if not records:
         raise ValueError("No valid records extracted. Please check your manifest and file paths.")
         
-    # 汇总为总表
     plot_df = pd.DataFrame(records)
     plot_df.to_csv(os.path.join(out_dir, "aggregated_benchmark_metrics.csv"), index=False)
     
-    # 将 Depth 设定为有序的 Categorical 变量
     plot_df['Depth'] = pd.Categorical(plot_df['Depth'], categories=depth_levels, ordered=True)
 
     print("Generating Benchmark Trend Plots...")
@@ -98,7 +98,7 @@ def plot_model_benchmark(
     model_order = [
         "TRACE", "Convolution", 
         "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
-        "ORF-structure"
+        "ORF-structure", "Transcription-level"
     ]
     all_models_in_data = plot_df['Model'].unique().tolist()
     for m in all_models_in_data:
@@ -107,28 +107,17 @@ def plot_model_benchmark(
             
     plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=model_order, ordered=True)
 
-    # 颜色分配引擎
+    # =================================================================
+    # [MODIFIED] 使用全局统一颜色字典
+    # =================================================================
     color_mapping = {}
-    gray_idx, brown_idx = 0, 0
-    grays = ["#555555", "#777777", "#999999", "#BBBBBB", "#DDDDDD", "#E5E5E5"]
-    browns = ["#AF804F", "#B98C57", "#C3975F", "#CDA367", "#D7AF6F", "#E1BA77", "#EBC67F"]
-    
-    unique_models = plot_df['Model'].unique().tolist()
-    for m_name in unique_models:
-        if "TRACE" in m_name:
-            color_mapping[m_name] = "#2C6B9A"
-        elif "ORF-structure" in m_name or "Baseline" in m_name:
-            color_mapping[m_name] = browns[brown_idx % len(browns)]
-            brown_idx += 1
-        else:
-            color_mapping[m_name] = grays[gray_idx % len(grays)]
-            gray_idx += 1
+    for m_name in plot_df['Model'].unique():
+        color_mapping[m_name] = GLOBAL_MODEL_COLORS.get(m_name, "#C0C0C0") # 默认灰色兜底
             
     print("Applied Color Mapping:")
     for k, v in color_mapping.items():
         print(f"  {k}: {v}")
     
-    # 内部画图函数
     def build_trend_plot(metric_name: str, y_label: str):
         p = (
             ggplot(plot_df, aes(x='Depth', y=metric_name, color='Model', group='Model'))
@@ -155,16 +144,13 @@ def plot_model_benchmark(
         )
         return p
 
-    # 绘制并保存 ROC-AUC
     p_roc = build_trend_plot('ROC-AUC', 'ROC-AUC')
     p_roc.save(os.path.join(out_dir, "Benchmark_ROC_AUC_Trend.pdf"), dpi=300, verbose=False)
     
-    # 绘制并保存 PR-AUC
     p_pr = build_trend_plot('PR-AUC', 'PR-AUC')
     p_pr.save(os.path.join(out_dir, "Benchmark_PR_AUC_Trend.pdf"), dpi=300, verbose=False)
     
     print(f"✅ Benchmark Complete! Plots saved to: {out_dir}")
-
 
 
 def plot_tradeoff_benchmark(
@@ -180,7 +166,6 @@ def plot_tradeoff_benchmark(
     """
     读取 overall_prediction_summary.csv 绘制任意两个指标的气泡轨迹图。
     默认设置为 x=TP_at_Best_Threshold, y=Best_F1_Score。
-    包含点大小映射：1M最小，Total最大，w/o Ribo-seq等于Total大小。
     """
     os.makedirs(out_dir, exist_ok=True)
     print(f"Loading and aggregating benchmark data ({x_col} vs {y_col})...")
@@ -189,7 +174,7 @@ def plot_tradeoff_benchmark(
     
     for cfg in manifest:
         model_name = cfg['model']
-        model_type = cfg['type']  # 'w/ Ribo-seq' 或 'w/o Ribo-seq'
+        model_type = cfg['type']  
         
         if model_type == 'w/o Ribo-seq':
             csv_path = cfg['path']
@@ -201,7 +186,7 @@ def plot_tradeoff_benchmark(
             records.append({
                 'Model': model_name,
                 'Type': model_type,
-                'Depth': 'Constant', # 表示深度无关
+                'Depth': 'Constant', 
                 x_col: df.iloc[0][x_col],
                 y_col: df.iloc[0][y_col]
             })
@@ -231,10 +216,6 @@ def plot_tradeoff_benchmark(
         
     plot_df = pd.DataFrame(records)
     
-    # =================================================================
-    # 严格设定 Depth 的层级顺序，确保画图和映射的逻辑性
-    # 将 'Constant' 追加到深度列表后面，便于统管
-    # =================================================================
     all_depth_categories = depth_levels + ['Constant']
     plot_df['Depth'] = pd.Categorical(plot_df['Depth'], categories=all_depth_categories, ordered=True)
 
@@ -246,7 +227,7 @@ def plot_tradeoff_benchmark(
     model_order = [
         "TRACE", "Convolution",
         "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
-        "ORF-structure"
+        "ORF-structure", "Transcription-level"
     ]
     all_models_in_data = plot_df['Model'].unique().tolist()
     for m in all_models_in_data:
@@ -254,37 +235,19 @@ def plot_tradeoff_benchmark(
             model_order.append(m)
     plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=model_order, ordered=True)
 
-    # 颜色分配引擎
+    # =================================================================
+    # [MODIFIED] 使用全局统一颜色字典
+    # =================================================================
     color_mapping = {}
-    gray_idx, brown_idx = 0, 0
-    grays = ["#555555", "#777777", "#999999", "#BBBBBB", "#DDDDDD", "#E5E5E5"]
-    browns = ["#AF804F", "#B98C57", "#C3975F", "#CDA367", "#D7AF6F", "#E1BA77", "#EBC67F"]
-    
-    unique_models = plot_df['Model'].unique().tolist()
-    for m_name in unique_models:
-        if "TRACE" in m_name:
-            color_mapping[m_name] = "#2C6B9A"
-        elif "ORF-structure" in m_name or "Baseline" in m_name:
-            color_mapping[m_name] = browns[brown_idx % len(browns)]
-            brown_idx += 1
-        else:
-            color_mapping[m_name] = grays[gray_idx % len(grays)]
-            gray_idx += 1
+    for m_name in plot_df['Model'].unique():
+        color_mapping[m_name] = GLOBAL_MODEL_COLORS.get(m_name, "#C0C0C0")
             
-    # =================================================================
-    # 点大小分配引擎 (Size Mapping)
-    # =================================================================
-    min_size = 2  # 最小点大小 (1M)
-    max_size = 5  # 最大点大小 (Total)
-    
-    # 动态生成线性递增的大小数组
+    # 点大小分配引擎 
+    min_size = 2  
+    max_size = 5  
     depth_sizes = np.linspace(min_size, max_size, len(depth_levels))
-    
-    # 构建映射字典
     size_mapping = {d: s for d, s in zip(depth_levels, depth_sizes)}
-    # w/o Ribo-seq 模型对应 'Constant'，将其大小与 'Total' 齐平
     size_mapping['Constant'] = 5 
-    # =================================================================
 
     p = (
         ggplot(plot_df, aes(x=x_col, y=y_col, color='Model'))
@@ -293,20 +256,10 @@ def plot_tradeoff_benchmark(
             mapping=aes(group='Model'), 
             linetype='dashed', size=1.2, alpha=0.7
         )
-        # =========================================================
-        # [MODIFIED] 在这里加入 size='Depth' 的映射，并移除写死的 size=4.5
-        # =========================================================
         + geom_point(mapping=aes(size='Depth'), alpha=0.9, stroke=0.5)
-        
         + scale_x_log10()
         + scale_color_manual(values=color_mapping)
-        
-        # =========================================================
-        # [NEW] 传入刚才计算的尺寸字典。
-        # 使用 breaks 仅在图例中显示 Ribo-seq 深度，隐藏 'Constant'（避免读者困惑）
-        # =========================================================
         + scale_size_manual(values=size_mapping, breaks=depth_levels, name="Ribo-seq Depth")
-        
         + theme_bw()
         + labs(
             title=title,
@@ -319,7 +272,7 @@ def plot_tradeoff_benchmark(
             axis_text=element_text(size=10),
             legend_position="right",
             legend_text=element_text(size=10),
-            legend_title=element_text(size=10, face="bold") # 让图例标题更明显
+            legend_title=element_text(size=10, face="bold") 
         )
     )
     
@@ -332,7 +285,8 @@ def plot_multi_model_top_k_precision(
         manifest: list, 
         out_dir: str = "./results/benchmark", 
         min_k: Optional[int] = None,
-        max_k: Optional[int] = None
+        max_k: Optional[int] = None, 
+        suffix: str = ""
 ):
     """
     绘制多模型 Top-K Precision 对比折线图。
@@ -383,13 +337,8 @@ def plot_multi_model_top_k_precision(
     if not all_pk_data:
         raise ValueError("No valid Top-K data processed. Please check your manifest.")
         
-    # 合并所有模型数据
     plot_df = pd.concat(all_pk_data, ignore_index=True)
         
-    # =================================================================
-    # 智能按模型平滑 (Smart Smoothing per Model)
-    # [注意] 必须在截断范围之前做平滑，否则起点的滑动窗口会缺失历史数据
-    # =================================================================
     smoothing_window = 50  
     
     def apply_smoothing(group):
@@ -399,17 +348,11 @@ def plot_multi_model_top_k_precision(
     print(f"Applying rolling average smoothing (window={smoothing_window})...")
     plot_df = plot_df.groupby('Model', group_keys=False).apply(apply_smoothing)
 
-    # =================================================================
-    # [MODIFIED] 限制 X 轴范围 (Zoom-in) - 移至平滑之后
-    # =================================================================
     if min_k is not None:
         plot_df = plot_df[plot_df['K'] >= min_k]
     if max_k is not None:
         plot_df = plot_df[plot_df['K'] <= max_k]
 
-    # =================================================================
-    # 智能按模型降采样 (Smart Downsampling per Model)
-    # =================================================================
     def downsample(group, max_pts=3000):
         if len(group) > max_pts:
             indices = np.linspace(0, len(group) - 1, max_pts).astype(int)
@@ -421,7 +364,7 @@ def plot_multi_model_top_k_precision(
     model_order = [
         "TRACE", "Convolution",
         "TranslationAI", "RiboTIE", "RiboTISH", "RibORF",
-        "ORF-structure"
+        "ORF-structure", "Transcription-level"
     ]
     all_models_in_data = plot_df['Model'].unique().tolist()
     for m in all_models_in_data:
@@ -430,49 +373,36 @@ def plot_multi_model_top_k_precision(
     plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=model_order, ordered=True)
 
     # =================================================================
-    # 颜色与线型分配引擎 (Color & Linetype Mapping)
+    # [MODIFIED] 颜色与线型分配引擎 (Color & Linetype Mapping)
     # =================================================================
     color_mapping = {}
     linetype_mapping = {} 
     
-    gray_idx, brown_idx = 0, 0
-    grays = ["#555555", "#777777", "#999999", "#BBBBBB", "#DDDDDD", "#E5E5E5"]
-    browns = ["#AF804F", "#B98C57", "#C3975F", "#CDA367", "#D7AF6F", "#E1BA77", "#EBC67F"]
-    
     for m_name in plot_df['Model'].cat.categories:
+        # 使用全局统一颜色
+        color_mapping[m_name] = GLOBAL_MODEL_COLORS.get(m_name, "#C0C0C0")
+        
+        # 线型保留你原有的逻辑：只有 TRACE 是实线，其余 Baseline 都是虚线
         if "TRACE" in m_name:
-            color_mapping[m_name] = "#2C6B9A"
             linetype_mapping[m_name] = "solid"
-        elif "ORF-structure" in m_name or "Baseline" in m_name:
-            color_mapping[m_name] = browns[brown_idx % len(browns)]
-            linetype_mapping[m_name] = "dashed" 
-            brown_idx += 1
         else:
-            color_mapping[m_name] = grays[gray_idx % len(grays)]
             linetype_mapping[m_name] = "dashed"  
-            gray_idx += 1
             
     print("Generating Multi-Model Precision@K line chart...")
     
-    # =================================================================
-    # [MODIFIED] 动态生成图表标题和文件名
-    # =================================================================
     if min_k is not None and max_k is not None:
         title_suffix = f"(K: {min_k} to {max_k})"
-        file_suffix = f"{min_k}_to_{max_k}"
+        file_suffix = f"{suffix}_{min_k}_to_{max_k}"
     elif min_k is not None:
         title_suffix = f"(K >= {min_k})"
-        file_suffix = f"{min_k}_to_All"
+        file_suffix = f"{suffix}_{min_k}_to_All"
     elif max_k is not None:
         title_suffix = f"(Top {max_k})"
-        file_suffix = f"1_to_{max_k}"
+        file_suffix = f"{suffix}_1_to_{max_k}"
     else:
         title_suffix = "(All Predictions)"
-        file_suffix = "All"
+        file_suffix = f"{suffix}_All"
 
-    # =================================================================
-    # 绘图逻辑
-    # =================================================================
     p = (
         ggplot(plot_df, aes(x='K', y='Precision_Smooth', color='Model'))
         + geom_line(aes(linetype='Model'), size=1.5, alpha=0.85)
@@ -519,9 +449,6 @@ def plot_top_k_precision_bar(
     
     records = []
     
-    # =================================================================
-    # 1. 精准提取每个评估文件在 target_k 处的 Precision
-    # =================================================================
     for cfg in manifest:
         model_name = cfg['model']
         csv_path = cfg['path']
@@ -536,12 +463,10 @@ def plot_top_k_precision_bar(
         df = pd.read_csv(csv_path)
         prec_val = np.nan
         
-        # 情况 A: 已经是计算好的 Precision@K 统计表
         if 'Precision' in df.columns and 'K' in df.columns:
             if target_k in df['K'].values:
                 prec_val = df.loc[df['K'] == target_k, 'Precision'].values[0]
             else:
-                # 如果模型预测数量不足 target_k，使用最大 K 处的真阳性数量重新计算
                 max_k_avail = df['K'].max()
                 if 'TP_Count' in df.columns:
                     max_tp = df.loc[df['K'] == max_k_avail, 'TP_Count'].values[0]
@@ -549,7 +474,6 @@ def plot_top_k_precision_bar(
                 else:
                     prec_val = (df['Precision'].iloc[-1] * max_k_avail) / target_k
                     
-        # 情况 B: 原始评分预测表
         elif 'y_true' in df.columns and score_col in df.columns:
             df_sorted = df.sort_values(by=score_col, ascending=False).reset_index(drop=True)
             df_sorted = df_sorted[df_sorted[score_col] >= 0].copy()
@@ -560,7 +484,6 @@ def plot_top_k_precision_bar(
                 if len(df_sorted) >= target_k:
                     prec_val = df_sorted['y_true'].iloc[:target_k].sum() / target_k
                 else:
-                    # 惩罚预测数量不足 target_k 的情况
                     prec_val = df_sorted['y_true'].sum() / target_k
         else:
             print(f"  [Warning] {csv_path} lacks required columns.")
@@ -578,9 +501,6 @@ def plot_top_k_precision_bar(
         
     plot_df = pd.DataFrame(records)
 
-    # =================================================================
-    # 2. 计算均值和标准误 (SEM)
-    # =================================================================
     summary_df = plot_df.groupby('Model', observed=False).agg(
         Overall_Mean=('Precision', 'mean'),
         SEM=('Precision', lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0)
@@ -589,13 +509,10 @@ def plot_top_k_precision_bar(
     summary_df['ymin'] = summary_df['Overall_Mean'] - summary_df['SEM']
     summary_df['ymax'] = summary_df['Overall_Mean'] + summary_df['SEM']
 
-    # =================================================================
-    # 3. 模型排序与颜色分配 
-    # =================================================================
     model_order = [
         "TRACE", "Convolution", 
         "TranslationAI", "RiboTIE", "RibORF", "RiboTISH",
-        "ORF-structure"
+        "ORF-structure", "Transcription-level"
     ]
     valid_models = [m for m in model_order if m in plot_df['Model'].unique()]
     for m in plot_df['Model'].unique():
@@ -605,25 +522,13 @@ def plot_top_k_precision_bar(
     plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=valid_models, ordered=True)
     summary_df['Model'] = pd.Categorical(summary_df['Model'], categories=valid_models, ordered=True)
 
-    # 模型 Bar 颜色映射
-    model_colors = {
-        "TRACE": "#2C6B9A",
-        "Convolution": "#637D96",
-        "TranslationAI": "#999999",
-        "RiboTIE": "#555555",
-        "RibORF": "#777777",
-        "RiboTISH": "#BBBBBB",
-        "ORF-structure": "#AF804F",
-        # "Kozak score": "#EBC67F"
-    }
-    # 兜底默认颜色
+    # =================================================================
+    # [MODIFIED] 获取全局字典的颜色，确保一致性
+    # =================================================================
+    model_colors = {}
     for m in valid_models:
-        if m not in model_colors:
-            model_colors[m] = "#C0C0C0"
+        model_colors[m] = GLOBAL_MODEL_COLORS.get(m, "#C0C0C0")
             
-    # =================================================================
-    # 4. 细胞系颜色分配 (高亮 Unseen)
-    # =================================================================
     unique_cells = plot_df['Cell_type'].unique().tolist()
     unseen_cells = [c for c in unique_cells if 'unseen' in str(c).lower()]
     seen_cells = [c for c in unique_cells if c not in unseen_cells]
@@ -637,9 +542,6 @@ def plot_top_k_precision_bar(
     for ct in unseen_cells:
         cell_colors[ct] = "#D6715E"
 
-    # =================================================================
-    # 5. 数据集形状分配
-    # =================================================================
     unique_datasets = plot_df['Dataset'].unique().tolist()
     plot_df['Dataset'] = pd.Categorical(plot_df['Dataset'], categories=unique_datasets, ordered=True)
     
@@ -648,20 +550,15 @@ def plot_top_k_precision_bar(
     for i, ds in enumerate(unique_datasets):
         dataset_shapes[ds] = shapes_pool[i % len(shapes_pool)]
 
-    # =================================================================
-    # 6. 绘图逻辑
-    # =================================================================
     print(f"Generating Precision@{target_k} Bar Chart...")
     
     p = (
         ggplot()
-        # 底层：绘制 Bar 图 (均值)
         + geom_col(
             data=summary_df, 
             mapping=aes(x='Model', y='Overall_Mean', fill='Model'), 
             width=0.7
         )
-        # 中层：绘制误差棒 (SEM)
         + geom_errorbar(
             data=summary_df, 
             mapping=aes(x='Model', ymin='ymin', ymax='ymax'), 
@@ -669,7 +566,6 @@ def plot_top_k_precision_bar(
             size=0.8, 
             color="black"
         )
-        # 顶层：绘制散点 (代表各个 Cell_type/Dataset 的实际值)
         + geom_jitter(
             data=plot_df, 
             mapping=aes(x='Model', y='Precision', shape='Dataset', color='Cell_type'), 
@@ -678,11 +574,9 @@ def plot_top_k_precision_bar(
             stroke=0.8,
             alpha=0.85
         )
-        # 美学映射
         + scale_fill_manual(values=model_colors, guide=None) 
         + scale_shape_manual(values=dataset_shapes, name="Dataset") 
         + scale_color_manual(values=cell_colors, name="Cell type")
-        # + scale_y_continuous(limits=(0, 1.05)) # Precision 最大为 1
         + theme_bw()
         + labs(
             x="",

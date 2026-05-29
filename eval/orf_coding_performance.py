@@ -9,6 +9,18 @@ from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_prec
 from plotnine import *
 
 # =====================================================================
+# [NEW] 动态寻找评估分数列的辅助函数
+# =====================================================================
+def resolve_score_col(df: pd.DataFrame, target_col: Optional[str]) -> str:
+    """优先使用指定分数，若无则按优先级降级寻找"""
+    if target_col and target_col in df.columns:
+        return target_col
+    for col in ['expr_score', 'translation_score', 'score']:
+        if col in df.columns:
+            return col
+    raise ValueError(f"No valid score column found! Available columns: {df.columns.tolist()}")
+
+# =====================================================================
 # Module 1: Data Loading and Preprocessing
 # =====================================================================
 def load_and_filter_data(
@@ -16,7 +28,8 @@ def load_and_filter_data(
         gt_csv_path: str, 
         target_transcript_ids: Optional[List[str]] = None,
         min_orf_len: Optional[int] = None,
-        max_orf_len: Optional[int] = None):
+        max_orf_len: Optional[int] = None,
+        target_score_col: Optional[str] = None):
     """Read, clean, and filter data based on target transcripts and exact length ranges."""
     print(f"Loading Ground Truth from: {gt_csv_path}")
     try:
@@ -26,9 +39,6 @@ def load_and_filter_data(
     except Exception as e:
         raise ValueError(f"Error reading GT: {e}")
         
-    # =================================================================
-    # [MODIFIED] 去除 GT 中 ENST 开头 ID 的版本号
-    # =================================================================
     gt_df['Tid_clean'] = gt_df['Tid'].astype(str).apply(
         lambda x: x.split('.')[0] if x.startswith('ENST') else x
     )
@@ -40,12 +50,12 @@ def load_and_filter_data(
     print(f"Loading Predictions from: {pred_csv_path}")
     pred_df = pd.read_csv(pred_csv_path)
     
-    if 'score' not in pred_df.columns:
-        raise ValueError("Validation Error: The predictions file MUST contain a 'score' column for evaluation.")
+    # =================================================================
+    # [MODIFIED] 动态决定用于评估的主分数
+    # =================================================================
+    score_col = resolve_score_col(pred_df, target_score_col)
+    print(f"  -> Using '{score_col}' as the primary score for ranking and evaluation.")
 
-    # =================================================================
-    # [MODIFIED] 去除 Predictions 中 ENST 开头 ID 的版本号
-    # =================================================================
     pred_df['Tid_clean'] = pred_df['Tid'].astype(str).apply(
         lambda x: x.split('.')[0] if x.startswith('ENST') else x
     )
@@ -53,12 +63,8 @@ def load_and_filter_data(
     if 'length' not in pred_df.columns:
         pred_df['length'] = pred_df['stop'] - pred_df['start']
 
-    # 1. Filter by transcript IDs
     if target_transcript_ids is not None:
         print(f"Filtering datasets to {len(target_transcript_ids)} target transcripts...")
-        # =================================================================
-        # [NEW] 同样清理传入的 target_transcript_ids，保证两端能够完美 match
-        # =================================================================
         target_set = set(
             str(t).split('.')[0] if str(t).startswith('ENST') else str(t) 
             for t in target_transcript_ids
@@ -67,7 +73,6 @@ def load_and_filter_data(
         pred_df = pred_df[pred_df['Tid_clean'].isin(target_set)].copy()
         
     if min_orf_len is not None or max_orf_len is not None:
-        # 参数校验
         if min_orf_len is not None and max_orf_len is not None and min_orf_len > max_orf_len:
             raise ValueError(f"Invalid length range: min_orf_len ({min_orf_len}) cannot be greater than max_orf_len ({max_orf_len}).")
             
@@ -91,29 +96,30 @@ def load_and_filter_data(
     gt_df = gt_df.reset_index(drop=True)
     gt_df['gt_idx'] = gt_df.index
     
-    pred_df = pred_df.sort_values('score', ascending=False).reset_index(drop=True)
+    # =================================================================
+    # [MODIFIED] 使用选定好的 score_col 进行倒序排列
+    # =================================================================
+    pred_df = pred_df.sort_values(score_col, ascending=False).reset_index(drop=True)
     pred_df['pred_idx'] = pred_df.index
     
-    return pred_df, gt_df
+    # [MODIFIED] 将 score_col 传递出去，供下游使用
+    return pred_df, gt_df, score_col
 
 # =====================================================================
 # Module 2: NMS Matching and Unified Evaluation Table Construction
 # =====================================================================
 def match_and_build_eval_df(pred_df: pd.DataFrame, gt_df: pd.DataFrame, eval_metrics: List[str], overlap_threshold: float) -> pd.DataFrame:
-    """Execute ultra-fast NMS matching and build a unified evaluation dataframe containing y_true, length, and scores."""
     print(f"\nMemory-Safe Matching (Frame Consistent & Overlap > {overlap_threshold*100}%)...")
     
-    # Build Ground Truth dictionary for O(1) lookups
     gt_dict = {}
     for row in gt_df.itertuples(index=False):
         if row.Tid_clean not in gt_dict:
             gt_dict[row.Tid_clean] = []
         gt_dict[row.Tid_clean].append((row.gt_idx, row.start_gt, row.stop_gt))
         
-    pred_to_gt = {} # Map successful predictions to their GT indices
+    pred_to_gt = {} 
     matched_gt_indices = set()
     
-    # Matching logic
     for row in pred_df.itertuples(index=False):
         tid = row.Tid_clean
         if tid not in gt_dict: continue
@@ -139,10 +145,8 @@ def match_and_build_eval_df(pred_df: pd.DataFrame, gt_df: pd.DataFrame, eval_met
     eval_records = []
     gt_lengths = dict(zip(gt_df['gt_idx'], gt_df['length']))
     
-    # 1. Assemble Predictions (TP and FP)
     for row in pred_df.itertuples(index=False):
         is_tp = row.pred_idx in pred_to_gt
-        # Core logic: If TP, use actual GT length; if FP, use predicted length
         eval_len = gt_lengths[pred_to_gt[row.pred_idx]] if is_tp else row.length
         
         record = {'y_true': 1 if is_tp else 0, 'length': eval_len}
@@ -151,11 +155,10 @@ def match_and_build_eval_df(pred_df: pd.DataFrame, gt_df: pd.DataFrame, eval_met
             record[m] = float(val)
         eval_records.append(record)
         
-    # 2. Assemble False Negatives (FN)
     for row in gt_df.itertuples(index=False):
         if row.gt_idx not in matched_gt_indices:
             record = {'y_true': 1, 'length': row.length}
-            for m in eval_metrics: record[m] = -1.0 # Missed GTs receive a score of -1.0
+            for m in eval_metrics: record[m] = -1.0 
             eval_records.append(record)
             
     eval_df = pd.DataFrame(eval_records)
@@ -170,10 +173,9 @@ def match_and_build_eval_df(pred_df: pd.DataFrame, gt_df: pd.DataFrame, eval_met
     return eval_df
 
 # =====================================================================
-# Module 3: Global Evaluation Plotting
+# Module 3: Global Evaluation Plotting (保持不变)
 # =====================================================================
 def evaluate_and_plot_global(eval_df: pd.DataFrame, eval_metrics: List[str], display_names: dict, out_dir: str):
-    """Calculate global metrics, plot ROC/PR and Heatmap."""
     print("\nCalculating overall metrics and generating global plots...")
     roc_dfs, pr_dfs, auc_records = [], [], []
     y_true = eval_df['y_true'].values
@@ -188,13 +190,11 @@ def evaluate_and_plot_global(eval_df: pd.DataFrame, eval_metrics: List[str], dis
         scores = eval_df[metric].values
         d_name = display_names.get(metric, metric)
         
-        # Calculate ROC
         fpr, tpr, _ = roc_curve(y_true, scores)
         roc_auc = auc(fpr, tpr)
         fpr_plot, tpr_plot = subsample_curve(fpr, tpr)
         roc_dfs.append(pd.DataFrame({'FPR': fpr_plot, 'TPR': tpr_plot, 'Metric': d_name, 'AUC': roc_auc}))
         
-        # Calculate PR
         prec, rec, _ = precision_recall_curve(y_true, scores)
         pr_auc = average_precision_score(y_true, scores)
         rec_plot, prec_plot = subsample_curve(rec, prec)
@@ -237,15 +237,17 @@ def evaluate_and_plot_global(eval_df: pd.DataFrame, eval_metrics: List[str], dis
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "Overall_AUC_Heatmap.pdf"), dpi=300)
     plt.close()
-    
     metrics_df.to_csv(os.path.join(out_dir, "overall_metrics.csv"), index=False)
 
 
 # =====================================================================
 # Module 4: Binned Evaluation Plotting and Stacked Bar Charts
 # =====================================================================
-def evaluate_and_plot_binned(eval_df: pd.DataFrame, eval_metrics: List[str], display_names: dict, out_dir: str):
-    """Bin by length and execute raw TP/FP/FN classification based on coordinate NMS matching."""
+def evaluate_and_plot_binned(eval_df: pd.DataFrame, eval_metrics: List[str], display_names: dict, out_dir: str, 
+                             # =================================================================
+                             # [NEW] 传入需要进行分类的主分数列
+                             # =================================================================
+                             main_score_col: str):
     print("\nCalculating Binned AUCs and Raw Classifications across ORF Lengths...")
     
     try:
@@ -258,13 +260,11 @@ def evaluate_and_plot_binned(eval_df: pd.DataFrame, eval_metrics: List[str], dis
         print("  -> Insufficient variation in lengths for 8 bins. Skipping binned plotting.")
         return
     
-    binned_records = []
-    binned_counts = []
+    binned_records, binned_counts = [], []
     
     for bin_label in ordered_bin_labels:
         bin_df = eval_df[eval_df['Length_Bin'] == bin_label]
         y_true_bin = bin_df['y_true'].values
-        
         valid_auc = (y_true_bin.sum() > 0) and ((1 - y_true_bin).sum() > 0)
         
         for metric in eval_metrics:
@@ -276,7 +276,10 @@ def evaluate_and_plot_binned(eval_df: pd.DataFrame, eval_metrics: List[str], dis
                 'ROC-AUC': roc_auc, 'PR-AUC': pr_auc
             })
             
-            if metric == 'score':
+            # =================================================================
+            # [MODIFIED] 使用动态 main_score_col 进行截断
+            # =================================================================
+            if metric == main_score_col:
                 tp = ((y_true_bin == 1) & (scores_bin >= 0)).sum()
                 fn = ((y_true_bin == 1) & (scores_bin < 0)).sum()
                 fp = (y_true_bin == 0).sum()
@@ -296,35 +299,26 @@ def evaluate_and_plot_binned(eval_df: pd.DataFrame, eval_metrics: List[str], dis
     color_palette = ["#e74c3c", "#3498db", "#2ecc71", "#9b59b6", "#f1c40f", "#34495e"]
     
     if not binned_df['ROC-AUC'].isna().all():
-        p_roc_binned = (
-            ggplot(binned_df.dropna(subset=['ROC-AUC']), aes(x='Length_Bin', y='ROC-AUC', color='Metric', group='Metric'))
+        p_roc_binned = (ggplot(binned_df.dropna(subset=['ROC-AUC']), aes(x='Length_Bin', y='ROC-AUC', color='Metric', group='Metric'))
             + geom_point(size=3) + geom_line(size=1.2) + scale_color_manual(values=color_palette) + theme_bw() 
             + labs(title="ROC-AUC across ORF Lengths", x="ORF Length (nt)", y="ROC-AUC")
-            + theme(axis_text_x=element_text(rotation=30, hjust=1), figure_size=(7, 5), panel_border=element_rect(color="black", size=1), legend_title=element_blank())
-        )
+            + theme(axis_text_x=element_text(rotation=30, hjust=1), figure_size=(7, 5), panel_border=element_rect(color="black", size=1), legend_title=element_blank()))
         p_roc_binned.save(os.path.join(out_dir, "Binned_Length_ROC_AUC.pdf"), verbose=False)
 
     if not binned_df['PR-AUC'].isna().all():
-        p_pr_binned = (
-            ggplot(binned_df.dropna(subset=['PR-AUC']), aes(x='Length_Bin', y='PR-AUC', color='Metric', group='Metric'))
+        p_pr_binned = (ggplot(binned_df.dropna(subset=['PR-AUC']), aes(x='Length_Bin', y='PR-AUC', color='Metric', group='Metric'))
             + geom_point(size=3) + geom_line(size=1.2) + scale_color_manual(values=color_palette) + theme_bw() 
             + labs(title="PR-AUC across ORF Lengths", x="ORF Length (nt)", y="PR-AUC")
-            + theme(axis_text_x=element_text(rotation=30, hjust=1), figure_size=(7, 5), panel_border=element_rect(color="black", size=1), legend_title=element_blank())
-        )
+            + theme(axis_text_x=element_text(rotation=30, hjust=1), figure_size=(7, 5), panel_border=element_rect(color="black", size=1), legend_title=element_blank()))
         p_pr_binned.save(os.path.join(out_dir, "Binned_Length_PR_AUC.pdf"), verbose=False)
 
-    p_counts_bar = (
-        ggplot(counts_df, aes(x='Length_Bin', y='Count', fill='Type'))
+    p_counts_bar = (ggplot(counts_df, aes(x='Length_Bin', y='Count', fill='Type'))
         + geom_bar(stat='identity', position='stack', alpha=0.85)
         + scale_fill_manual(values={'True Positive (TP)': '#2ecc71', 'False Negative (FN)': '#95a5a6', 'False Positive (FP)': '#e74c3c'})
-        + theme_bw() 
-        + labs(
-            title="Raw Prediction Outcomes (NMS Matched) across Lengths", 
-            x="ORF Length (nt)", y="Count"
-        )
-        + theme(axis_text_x=element_text(rotation=30, hjust=1), figure_size=(7, 5), panel_border=element_rect(color="black", size=1), legend_title=element_blank(), legend_position="bottom")
-    )
+        + theme_bw() + labs(title="Raw Prediction Outcomes (NMS Matched) across Lengths", x="ORF Length (nt)", y="Count")
+        + theme(axis_text_x=element_text(rotation=30, hjust=1), figure_size=(7, 5), panel_border=element_rect(color="black", size=1), legend_title=element_blank(), legend_position="bottom"))
     p_counts_bar.save(os.path.join(out_dir, "Binned_Length_Distribution.pdf"), verbose=False)
+
 
 # =====================================================================
 # Main Orchestrator
@@ -336,18 +330,26 @@ def evaluate_orf_level_predictions(
         min_orf_len: Optional[int] = None,
         max_orf_len: Optional[int] = None,
         out_dir: str = "./results/eval",
-        overlap_threshold: float = 0.70):
+        overlap_threshold: float = 0.70,
+        target_score_col: Optional[str] = None):
     """
     Main Orchestrator: Highly decoupled ORF evaluation pipeline.
     Automatically identifies and plots available metrics, dropping missing ones.
     """
     os.makedirs(out_dir, exist_ok=True)
     
-    # 1. Filter and Load
-    pred_df, gt_df = load_and_filter_data(
-        pred_csv_path, gt_csv_path, target_transcript_ids, min_orf_len, max_orf_len)
+    # 1. Filter and Load (解包接收动态确定的 score_col)
+    pred_df, gt_df, score_col = load_and_filter_data(
+        pred_csv_path, gt_csv_path, target_transcript_ids, min_orf_len, max_orf_len, target_score_col)
     
+    # =================================================================
+    # [MODIFIED] 将两种新分数纳入全集选项池中
+    # =================================================================
     all_possible_metrics = {
+        'expr_score': 'Expression Score (TPM*Signal)',
+        'translation_score': 'Pure Translation Score',
+        'transcription_score': 'Pure Transcription Score',
+        'seq_score': 'Pure ORF-structure Score',
         'score': 'Final Score', 
         'mean_intensity': 'Mean Intensity', 
         'tri_nucleotide_periodicity': 'Periodicity',
@@ -363,18 +365,20 @@ def evaluate_orf_level_predictions(
 
     # 2. Match and build unified evaluation dataframe
     eval_df = match_and_build_eval_df(pred_df, gt_df, eval_metrics, overlap_threshold)
-    
     eval_df.to_csv(os.path.join(out_dir, "unified_evaluation_table.csv"), index=False)
     
     print("\nCalculating Overall Prediction Summary and Best F1-Score...")
     
-    tp_count = ((eval_df['y_true'] == 1) & (eval_df['score'] >= 0)).sum()
+    # =================================================================
+    # [MODIFIED] 使用动态决定的 score_col 替代原本硬编码的 'score'
+    # =================================================================
+    tp_count = ((eval_df['y_true'] == 1) & (eval_df[score_col] >= 0)).sum()
     fp_count = (eval_df['y_true'] == 0).sum()
     total_predictions = tp_count + fp_count
     overall_precision = tp_count / total_predictions if total_predictions > 0 else 0.0
 
     y_true_all = eval_df['y_true'].values
-    scores_all = eval_df['score'].values
+    scores_all = eval_df[score_col].values
     
     prec, rec, pr_threshs = precision_recall_curve(y_true_all, scores_all)
     f1_scores = 2 * (prec * rec) / (prec + rec + 1e-9)
@@ -383,8 +387,8 @@ def evaluate_orf_level_predictions(
     opt_thresh_val = pr_threshs[opt_idx] if opt_idx < len(pr_threshs) else pr_threshs[-1]
     best_f1 = f1_scores[opt_idx]
     
-    best_tp_count = ((eval_df['y_true'] == 1) & (eval_df['score'] >= opt_thresh_val) & (eval_df['score'] >= 0)).sum()
-    best_fp_count = ((eval_df['y_true'] == 0) & (eval_df['score'] >= opt_thresh_val) & (eval_df['score'] >= 0)).sum()
+    best_tp_count = ((eval_df['y_true'] == 1) & (eval_df[score_col] >= opt_thresh_val) & (eval_df[score_col] >= 0)).sum()
+    best_fp_count = ((eval_df['y_true'] == 0) & (eval_df[score_col] >= opt_thresh_val) & (eval_df[score_col] >= 0)).sum()
 
     summary_df = pd.DataFrame({
         'Total_Predictions': [total_predictions],
@@ -401,77 +405,76 @@ def evaluate_orf_level_predictions(
     summary_df.to_csv(summary_save_path, index=False)
     print(f"  -> Saved Overall TP ({tp_count}) and Precision ({overall_precision:.4f})")
     print(f"  -> Found Best F1 ({best_f1:.4f}) at Threshold {opt_thresh_val:.4f} (TP={best_tp_count}, FP={best_fp_count})")
-    print(f"  -> Summary saved to: {summary_save_path}")
-
-    # 3. Global plotting
-    evaluate_and_plot_global(eval_df, eval_metrics, display_names, out_dir)
     
-    # 4. Binned plotting
-    evaluate_and_plot_binned(eval_df, eval_metrics, display_names, out_dir)
+    evaluate_and_plot_global(eval_df, eval_metrics, display_names, out_dir)
+    # [MODIFIED] 传入选定的 score_col
+    evaluate_and_plot_binned(eval_df, eval_metrics, display_names, out_dir, score_col)
     
     print(f"\n✅ All Evaluation processes successfully finished! Output directory: {out_dir}")
 
 
+
 # =====================================================================
-# Module 1: Precision@K Calculation Engine
+# Module 1 (Top-K): Precision@K Calculation Engine
 # =====================================================================
 def calculate_top_k_precision(
         pred_csv_path: str, 
         gt_csv_path: str, 
         min_orf_len: Optional[int] = None,
         max_orf_len: Optional[int] = None,
-        overlap_threshold: float = 0.70,) -> pd.DataFrame:
+        overlap_threshold: float = 0.70,
+        target_score_col: Optional[str] = None) -> pd.DataFrame:
     """
     Calculate the Precision@K for predicted ORFs against the Ground Truth.
     Matches are based on Frame consistency and spatial overlap.
-    Includes robust length filtering for specific ORF ranges (e.g., sORFs).
     """
     print(f"\nLoading and preparing data for Precision@K evaluation...")
     
-    # 1. Load Ground Truth
     gt_df = pd.read_csv(gt_csv_path, sep='\t' if '\t' in open(gt_csv_path).readline() else ',')
-    gt_df['Tid_clean'] = gt_df['Tid'].astype(str)
+    
+    # =================================================================
+    # [MODIFIED] 安全清理 Ground Truth ID：仅对 ENST/ENSG 截断版本号
+    # =================================================================
+    gt_df['Tid_clean'] = gt_df['Tid'].astype(str).apply(
+        lambda x: x.split('.')[0] if (x.startswith('ENST') or x.startswith('ENSG')) and '.' in x else x
+    )
+    
     gt_df['start_gt'] = gt_df['CDS_Start_0based']
     gt_df['stop_gt'] = gt_df['CDS_End_0based']
-    gt_df['length'] = gt_df['stop_gt'] - gt_df['start_gt'] # [NEW] 确保计算了GT长度
+    gt_df['length'] = gt_df['stop_gt'] - gt_df['start_gt'] 
     
-    # 2. Load Predictions 
     pred_df = pd.read_csv(pred_csv_path)
-    pred_df['Tid_clean'] = pred_df['Tid'].astype(str)
+    
+    # =================================================================
+    # [MODIFIED] 安全清理 Predictions ID：仅对 ENST/ENSG 截断版本号
+    # =================================================================
+    pred_df['Tid_clean'] = pred_df['Tid'].astype(str).apply(
+        lambda x: x.split('.')[0] if (x.startswith('ENST') or x.startswith('ENSG')) and '.' in x else x
+    )
+    
     if 'length' not in pred_df.columns:
         pred_df['length'] = pred_df['stop'] - pred_df['start']
+
+    score_col = resolve_score_col(pred_df, target_score_col)
+    print(f"  -> Ranking predictions using column: '{score_col}'")
         
-    # =================================================================
-    # [NEW] 双向长度过滤逻辑
-    # =================================================================
     if min_orf_len is not None or max_orf_len is not None:
         if min_orf_len is not None and max_orf_len is not None and min_orf_len > max_orf_len:
-            raise ValueError(f"Invalid length range: min_orf_len ({min_orf_len}) cannot be greater than max_orf_len ({max_orf_len}).")
+            raise ValueError(f"Invalid length range.")
             
         lower_bound = min_orf_len if min_orf_len is not None else 0
         upper_bound = max_orf_len if max_orf_len is not None else float('inf')
         
-        print(f"Filtering ORFs by length range: {lower_bound} <= Length <= {upper_bound} nt...")
-        
-        gt_orig_len = len(gt_df)
-        pred_orig_len = len(pred_df)
-        
         gt_df = gt_df[(gt_df['length'] >= lower_bound) & (gt_df['length'] <= upper_bound)].copy()
         pred_df = pred_df[(pred_df['length'] >= lower_bound) & (pred_df['length'] <= upper_bound)].copy()
-        
-        print(f"  -> Ground Truth ORFs retained : {len(gt_df)} / {gt_orig_len}")
-        print(f"  -> Predicted ORFs retained    : {len(pred_df)} / {pred_orig_len}")
         
     if len(gt_df) == 0 or len(pred_df) == 0:
         print("Warning: No Ground Truth or Predicted ORFs left after filtering. Returning empty dataframe.")
         return pd.DataFrame(columns=['K', 'TP_Count', 'Precision'])
-    # =================================================================
 
-    # 排序预测结果 (Ensure it is sorted by score in descending order!)
-    pred_df = pred_df.sort_values(by='score', ascending=False).reset_index(drop=True)
+    pred_df = pred_df.sort_values(by=score_col, ascending=False).reset_index(drop=True)
     pred_df['pred_idx'] = pred_df.index
     
-    # 3. Fast Coordinate Matching (Frame & Overlap)
     print(f"Executing ultra-fast coordinate matching (Overlap > {overlap_threshold*100}%)...")
     gt_dict = {}
     for row in gt_df.itertuples(index=False):
@@ -503,32 +506,26 @@ def calculate_top_k_precision(
         
         is_tp_list.append(1 if matched else 0)
 
-    # 4. Vectorized Precision@K Calculation
     print("Calculating Cumulative Precision@K...")
     is_tp_array = np.array(is_tp_list)
-    
     tp_cumsum = np.cumsum(is_tp_array)
     k_array = np.arange(1, len(is_tp_array) + 1)
-    
     precision_at_k = tp_cumsum / k_array
     
     pk_df = pd.DataFrame({
         'K': k_array,
         'TP_Count': tp_cumsum,
-        'Precision': precision_at_k
+        'Precision': precision_at_k,
+        'Score_Type': score_col 
     })
     
     print(f"Done! Evaluated Top {len(pk_df)} predictions.")
     return pk_df
 
 # =====================================================================
-# Module 2: Precision@K Plotting Function (保持不变)
+# Module 2 (Top-K): Precision@K Plotting Function
 # =====================================================================
 def plot_top_k_precision(pk_df: pd.DataFrame, out_dir: str = "./results/eval", max_k: Optional[int] = None):
-    """
-    Plot the Precision@K line chart. 
-    Optionally restrict the x-axis to a maximum K value to zoom in on the top predictions.
-    """
     if pk_df.empty:
         print("Dataframe is empty, skipping plot generation.")
         return
@@ -546,6 +543,8 @@ def plot_top_k_precision(pk_df: pd.DataFrame, out_dir: str = "./results/eval", m
         
     baseline_precision = pk_df['Precision'].iloc[-1]
     
+    score_label = plot_df['Score_Type'].iloc[0] if 'Score_Type' in plot_df.columns else 'Final Score'
+    
     p = (
         ggplot(plot_df, aes(x='K', y='Precision'))
         + geom_line(color="#2980b9", size=1.5, alpha=0.9)
@@ -553,7 +552,7 @@ def plot_top_k_precision(pk_df: pd.DataFrame, out_dir: str = "./results/eval", m
         + theme_classic()
         + labs(
             title="Precision@K: Top Predicted ORFs vs Ground Truth",
-            x="Top K Predicted ORFs (Ranked by Final Score)",
+            x=f"Top K Predicted ORFs (Ranked by {score_label})", 
             y="Precision (Proportion of True Positives)"
         )
         + annotate("text", x=plot_df['K'].max() * 0.2, y=baseline_precision - 0.05, 
