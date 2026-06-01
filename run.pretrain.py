@@ -4,7 +4,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from data.RPF_counter_v3 import *
 from model.translation_base_model import TranslationBaseModel
-from model.mask_heads import PsiteDensityHead
+from model.mask_heads import TranslationProfileHead
 from train.model_pretrain import PretrainingTrainer
 from utils import print_param_counts
 
@@ -37,7 +37,7 @@ base_model = TranslationBaseModel.from_config(
 # create heads
 base_model.add_head(
     "count",
-    PsiteDensityHead.create_from_model(
+    TranslationProfileHead.create_from_model(
         base_model,
         d_pred_h = 384
         ),
@@ -55,7 +55,7 @@ base_model = DDP(
 )
 
 # trainer
-epoch_num = 50
+epoch_num = 40
 trainer = PretrainingTrainer(
     model = base_model,
     dataset_paths = [human_train_dataset_path], #, macaque_train_dataset_path, mouse_train_dataset_path],
