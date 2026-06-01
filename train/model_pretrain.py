@@ -492,7 +492,6 @@ class PretrainingTrainer:
         # ==========================================
         # 1. Micro Loss (Token-level Shape Constraint)
         # ==========================================
-        # Assume self.dynamics_criterion is defined in your class (e.g., SmoothL1Loss)
         if pred.shape[2] == 1:
             loss_all = self.dynamics_criterion(pred.squeeze(-1), count_raw_emb.squeeze(-1)) 
             loss_all = loss_all * count_emb_masks.float() * token_weights
@@ -514,13 +513,11 @@ class PretrainingTrainer:
         B, L = cds_masks.shape
         device = pred.device
         
-        # Dynamically parse the start of the CDS to construct accurate Frame Masks.
         _, start_indices = cds_masks.max(dim=1)
         
         positions = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
         relative_positions = positions - start_indices.unsqueeze(1)
         
-        # Isolate the 3 reading frames within the CDS boundaries
         f0_mask = cds_masks & (relative_positions % 3 == 0)
         f1_mask = cds_masks & (relative_positions % 3 == 1)
         f2_mask = cds_masks & (relative_positions % 3 == 2)
@@ -536,9 +533,11 @@ class PretrainingTrainer:
             
         frame_mse_losses = []
         
-        # Iterate through the 3 reading frames to compute independent Linear-MSE losses
-        for _, f_mask in enumerate(frame_masks):
-            # Mask intersection
+        # 【修复1】提前声明变量，用于保存 Frame 0 的均值
+        f0_p_mean = None
+        f0_t_mean = None
+        
+        for i, f_mask in enumerate(frame_masks):
             target_eval_mask = count_emb_masks.to(device) & f_mask
             
             p_sum = (p_val * target_eval_mask.float()).sum(dim=1)
@@ -550,38 +549,50 @@ class PretrainingTrainer:
             p_mean = p_sum / safe_t_lengths
             t_mean = t_sum / safe_t_lengths
             
-            # Compute MSE loss (Assume self.te_criterion is nn.MSELoss)
-            f_loss = self.te_criterion(p_mean, t_mean) # shape: (B,)
+            # 在第一轮循环（Frame 0）时，捕获真实的均值供 Ranking 使用
+            if i == 0:
+                f0_p_mean = p_mean
+                f0_t_mean = t_mean
+            
+            # Compute MSE loss
+            f_loss = self.te_criterion(p_mean, t_mean) 
             frame_mse_losses.append(f_loss)
 
-        # ---------------------------------------------------------
-        # 动态权重：反推是否有 CDS
-        # 如果一个转录本的 cds_masks 在有效长度内全为 True，说明它没有 CDS (或者被设为了全 True)
-        # 注意：需要结合 count_emb_masks (有效序列长度) 来判断
-        # ---------------------------------------------------------
-        # 只在有效序列长度内检查，如果 cds_masks 包含 False，说明有真实的 UTR 和 CDS 边界
-        has_utr = (~cds_masks & count_emb_masks.bool().to(device)).any(dim=1) # shape: (B,)
+        has_utr = (~cds_masks & count_emb_masks.bool().to(device)).any(dim=1) 
         
-        # 有 CDS (has_utr为True) 则 w0=1.5，没有 CDS 则 w0=1.0
-        w0 = torch.where(has_utr, 1.5, 1.0).to(device) # shape: (B,)
+        w0 = torch.where(has_utr, 1.5, 1.0).to(device) 
         w1 = 1.0
         w2 = 1.0
         
-        # 向量化加权平均
-        w_sum = w0 + w1 + w2 # shape: (B,)
+        w_sum = w0 + w1 + w2 
         per_sample_macro_loss = (w0 * frame_mse_losses[0] + w1 * frame_mse_losses[1] + w2 * frame_mse_losses[2]) / w_sum
 
         # ==========================================
-        # 3. Fusion
+        # 3. Pairwise Ranking Loss (仅针对 Frame 0 的 TE)
         # ==========================================
-        # 假设 self.alpha_limit 和 self.current_alpha 在你的类中已定义
+        ranking_loss = torch.tensor(0.0, device=device)
+
+        # 确保 f0_p_mean 和 f0_t_mean 已成功提取
+        if B > 1 and f0_p_mean is not None and f0_t_mean is not None:
+            margin = 0.01
+            
+            p_diff = f0_p_mean.unsqueeze(1) - f0_p_mean.unsqueeze(0)
+            t_diff = f0_t_mean.unsqueeze(1) - f0_t_mean.unsqueeze(0)
+            
+            valid_mask = t_diff > margin
+            
+            if valid_mask.any():
+                rank_err = F.relu(margin - p_diff)
+                ranking_loss = rank_err[valid_mask].mean()
+                
+        # ==========================================
+        # 4. Fusion
+        # ==========================================
         alpha = max(self.alpha_limit) if is_eval else getattr(self, 'current_alpha', 4.0)
+        beta = 0.1
         
-        # 结合 Micro local-shape 与 Macro global-scale
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
-        
-        # 最终的 batch loss
-        loss = total_sample_loss.mean()
+        loss = total_sample_loss.mean() + beta * ranking_loss
 
         return loss
 
