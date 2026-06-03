@@ -86,7 +86,7 @@ class FlashMultiHeadedAttention(nn.Module):
             qkv_unpad.to(torch.bfloat16),
             cu_seqlens,
             max_seqlen,
-            dropout_p = self.p_drop,
+            dropout_p = self.p_drop if self.training else 0.0, # flash_attn 无法感知 model.eval
             causal = self.causal,
             softmax_scale = (float(softmax_scale) if softmax_scale is not None else None)
         ).to(torch.float32)

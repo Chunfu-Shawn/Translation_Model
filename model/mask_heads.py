@@ -399,10 +399,7 @@ class TranslationProfileHead(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
-                    if m.out_features == self.d_count: # 最后一层
-                        nn.init.constant_(m.bias, 0.1) # 初始化为微小正数防死
-                    else:
-                        nn.init.zeros_(m.bias)
+                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
                 if m.weight is not None:
                     nn.init.ones_(m.weight)

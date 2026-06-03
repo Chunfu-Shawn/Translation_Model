@@ -533,7 +533,7 @@ class PretrainingTrainer:
             
         frame_mse_losses = []
         
-        # 【修复1】提前声明变量，用于保存 Frame 0 的均值
+        # 提前声明变量，用于保存 Frame 0 的均值
         f0_p_mean = None
         f0_t_mean = None
         
@@ -589,7 +589,7 @@ class PretrainingTrainer:
         # 4. Fusion
         # ==========================================
         alpha = max(self.alpha_limit) if is_eval else getattr(self, 'current_alpha', 4.0)
-        beta = 0.1
+        beta = 0.2
         
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         loss = total_sample_loss.mean() + beta * ranking_loss

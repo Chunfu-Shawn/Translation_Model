@@ -9,19 +9,20 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from Bio.Seq import Seq
 
+
 # =================================================================
-# [NEW] 安全清理 ID 的辅助函数
+# Helper Function for Safe ID Cleaning
 # =================================================================
-def safe_clean_id(raw_id: str) -> str:
+def safe_clean_id(tid: str) -> str:
     """
-    安全清理 ID：
-    1. 去除 FASTA 头部可能含有的管道符及后面的内容（例如 '>ENST0001|protein_coding' -> 'ENST0001'）
-    2. 仅当 ID 以 'ENST' 或 'ENSG' 开头时，才去除 '.' 及后面的版本号
+    Safely clean Transcript/Gene IDs:
+    - Strip version numbers ONLY for Ensembl IDs (e.g., ENST, ENSG).
+    - Keep novel IDs (e.g., MSTRG.123.1) exactly as they are to prevent destructive truncation.
     """
-    clean_id = str(raw_id).split('|')[0]
-    if (clean_id.startswith('ENST') or clean_id.startswith('ENSG')) and '.' in clean_id:
-        clean_id = clean_id.split('.')[0]
-    return clean_id
+    tid_str = str(tid).strip()
+    if tid_str.startswith('ENS'):
+        return tid_str.split('.')[0]
+    return tid_str
 
 
 # =================================================================
@@ -206,6 +207,7 @@ class FastSignalDrivenORFCaller:
             resolved_cands.append(best_cand)
         return self.fast_nms(resolved_cands, iou_threshold=iou_threshold)
 
+
 # =================================================================
 # Main Pipeline
 # =================================================================
@@ -233,7 +235,7 @@ class TranslationSignalORFCaller:
             g_col, t_col = 'Gene stable ID', 'Transcript stable ID'
             if g_col in m_df.columns and t_col in m_df.columns:
                 for _, r in m_df.iterrows():
-                    # [MODIFIED] 使用安全清理函数
+                    # [MODIFIED] Apply the safe cleaning function
                     g_id = safe_clean_id(str(r[g_col]))
                     t_id = safe_clean_id(str(r[t_col]))
                     self.tx2gene[t_id] = g_id
@@ -248,11 +250,11 @@ class TranslationSignalORFCaller:
         if self.has_tpm:
             t_df = pd.read_csv(tpm_csv_path, index_col=0)
             
-            # [MODIFIED] 使用 Pandas 的 apply 方法配合 safe_clean_id 清理 DataFrame 的 Index
+            # [MODIFIED] Use Pandas apply method with safe_clean_id to sanitize DataFrame Index
             t_df.index = t_df.index.to_series().astype(str).apply(safe_clean_id)
             
-            # 由于去除了版本号，同一个 ID 可能出现重复行 (例如 ENSG001.1 和 ENSG001.2 被去除了版本号)
-            # 对重复的 ID 表达量取均值 (或者最大值)，这里选择均值
+            # [MODIFIED] Removing version numbers might cause duplicate index entries (e.g., ENSG001.1 and ENSG001.2 become ENSG001)
+            # Aggregate duplicate IDs by taking the mean expression value
             t_df = t_df.groupby(t_df.index).mean()
             
             if self.cell_type in t_df.columns:
