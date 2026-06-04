@@ -252,14 +252,14 @@ class DatasetGenerator():
         te_dict = {t: rpf_clr[i] - (slope * rna_clr[i] + intercept) for i, t in enumerate(tids)}
         return te_dict, rpf_depth, rpf_cov
 
-    def count_embedding(self, arr, te_residual):
+    def count_embedding(self, arr, te_residual, base=1.2):
         """
         arr 已经是被 parse_and_winsorize_to_array 组装且净化好的矩阵了。
         """
         nz_mask = arr > 0
         nz_mean = np.mean(arr[nz_mask]) if np.any(nz_mask) else 1.0
         
-        norm_count = np.log1p((arr / nz_mean) * np.exp(te_residual))
+        norm_count = np.log1p((arr / nz_mean) * np.power(base, te_residual))
         
         return norm_count
 

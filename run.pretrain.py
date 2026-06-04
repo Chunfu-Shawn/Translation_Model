@@ -18,7 +18,7 @@ torch.backends.cudnn.benchmark = True
 # load dataset
 dataset_dir = '/home/user/data3/rbase/translation_model/data/dataset/'
 ## human
-human_dataset_name = "human_7c_6k_depth0.1_cov0.1_rpm1"
+human_dataset_name = "human_7c_6k_depth0.1_cov0.1_rpm1_2"
 human_train_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".train.h5")
 human_val_dataset_path = os.path.join(dataset_dir, human_dataset_name + ".valid.h5")
 ## macaque
@@ -60,7 +60,7 @@ trainer = PretrainingTrainer(
     model = base_model,
     dataset_paths = [human_train_dataset_path], #, macaque_train_dataset_path, mouse_train_dataset_path],
     val_dataset_paths = [human_val_dataset_path], #, macaque_val_dataset_path, mouse_val_dataset_path],
-    dataset_name = "human_7c_6k_depth0.1_cov0.1_rpm1",
+    dataset_name = "human_7c_6k_depth0.1_cov0.1_rpm1_2",
     batch_size = 46,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
