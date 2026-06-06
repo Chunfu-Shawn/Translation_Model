@@ -71,7 +71,6 @@ def read_fasta(file_paths: Union[str, List[str]]) -> Dict[str, str]:
 
 # =================================================================
 # Core Algorithm: Multi-dimensional Prefix Sum ORF Caller
-# (FastSignalDrivenORFCaller 的代码保持不变，此处省略以节省空间)
 # =================================================================
 class FastSignalDrivenORFCaller:
     def __init__(self, start_codons=['ATG', 'CTG', 'GTG'], stop_codons=['TAA', 'TAG', 'TGA'], min_len=30, mode='balanced'):
@@ -111,7 +110,7 @@ class FastSignalDrivenORFCaller:
                     orf_len = curr_stop - start_pos + 3
                     if orf_len >= self.min_len:
                         candidates.append({
-                            'start': start_pos, 'stop': curr_stop,
+                            'start': start_pos, 'stop': curr_stop, # 0-based
                             'length': orf_len, 'start_codon': sequence[start_pos:start_pos+3]
                         })
                     start_idx += 1 
