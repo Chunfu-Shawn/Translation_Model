@@ -574,7 +574,7 @@ class PretrainingTrainer:
 
         # 确保 f0_p_mean 和 f0_t_mean 已成功提取
         if B > 1 and f0_p_mean is not None and f0_t_mean is not None:
-            margin = 0.005
+            margin = 0.001
             
             p_diff = f0_p_mean.unsqueeze(1) - f0_p_mean.unsqueeze(0)
             t_diff = f0_t_mean.unsqueeze(1) - f0_t_mean.unsqueeze(0)
@@ -589,7 +589,7 @@ class PretrainingTrainer:
         # 4. Fusion
         # ==========================================
         alpha = max(self.alpha_limit) if is_eval else getattr(self, 'current_alpha', 4.0)
-        beta = 0.2
+        beta = 0.5
         
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         loss = total_sample_loss.mean() + beta * ranking_loss

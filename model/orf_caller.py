@@ -22,7 +22,7 @@ def safe_clean_id(tid: str) -> str:
     tid_str = str(tid).strip()
     if tid_str.startswith('ENS'):
         return tid_str.split('.')[0]
-    return tid_str
+    return tid_str.split(':')[0]
 
 
 # =================================================================
@@ -457,8 +457,7 @@ class TranslationSignalORFCaller:
                     try:
                         prot = str(Seq(seq_dna).translate(to_stop=True))
                         if prot:
-                            tpm_display = r.tpm if not pd.isna(r.tpm) else "N/A"
-                            hdr = f">{r.Tid}|{r.Gene_ID}|{r.Cell_Type}|{r.start}:{r.stop}|ExprScore:{r.expr_score:.3f}|TPM:{tpm_display}"
+                            hdr = f">{r.Tid}|start-{r.start}:end-{r.stop}"
                             split_prot = [prot[i:i+80] for i in range(0, len(prot), 80)]
                             f_out.write(f"{hdr}\n" + "\n".join(split_prot) + "\n")
                             extracted_count += 1
