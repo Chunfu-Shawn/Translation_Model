@@ -84,10 +84,9 @@ class AddAdaZeroLayerNorm(nn.Module):
     """
     Adaptive Layer Normalization with Gating (adaLN-Zero) with Information Bottleneck.
     """
-    def __init__(self, d_model, p_drop, adaptive_dim=16, gamma_scale=1):
+    def __init__(self, d_model, p_drop, adaptive_dim=16):
         super().__init__()
         self.d_model = d_model
-        self.gamma_scale = gamma_scale
         self.dropout = nn.Dropout(p=p_drop)
         
         self.LN = nn.LayerNorm(d_model, elementwise_affine=False)
@@ -102,9 +101,7 @@ class AddAdaZeroLayerNorm(nn.Module):
 
     def forward(self, reps_batch, sublayer_module, compact_style):
         style = self.adaLN_modulation(compact_style)        
-        gamma, beta, alpha = style.chunk(3, dim=-1)         
-        
-        # gamma = torch.tanh(gamma) * self.gamma_scale
+        gamma, beta, alpha = style.chunk(3, dim=-1)
         
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)
@@ -190,11 +187,11 @@ class AdaZeroEncoderLayer(nn.Module):
     Encoder Layer using Adaptive Layer Normalization.
     Automatically handles Flash Attention vs Standard Attention fallback.
     """
-    def __init__(self, d_model, d_ff, heads, p_drop, adaptive_dim, gamma_scale):
+    def __init__(self, d_model, d_ff, heads, p_drop, adaptive_dim):
         super().__init__()
         
         self.sublayers = replicate_module(
-            AddAdaZeroLayerNorm(d_model, p_drop, adaptive_dim, gamma_scale), 2
+            AddAdaZeroLayerNorm(d_model, p_drop, adaptive_dim), 2
         )
         
         self.d_model = d_model

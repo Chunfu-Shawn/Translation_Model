@@ -65,7 +65,6 @@ class TranslationBaseModel(nn.Module):
         number_of_layers: int = 12,
         d_ff: int = 2048,
         adaptive_dim: int = 32,
-        gamma_scale: float = 0.5,
         p_drop: float = 0.1,
         model_name: str = "base_model",
     ):
@@ -83,7 +82,6 @@ class TranslationBaseModel(nn.Module):
             number_of_layers=number_of_layers,
             d_ff=d_ff,
             adaptive_dim=adaptive_dim,
-            gamma_scale=gamma_scale,
             p_drop=p_drop,
             model_name=model_name
         )
@@ -98,7 +96,6 @@ class TranslationBaseModel(nn.Module):
 
         self.n_heads = n_heads
         self.adaptive_dim = adaptive_dim
-        self.gamma_scale = gamma_scale
 
         # ==========================================
         # Dynamic Species Dictionary Mapping
@@ -132,7 +129,7 @@ class TranslationBaseModel(nn.Module):
         )
 
         # Pass num_classes to Encoder/Layer for AdaLayerNorm embedding initialization
-        encoder_layer = AdaZeroEncoderLayer(d_model, d_ff, n_heads, p_drop, self.adaptive_dim, self.gamma_scale)
+        encoder_layer = AdaZeroEncoderLayer(d_model, d_ff, n_heads, p_drop, self.adaptive_dim)
         self.encoder = AdaEncoder(encoder_layer, number_of_layers)
 
         # pluggable heads
@@ -266,7 +263,6 @@ class TranslationBaseModel(nn.Module):
             number_of_layers=int(cfg_dict.get("number_of_layers", 6)),
             d_ff=int(cfg_dict.get("d_ff", 2048)),
             adaptive_dim=int(cfg_dict.get("adaptive_dim", 32)),
-            gamma_scale=float(cfg_dict.get("gamma_scale", 0.5)),
             p_drop=float(cfg_dict.get("p_drop", 0.1)),
             expr_dict_path=cfg_dict.get("expr_dict_path", None), 
             model_name=cfg_dict.get("model_name"),
@@ -295,7 +291,6 @@ class TranslationBaseModel(nn.Module):
             number_of_layers=cfg.number_of_layers,
             d_ff=cfg.d_ff,
             adaptive_dim=cfg.adaptive_dim,
-            gamma_scale=cfg.gamma_scale,
             p_drop=cfg.p_drop,
             model_name=cfg.model_name
         )

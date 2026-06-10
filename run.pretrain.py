@@ -32,7 +32,7 @@ mouse_val_dataset_path = os.path.join(dataset_dir, mouse_dataset_name + ".valid.
 
 # create model
 base_model = TranslationBaseModel.from_config(
-    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_8h_10l_64env_16ad.yaml"
+    "/home/user/data3/rbase/translation_model/models/src/config/base_model_expr_384d_16h_12l_64env_16ad.yaml"
     ).cuda(rank)
 # create heads
 base_model.add_head(
@@ -58,9 +58,9 @@ base_model = DDP(
 epoch_num = 50
 trainer = PretrainingTrainer(
     model = base_model,
-    dataset_paths = [human_train_dataset_path], #, macaque_train_dataset_path, mouse_train_dataset_path],
-    val_dataset_paths = [human_val_dataset_path], #, macaque_val_dataset_path, mouse_val_dataset_path],
-    dataset_name = "human_7c_6k_depth0.1_cov0.1_rpm1",
+    dataset_paths = [human_train_dataset_path, macaque_train_dataset_path, mouse_train_dataset_path],
+    val_dataset_paths = [human_val_dataset_path, macaque_val_dataset_path, mouse_val_dataset_path],
+    dataset_name = "hs_7c_rm_4c_mm_3c_6k_depth0.1_cov0.1_rpm1",
     batch_size = 50,
     checkpoint_dir = '/home/user/data3/rbase/translation_model/models/checkpoint/pretrain',
     log_dir = '/home/user/data3/rbase/translation_model/models/log/pretrain',
@@ -76,7 +76,7 @@ trainer = PretrainingTrainer(
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,
     accumulation_steps = 1,
-    balance_classes = False,
+    balance_classes = True,
     beta = (0.9, 0.98),
     epsilon = 1e-9,
     weight_decay = 0.01,
