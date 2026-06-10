@@ -589,7 +589,7 @@ class PretrainingTrainer:
         # 4. Fusion
         # ==========================================
         alpha = max(self.alpha_limit) if is_eval else getattr(self, 'current_alpha', 4.0)
-        beta = 1
+        beta = 0.5
         
         total_sample_loss = per_sample_micro_loss + alpha * per_sample_macro_loss
         loss = total_sample_loss.mean() + beta * ranking_loss
