@@ -558,9 +558,9 @@ class PretrainingTrainer:
             f_loss = self.te_criterion(p_mean, t_mean) 
             frame_mse_losses.append(f_loss)
 
-        has_utr = (~cds_masks & count_emb_masks.bool().to(device)).any(dim=1) 
+        # has_utr = (~cds_masks & count_emb_masks.bool().to(device)).any(dim=1) 
         
-        w0 = torch.where(has_utr, 1.5, 1.0).to(device) 
+        w0 = 1.0 #torch.where(has_utr, 1.5, 1.0).to(device) 
         w1 = 1.0
         w2 = 1.0
         
