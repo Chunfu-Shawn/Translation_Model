@@ -194,7 +194,7 @@ if __name__ == "__main__":
     # Config file paths
     ortholog_csv = "/home/user/data3/rbase/genome_ref/Homolog/human_macaque_mouse_orthologs.tsv" 
     
-    human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/matched_samples_RNA-seq.txt"
+    human_counts = "/home/user/data3/yaoc/translation_model/rna-seq/matched_counts/matched_samples_RNA-seq.txt"
     macque_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/macaque_featureCounts.txt"
     mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_featureCounts.txt"
     

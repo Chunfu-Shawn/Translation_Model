@@ -259,7 +259,7 @@ class DatasetGenerator():
         nz_mask = arr > 0
         nz_mean = np.mean(arr[nz_mask]) if np.any(nz_mask) else 1.0
         
-        norm_count = np.log1p((arr / nz_mean) * np.power(base, te_residual))
+        norm_count = np.log1p((arr / nz_mean) * np.exp(te_residual))
         
         return norm_count
 

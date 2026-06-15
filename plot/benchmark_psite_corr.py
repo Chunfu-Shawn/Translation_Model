@@ -3,8 +3,26 @@ import numpy as np
 import pandas as pd
 from plotnine import *
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-from scipy.stats import linregress
+import pickle
+
+
+GLOBAL_MODEL_ORDER = [
+    "TRACE", "Encoder", "Convolution", 
+    "Translatomer", "Riboformer (CDS)", "RiboMIMO (CDS)",
+    "Cross-batch", "Cross-experiment"
+]
+
+GLOBAL_MODEL_COLORS = {
+    "TRACE": "#2C6B9A", 
+    # "Encoder": "#555555", 
+    # "Convolution": "#637D96",
+    "Translatomer": "#555555",
+    "Riboformer (CDS)": "#777777",
+    "RiboMIMO (CDS)": "#BBBBBB",
+    "Cross-batch": "#AF804F",
+    "Cross-experiment": "#EBC67F",
+}
+
 
 def load_and_aggregate_multicell(data_config, depth_threshold=None, metric="Pearson_R"):
     """
@@ -98,12 +116,6 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
 
     agg_df['Cell_type'] = agg_df['Cell_type'].replace({'SW480': 'SW480 (Unseen)'})
 
-    # --- 2. 设置因子的顺序 ---
-    model_order = [
-        "TRACE", "Convolution", #"Encoder"
-        "Translatomer", "Riboformer (CDS)", "RiboMIMO (CDS)", 
-        "Cross-batch", "Cross-experiment"
-    ]
     
     if cell_types:
         # 如果传入了 cell_types 过滤列表，需要同步将里面的 SW480 替换掉
@@ -111,7 +123,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
         agg_df = agg_df[agg_df["Cell_type"].isin(cell_types)]
 
     # 强制转化为有序分类变量
-    agg_df['Model'] = pd.Categorical(agg_df['Model'], categories=model_order, ordered=True)
+    agg_df['Model'] = pd.Categorical(agg_df['Model'], categories=GLOBAL_MODEL_ORDER, ordered=True)
     
     # 核心修改 1：让 Unseen 细胞系排在 Categories 的最后一个
     # 这样在后续基于这个 Categorical 排序时，它就会被放到 DataFrame 的末尾
@@ -139,16 +151,6 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
     summary_df['ymin'] = summary_df['Overall_Mean'] - summary_df['SEM']
     summary_df['ymax'] = summary_df['Overall_Mean'] + summary_df['SEM']
 
-    color_mapping = {
-        "TRACE": "#2C6B9A", # 2C6B9A
-        # "Encoder": "#555555",
-        "Convolution": "#637D96",
-        "Translatomer": "#555555",
-        "Riboformer (CDS)": "#777777", #999999
-        "RiboMIMO (CDS)": "#BBBBBB",
-        "Cross-batch": "#AF804F",
-        "Cross-experiment": "#EBC67F"
-    }
 
     # ======================================
     #  4. 为散点图生成颜色字典，单独高亮 SW480
@@ -170,7 +172,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
         + geom_jitter(data=agg_df, mapping=aes(y='Mean', shape='Cell_type', color='Cell_type'), 
                       width=0.2, size=3.5, alpha=0.8)
         + scale_color_manual(values=point_colors) 
-        + scale_fill_manual(values=color_mapping) 
+        + scale_fill_manual(values=GLOBAL_MODEL_COLORS) 
         # + coord_cartesian(ylim=[0, 0.7])
         + theme_bw()
         + theme(
@@ -193,73 +195,119 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
     
     plot.save(save_path, width=6, height=5, dpi=300)
     print(f"Plot saved to: {save_path}")
+ 
 
-
+# =================================================================
+# Length Robustness Analysis Module
+# =================================================================
 def prepare_length_robustness_data(
-        dataset, 
         model_csv_dict: dict, 
+        seq_pkl_path: str, 
+        meta_dict: dict = None, 
         out_dir="./results/robustness", 
         suffix=""):
     """
-    Step 1: 收集转录本长度和相关性并合并，保存为单独的数据表。(保持不变)
+    Step 1: Anchor samples based on TRACE model predictions.
+    Load global seq_dict pickle internally to map lengths and ensure consistent evaluation scale.
     """
     os.makedirs(out_dir, exist_ok=True)
     
-    print(">>> Extracting length info from dataset...")
-    length_records = []
+    # =================================================================
+    # [NEW] Safely load the sequence dictionary from the pickle path
+    # =================================================================
+    print(f">>> Loading sequence dictionary from {seq_pkl_path}...")
+    try:
+        with open(seq_pkl_path, 'rb') as f:
+            seq_dict = pickle.load(f)
+        print(f"  -> Successfully loaded {len(seq_dict)} sequences.")
+    except Exception as e:
+        print(f"  [Error] Failed to load seq_dict from {seq_pkl_path}: {e}")
+        return None
+
+    print(">>> Phase 1: Reading model predictions and anchoring samples based on TRACE...")
+    model_data_store = {}
     
-    for i in tqdm(range(len(dataset))):
-        uuid, _, _, _, meta_info, seq_emb, _ = dataset[i]
-        uuid_str = str(uuid)
-        parts = uuid_str.split('-')
-        if len(parts) < 2: continue
-        
-        tid, cell_type = parts[0], parts[1]
-        full_len = len(seq_emb)
-        cds_s = int(meta_info.get("cds_start_pos", -1))
-        cds_e = int(meta_info.get("cds_end_pos", -1))
-        
-        if cds_s != -1 and cds_e != -1:
-            cds_len = cds_e - max(0, cds_s - 1)
-            five_utr_len = max(0, cds_s - 1)
-        else:
-            cds_len = np.nan
-            five_utr_len = np.nan
-            
-        length_records.append({
-            'Tid': tid,
-            'Cell_type': cell_type,
-            'Full_Length': full_len,
-            '5UTR_Length': five_utr_len,
-            'CDS_Length': cds_len
-        })
-        
-    df_lengths = pd.DataFrame(length_records).drop_duplicates(subset=['Tid', 'Cell_type'])
-    
-    print(">>> Merging model predictions...")
-    all_model_dfs = []
     for model_name, csv_path in model_csv_dict.items():
         if not os.path.exists(csv_path):
-            print(f"Warning: {csv_path} not found. Skipping {model_name}.")
+            print(f"  [Warning] {csv_path} not found. Skipping {model_name}.")
             continue
         
-        df_corr = pd.read_csv(csv_path)
-        df_merged = pd.merge(df_corr, df_lengths, on=['Tid', 'Cell_type'], how='inner')
-        df_merged['Model'] = model_name
-        all_model_dfs.append(df_merged)
+        df = pd.read_csv(csv_path)
+        if 'Spearman_R' not in df.columns:
+            print(f"  [Warning] Missing 'Spearman_R' in {csv_path}. Skipping.")
+            continue
+            
+        # Construct unique identifier (Tid, Cell_type) for filtering
+        df['Sample_ID'] = df['Tid'] + "::" + df['Cell_type']
         
-    if not all_model_dfs:
-        print("No valid data to merge.")
+        # Drop rows with missing values
+        df = df.dropna(subset=['Spearman_R'])
+        model_data_store[model_name] = df
+        
+    if not model_data_store:
+        print("No valid data to process.")
+        return None
+
+    # Core logic: Use TRACE as the anchor, discard samples not present in TRACE
+    if "TRACE" not in model_data_store:
+        print("  [Error] 'TRACE' model not found in the input dictionary. Cannot filter by TRACE.")
         return None
         
+    trace_samples = set(model_data_store["TRACE"]['Sample_ID'])
+    print(f"  -> Found {len(trace_samples)} valid samples in TRACE. Using these as the benchmark anchor.")
+
+    print(">>> Phase 2: Mapping lengths globally for the anchored samples...")
+    all_model_dfs = []
+    
+    for model_name, df in model_data_store.items():
+        # Keep only samples present in TRACE
+        df_filtered = df[df['Sample_ID'].isin(trace_samples)].copy()
+        
+        # Map Full_Length using the internally loaded seq_dict
+        df_filtered['Full_Length'] = df_filtered['Tid'].map(
+            lambda x: len(seq_dict[x]) if x in seq_dict else np.nan
+        )
+        
+        if meta_dict:
+            def get_cds_len(tid):
+                info = meta_dict.get(tid)
+                if not info: return np.nan
+                cds_s = int(info.get("cds_start_pos", -1)) if isinstance(info, dict) else getattr(info, "cds_start_pos", -1)
+                cds_e = int(info.get("cds_end_pos", -1)) if isinstance(info, dict) else getattr(info, "cds_end_pos", -1)
+                return (cds_e - max(0, cds_s - 1)) if cds_s != -1 and cds_e != -1 else np.nan
+                
+            def get_utr_len(tid):
+                info = meta_dict.get(tid)
+                if not info: return np.nan
+                cds_s = int(info.get("cds_start_pos", -1)) if isinstance(info, dict) else getattr(info, "cds_start_pos", -1)
+                return max(0, cds_s - 1) if cds_s != -1 else np.nan
+
+            df_filtered['CDS_Length'] = df_filtered['Tid'].apply(get_cds_len)
+            df_filtered['5UTR_Length'] = df_filtered['Tid'].apply(get_utr_len)
+        else:
+            df_filtered['CDS_Length'] = np.nan
+            df_filtered['5UTR_Length'] = np.nan
+            
+        df_filtered['Model'] = model_name
+        
+        # Drop auxiliary columns
+        df_filtered = df_filtered.drop(columns=['Sample_ID'])
+        all_model_dfs.append(df_filtered)
+        
     df_final = pd.concat(all_model_dfs, ignore_index=True)
-    df_final = df_final.dropna(subset=['Spearman_R', 'Full_Length'])
+    
+    before_drop = len(df_final)
+    df_final = df_final.dropna(subset=['Full_Length'])
+    after_drop = len(df_final)
+    
+    if before_drop != after_drop:
+        print(f"  -> Dropped {before_drop - after_drop} samples due to missing Fasta sequence.")
 
     filename = f"length_robustness_data.{suffix}.csv" if suffix else "length_robustness_data.csv"
     save_path = os.path.join(out_dir, filename)
     df_final.to_csv(save_path, index=False)
     
-    print(f">>> Data successfully extracted and saved to {save_path}")
+    print(f">>> Data successfully extracted and saved to {save_path} (Total valid records: {len(df_final)})")
     return save_path
 
 
@@ -310,18 +358,7 @@ def plot_length_robustness_line_chart(
     ).reset_index()
     summary_df = summary_df.dropna(subset=['Mean_R'])
 
-    # 颜色配置
-    color_mapping = {
-        "TRACE": "#2C6B9A", # 2C6B9A
-        # "Encoder": "#555555",
-        "Convolution": "#637D96",
-        "Translatomer": "#555555",
-        "Riboformer (CDS)": "#777777", #999999
-        "RiboMIMO (CDS)": "#BBBBBB",
-        "Cross-batch": "#AF804F",
-        "Cross-experiment": "#EBC67F"
-    }
-    model_order = [m for m in color_mapping.keys() if m in summary_df['Model'].unique()]
+    model_order = [m for m in GLOBAL_MODEL_ORDER if m in summary_df['Model'].unique()]
 
     os.makedirs(out_dir, exist_ok=True)
     print(">>> Plotting combined custom-scaled chart with Matplotlib...")
@@ -346,8 +383,11 @@ def plot_length_robustness_line_chart(
     
     ax1.bar(x_positions, bar_heights, color='darkgray', alpha=0.7, width=0.6)
     
-    # 美化上方子图
-    ax1.set_ylabel("Transcript count", color='#606060', fontsize=11)
+    # =================================================================
+    # [MODIFIED] 将 Transcript count 修改为 Sample count，保持两张图统计含义和尺度(Scale)的绝对一致性
+    # =================================================================
+    ax1.set_ylabel("Sample count", color='#606060', fontsize=11)
+    
     ax1.tick_params(axis='y', colors='#606060', labelsize=10)
     ax1.grid(False) # 明确去掉上方网格线
     
@@ -377,7 +417,7 @@ def plot_length_robustness_line_chart(
             z_ord = 5 if model == "TRACE" else 3
             alpha_val = 0.9 if model == "TRACE" else 0.7
             
-            ax2.errorbar(valid_x, y_vals, yerr=y_errs, fmt='-o', color=color_mapping[model], 
+            ax2.errorbar(valid_x, y_vals, yerr=y_errs, fmt='-o', color=GLOBAL_MODEL_COLORS.get(model, "#C0C0C0"), 
                          linewidth=1.8, markersize=7, markerfacecolor='white', markeredgewidth=1.8,
                          capsize=4, alpha=alpha_val, label=model, zorder=z_ord)
 
@@ -408,6 +448,217 @@ def plot_length_robustness_line_chart(
 
     # 保存
     filename = f"robustness_combined_chart.{suffix_name}.pdf" if suffix else "robustness_combined_chart.pdf"
+    plot_path = os.path.join(out_dir, filename)
+    
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', transparent=True)
+    plt.close()
+    
+    print(f">>> Combined chart saved to {plot_path}")
+    
+    return summary_df
+
+def prepare_depth_robustness_data(
+        model_csv_dict: dict, 
+        out_dir="./results/robustness", 
+        suffix=""):
+    """
+    Step 1: 直接读取带有 Depth 的 CSV。
+    以 TRACE 为基准过滤样本，确保与 Length 分析拥有完全一致的 Fair Benchmark 基础。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    print(">>> Phase 1: Reading model predictions and anchoring samples based on TRACE...")
+    
+    model_data_store = {}
+    
+    for model_name, csv_path in model_csv_dict.items():
+        if not os.path.exists(csv_path):
+            print(f"  [Warning] {csv_path} not found. Skipping {model_name}.")
+            continue
+        
+        df = pd.read_csv(csv_path)
+        
+        if 'Depth' not in df.columns or 'Spearman_R' not in df.columns:
+            print(f"  [Warning] Missing 'Depth' or 'Spearman_R' in {csv_path}. Skipping.")
+            continue
+        
+        # 构建唯一标识 (Tid, Cell_type)
+        df['Sample_ID'] = df['Tid'] + "::" + df['Cell_type']
+        
+        df = df.dropna(subset=['Spearman_R', 'Depth'])
+        model_data_store[model_name] = df
+        
+    if not model_data_store:
+        print("No valid data to process.")
+        return None
+        
+    # =================================================================
+    # [MODIFIED] 核心逻辑：以 TRACE 为主准星，TRACE 没有的就不要
+    # =================================================================
+    if "TRACE" not in model_data_store:
+        print("  [Error] 'TRACE' model not found in the input dictionary. Cannot filter by TRACE.")
+        return None
+        
+    trace_samples = set(model_data_store["TRACE"]['Sample_ID'])
+    print(f"  -> Found {len(trace_samples)} valid samples in TRACE. Using these as the benchmark anchor.")
+
+    print(">>> Phase 2: Merging data for the anchored samples...")
+    all_model_dfs = []
+    
+    for model_name, df in model_data_store.items():
+        # [MODIFIED] 仅保留在 TRACE 中存在的样本
+        df_filtered = df[df['Sample_ID'].isin(trace_samples)].copy()
+        df_filtered['Model'] = model_name
+        df_filtered = df_filtered.drop(columns=['Sample_ID'])
+        all_model_dfs.append(df_filtered)
+        
+    df_final = pd.concat(all_model_dfs, ignore_index=True)
+
+    filename = f"depth_robustness_data.{suffix}.csv" if suffix else "depth_robustness_data.csv"
+    save_path = os.path.join(out_dir, filename)
+    df_final.to_csv(save_path, index=False)
+    
+    print(f">>> Data successfully extracted and saved to {save_path} (Total valid records: {len(df_final)})")
+    return save_path
+
+
+def plot_depth_robustness_line_chart(
+        data_path: str, 
+        x_value: str = "Depth",
+        out_dir="./results/robustness", 
+        suffix="",
+        bins=None,
+        labels=None):
+    """
+    Step 3: 采用 Matplotlib 绘制上下双子图 (Subplots)。
+    基于 Reads Density (Depth) 进行分箱，评估模型在不同表达丰度下的鲁棒性。
+    """
+    suffix_name = f'{suffix}_{x_value}' if suffix else x_value
+    
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data table not found: {data_path}")
+        
+    print(f">>> Loading data from {data_path} for line chart plotting...")
+    df_final = pd.read_csv(data_path)
+    
+    df_final = df_final.dropna(subset=[x_value, 'Spearman_R']).copy()
+    df_final = df_final[df_final[x_value] > 0]
+    
+    # =================================================================
+    # 1. 动态设定适合 Depth (Reads Density) 的分箱策略
+    # 采用类似对数的切分，适应丰度跨度大的特点
+    # =================================================================
+    if bins is None or labels is None:
+        bins = [0, 1, 5, 10, 50, 100, np.inf]
+        labels = ['<1', '1-5', '5-10', '10-50', '50-100', '>100']
+            
+    df_final['Depth_Bin'] = pd.cut(df_final[x_value], bins=bins, labels=labels)
+    df_final = df_final.dropna(subset=['Depth_Bin'])
+
+    # --- 2. 计算样本分布 (根据 Tid 和 Cell_type 去重，保证顶部的计数真实) ---
+    print(">>> Calculating sample distribution...")
+    df_unique = df_final.drop_duplicates(subset=['Tid', 'Cell_type']).copy()
+    dist_df = df_unique.groupby('Depth_Bin', observed=False).size().reset_index(name='Count')
+
+    # --- 3. 计算模型均值与 SEM ---
+    print(">>> Aggregating means and standard errors for models...")
+    summary_df = df_final.groupby(['Model', 'Depth_Bin'], observed=False).agg(
+        Mean_R=('Spearman_R', 'mean'),
+        SEM=('Spearman_R', lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0)
+    ).reset_index()
+    summary_df = summary_df.dropna(subset=['Mean_R'])
+
+    # 使用全局模型顺序字典进行排序过滤
+    model_order = [m for m in GLOBAL_MODEL_ORDER if m in summary_df['Model'].unique()]
+    # 兜底：如果有没有在字典里的模型，追加到最后
+    for m in summary_df['Model'].unique():
+        if m not in model_order:
+            model_order.append(m)
+
+    os.makedirs(out_dir, exist_ok=True)
+    print(">>> Plotting combined custom-scaled chart with Matplotlib...")
+
+    # =================================================================
+    # Matplotlib 双子图 (保留你精心调校的美学参数)
+    # =================================================================
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 5), 
+                                   gridspec_kw={'height_ratios': [1, 4]}, sharex=True)
+    
+    plt.subplots_adjust(hspace=0.08) 
+    x_positions = np.arange(len(labels))
+    
+    # ---------------------------------------------------------
+    # 上方子图 (ax1) - 密度分布柱状图
+    # ---------------------------------------------------------
+    bar_heights = [dist_df[dist_df['Depth_Bin'] == lbl]['Count'].values[0] if lbl in dist_df['Depth_Bin'].values else 0 for lbl in labels]
+    
+    ax1.bar(x_positions, bar_heights, color='darkgray', alpha=0.7, width=0.6)
+    
+    # =================================================================
+    # [MODIFIED] 与 Length 图统一标签，确保 Scale 概念一致
+    # =================================================================
+    ax1.set_ylabel("Sample count", color='#606060', fontsize=11)
+    
+    ax1.tick_params(axis='y', colors='#606060', labelsize=10)
+    ax1.grid(False) 
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+    ax1.spines['bottom'].set_visible(False)
+    ax1.tick_params(axis='x', length=0) 
+    
+    # ---------------------------------------------------------
+    # 下方子图 (ax2) - 性能折线图
+    # ---------------------------------------------------------
+    for model in model_order:
+        m_df = summary_df[summary_df['Model'] == model]
+        if m_df.empty: continue
+        
+        y_vals, y_errs, valid_x = [], [], []
+        for i, lbl in enumerate(labels):
+            row = m_df[m_df['Depth_Bin'] == lbl]
+            if not row.empty:
+                y_vals.append(row['Mean_R'].values[0])
+                y_errs.append(row['SEM'].values[0])
+                valid_x.append(i)
+                
+        if valid_x:
+            # 高亮主推模型 TRACE (将其画在最上层 zorder=5)
+            z_ord = 5 if model == "TRACE" else 3
+            alpha_val = 0.9 if model == "TRACE" else 0.7
+            
+            # 动态从全局字典获取颜色，如果没有则用灰色兜底
+            c_color = GLOBAL_MODEL_COLORS.get(model, "#C0C0C0")
+            
+            ax2.errorbar(valid_x, y_vals, yerr=y_errs, fmt='-o', color=c_color, 
+                         linewidth=1.8, markersize=7, markerfacecolor='white', markeredgewidth=1.8,
+                         capsize=4, alpha=alpha_val, label=model, zorder=z_ord)
+
+    # 美化下方子图
+    ax2.set_ylabel("Model performance (Spearman R)", fontsize=11, color="black")
+    
+    # 设置 X 轴类别
+    ax2.set_xticks(x_positions)
+    ax2.set_xticklabels(labels, rotation=30, ha='right', fontsize=10, color="black")
+    
+    x_title = "RNA ribosome load density"
+    ax2.set_xlabel(x_title, fontsize=12, labelpad=10)
+
+    # 给下方的折线图加上 plotnine 风格的轻灰色网格框
+    ax2.grid(True, linestyle='-', alpha=0.9, color='#E0E0E0')
+    ax2.spines['top'].set_visible(False)
+    ax2.spines['right'].set_visible(False)
+    
+    # ---------------------------------------------------------
+    # 全局调整与图例
+    # ---------------------------------------------------------
+    fig.align_ylabels([ax1, ax2])
+    
+    # 图例居中放在整张图的顶部 (保持你原来的设定)
+    ax2.legend(loc='lower center', bbox_to_anchor=(0.5, 0.9), ncol=3, 
+               frameon=False, fontsize=10, handlelength=1.5,
+               bbox_transform=fig.transFigure)
+
+    # 保存
+    filename = f"robustness_depth_chart.{suffix_name}.pdf" if suffix else "robustness_depth_chart.pdf"
     plot_path = os.path.join(out_dir, filename)
     
     plt.savefig(plot_path, dpi=300, bbox_inches='tight', transparent=True)
