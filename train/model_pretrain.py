@@ -140,7 +140,8 @@ class PretrainingTrainer:
             optimizer=self.optimizer,
             lr_lambda=create_lr_lambda(total_steps=self._total_steps, warmup_steps=warmup_steps, min_eta=1e-4)
         )
-        self.scaler = torch.amp.GradScaler() 
+        self.use_amp = self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # logging & checkpointing
         self.checkpoint_dir = checkpoint_dir
@@ -162,6 +163,14 @@ class PretrainingTrainer:
             print(f"[Trainer] device={self.device}, steps_per_epoch={self.steps_per_epoch}, total_steps={self._total_steps}")
             print(f"[Trainer] mask_perc={self.mask_perc}")
             print(f"[Trainer] Train Datasets: {len(self.dataset)} samples. Eval Datasets: {len(self.val_dataset)} samples.")
+
+    def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.to(self.device, non_blocking=self.device.type == "cuda")
+
+    def _amp_context(self):
+        if self.use_amp:
+            return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
 
     # =========================================================
     # Dataset Builder Method
@@ -378,8 +387,8 @@ class PretrainingTrainer:
         expr_batch = torch.stack(expr_vectors) # [B, d_expr]
         
         cds_starts = [meta.get("cds_start_pos", -1) for meta in meta_info]
-        cds_stops = [meta.get("cds_stop_pos", -1) for meta in meta_info]
-        motif_occs = [meta.get("motif_occs", []) for meta in meta_info]
+        cds_stops = [meta.get("cds_end_pos", -1) for meta in meta_info]
+        motif_occs = [meta.get("motif_occ", []) for meta in meta_info]
 
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
@@ -608,7 +617,7 @@ class PretrainingTrainer:
             num_workers=5,
             prefetch_factor=5, 
             persistent_workers=True, 
-            pin_memory=True,
+            pin_memory=self.device.type == "cuda",
             collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, is_eval=False)
         )
         total_loss = torch.zeros(1).to(self.device)
@@ -626,14 +635,13 @@ class PretrainingTrainer:
             seq_embs_padded, \
             count_embs_padded, count_embs_masked, count_emb_masks, cds_masks, pad_masks = batch_data
 
-            # Move tensors to CUDA
-            expr_batch = expr_batch.cuda(non_blocking=True)
-            seq_embs_padded = seq_embs_padded.cuda(non_blocking=True)
-            count_embs_masked = count_embs_masked.cuda(non_blocking=True)
-            count_embs_padded = count_embs_padded.cuda(non_blocking=True)
-            count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-            cds_masks = cds_masks.cuda(non_blocking=True)
-            pad_masks = pad_masks.cuda(non_blocking=True)
+            expr_batch = self._to_device(expr_batch)
+            seq_embs_padded = self._to_device(seq_embs_padded)
+            count_embs_masked = self._to_device(count_embs_masked)
+            count_embs_padded = self._to_device(count_embs_padded)
+            count_emb_masks = self._to_device(count_emb_masks)
+            cds_masks = self._to_device(cds_masks)
+            pad_masks = self._to_device(pad_masks)
 
             # ==========================================
             # Inject Gaussian Noise into Expression Vectors
@@ -644,7 +652,7 @@ class PretrainingTrainer:
                 noise = torch.randn_like(expr_batch, dtype=torch.float32) * self.expr_noise_std
                 expr_batch = expr_batch + noise.to(expr_batch.dtype)
 
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with self._amp_context():
                 # Pass the dynamically generated expr_vector to the model
                 outputs = self.model(
                     seq_batch=seq_embs_padded, 
@@ -658,9 +666,9 @@ class PretrainingTrainer:
                 loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks, is_eval=False)
                 acc_loss = loss / self.ac_steps
 
-            do_sync = ((batch_idx + 1) % self.ac_steps == 0)
+            do_sync = ((batch_idx + 1) % self.ac_steps == 0) or ((batch_idx + 1) == batch_num)
 
-            context = (self.model.no_sync() if not do_sync else contextlib.nullcontext())
+            context = (self.model.no_sync() if not do_sync and hasattr(self.model, "no_sync") else contextlib.nullcontext())
             with context:
                 self.scaler.scale(acc_loss).backward()
 
@@ -702,7 +710,7 @@ class PretrainingTrainer:
             num_workers=5,
             prefetch_factor=5, 
             persistent_workers=True, 
-            pin_memory=True,
+            pin_memory=self.device.type == "cuda",
             collate_fn=lambda s: self.collate_mask_pad_batch_to_cuda(s, is_eval=True)
         )
         total_loss = torch.zeros(1).to(self.device)
@@ -721,17 +729,16 @@ class PretrainingTrainer:
                 seq_embs_padded, \
                 count_embs_padded, count_embs_masked, count_emb_masks, cds_masks, pad_masks = batch_data
 
-                # Move tensors to CUDA
-                expr_batch = expr_batch.cuda(non_blocking=True)
-                seq_embs_padded = seq_embs_padded.cuda(non_blocking=True)
-                count_embs_masked = count_embs_masked.cuda(non_blocking=True)
-                count_embs_padded = count_embs_padded.cuda(non_blocking=True)
-                count_emb_masks = count_emb_masks.cuda(non_blocking=True)
-                cds_masks = cds_masks.cuda(non_blocking=True)
-                pad_masks = pad_masks.cuda(non_blocking=True)
+                expr_batch = self._to_device(expr_batch)
+                seq_embs_padded = self._to_device(seq_embs_padded)
+                count_embs_masked = self._to_device(count_embs_masked)
+                count_embs_padded = self._to_device(count_embs_padded)
+                count_emb_masks = self._to_device(count_emb_masks)
+                cds_masks = self._to_device(cds_masks)
+                pad_masks = self._to_device(pad_masks)
 
                 # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
-                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                with self._amp_context():
                     outputs = unwrap_model(self.model).predict(
                         seq_batch=seq_embs_padded, 
                         count_batch=count_embs_masked, 

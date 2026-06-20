@@ -477,7 +477,8 @@ class TranslationBaseModel(nn.Module):
              output_expr_batch[:] = vec
         elif isinstance(cell_type, (list, tuple, np.ndarray)):
              if len(cell_type) == 1:
-                 vec = _get_vec(cell_type[0] if isinstance(cell_type, list) else cell_type.item())
+                 key = cell_type[0] if isinstance(cell_type, (list, tuple)) else cell_type.item()
+                 vec = _get_vec(key)
                  output_expr_batch[:] = vec
              elif len(cell_type) == batch_size:
                  for i, ct in enumerate(cell_type):
@@ -520,7 +521,8 @@ class TranslationBaseModel(nn.Module):
             
         if isinstance(species, (list, tuple, np.ndarray)):
             if len(species) == 1:
-                idx = _single_to_index(species[0] if isinstance(species, list) else species.item())
+                val = species[0] if isinstance(species, (list, tuple)) else species.item()
+                idx = _single_to_index(val)
                 return torch.full((batch_size,), idx, dtype=torch.long)
             if len(species) == batch_size:
                 mapped = [_single_to_index(x) for x in species]
@@ -555,8 +557,9 @@ class TranslationBaseModel(nn.Module):
     ):
         """
         Strict forward.
-        You must provide EITHER `expr_vector` (shape: bs, d_expr) OR `cell_type` (for dict lookup).
-        Optionally provide `species` (shape: bs) to inject evolutionary baselines.
+        Provide `expr_vector` (shape: bs, d_expr) for training, or `cell_type` for dictionary lookup.
+        If both are missing or unknown, the model falls back to the mean expression vector.
+        Optionally provide `species` to inject evolutionary baselines.
         """
 
         # --- basic type checks ---
@@ -564,8 +567,8 @@ class TranslationBaseModel(nn.Module):
             raise TypeError("forward() expects seq_batch as torch.Tensor (dim==3). Use predict() for flexible inputs.")
         if not isinstance(count_batch, torch.Tensor):
             raise TypeError("forward() expects count_batch as torch.Tensor (dim==3). Use predict() for flexible inputs.")
-        if not isinstance(expr_vector, torch.Tensor):
-            raise TypeError("forward() expects expr_vector as torch.Tensor. Use predict() for flexible inputs.")
+        if expr_vector is not None and not isinstance(expr_vector, torch.Tensor):
+            raise TypeError("forward() expects expr_vector as torch.Tensor when provided. Use predict() for flexible inputs.")
         if seq_batch.dim() != 3:
             raise ValueError(f"seq_batch must have dim==3 (bs, seq_len, d_seq). Got shape {tuple(seq_batch.shape)}")
         if count_batch.dim() != 3:

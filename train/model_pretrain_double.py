@@ -389,7 +389,7 @@ class PretrainingTrainer:
         expr_batch = torch.stack(expr_vectors) # [B, d_expr]
         
         cds_starts = [meta.get("cds_start_pos", -1) for meta in meta_info]
-        motif_occs = [meta.get("motif_occs", []) for meta in meta_info]
+        motif_occs = [meta.get("motif_occ", []) for meta in meta_info]
         te_targets = torch.tensor([meta.get("te_scale", None) for meta in meta_info], dtype=torch.float32)
 
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)

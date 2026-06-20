@@ -375,8 +375,8 @@ class PretrainingTrainer:
         expr_batch = torch.stack(expr_vectors) # [B, d_expr]
         
         cds_starts = [meta.get("cds_start_pos", -1) for meta in meta_info]
-        cds_stops = [meta.get("cds_stop_pos", -1) for meta in meta_info]
-        motif_occs = [meta.get("motif_occs", []) for meta in meta_info]
+        cds_stops = [meta.get("cds_end_pos", -1) for meta in meta_info]
+        motif_occs = [meta.get("motif_occ", []) for meta in meta_info]
 
         seq_embs_padded = pad_sequence(seq_embs, batch_first=True, padding_value=-1)
         count_embs_padded = pad_sequence(count_embs, batch_first=True, padding_value=-1)
