@@ -152,7 +152,6 @@ def get_samples_5utr_no_start_stop(
     for i in tqdm(range(len(dataset))):
         try:
             item = dataset[i]
-            # 根据实际 dataset 结构解包
             cell_type = item[0]
             cds_pos = item[1]
             seq_emb = item[3] # Tensor or Numpy

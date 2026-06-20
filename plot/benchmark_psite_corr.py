@@ -7,7 +7,8 @@ import pickle
 
 
 GLOBAL_MODEL_ORDER = [
-    "TRACE", "Encoder", "Convolution", 
+    "TRACE", 
+    # "Encoder", "Convolution", 
     "Translatomer", "Riboformer (CDS)", "RiboMIMO (CDS)",
     "Cross-batch", "Cross-experiment"
 ]
@@ -103,7 +104,10 @@ def load_and_aggregate_multicell(data_config, depth_threshold=None, metric="Pear
     return pd.DataFrame(aggregated_data)
 
 
-def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Correlation", out_dir = "./"):
+def plot_multicell_performance(
+        agg_df, cell_types=None, 
+        metric_name="Pearson Correlation", out_dir = "./",
+        w = 5, h =5):
     """
     使用 plotnine 绘制 Bar + Errorbar(SEM) + Jitter Points，展示跨细胞类型的模型表现。
     """
@@ -193,7 +197,7 @@ def plot_multicell_performance(agg_df, cell_types=None, metric_name="Pearson Cor
     os.makedirs(out_dir, exist_ok=True)
     save_path = os.path.join(out_dir, f"benchmark.translation.profile_{metric_name}_correlation.models_multicell.pdf")
     
-    plot.save(save_path, width=6, height=5, dpi=300)
+    plot.save(save_path, width=w, height=h, dpi=300)
     print(f"Plot saved to: {save_path}")
  
 

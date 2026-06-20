@@ -7,7 +7,7 @@ from sklearn.metrics import mean_squared_error
 from plotnine import *
 import torch 
 
-# --- 辅助函数：计算二维核密度 ---
+# --- Auxiliary Function: Calculate 2D Density ---
 def calculate_density(x, y):
     mask = np.isfinite(x) & np.isfinite(y)
     x_clean = x[mask]
@@ -29,7 +29,7 @@ def calculate_density(x, y):
 class PredictionVisualizer:
     def __init__(self, pkl_path, dataset, out_dir="./results/plots"):
         """
-        初始化可视化工具，加载预测数据和真实数据集。
+        Initialize the visualizer by loading prediction data and the ground truth dataset.
         """
         if not os.path.exists(pkl_path):
             raise FileNotFoundError(f"Pickle file not found: {pkl_path}")
@@ -50,14 +50,10 @@ class PredictionVisualizer:
         self.uuid_to_idx = {str(self.dataset[i][0]): i for i in range(len(self.dataset))}
         print("Index built.")
 
-    # ==========================================
-    # [MODIFIED] 修改 ylim 的类型提示和默认行为
-    # ==========================================
-    def plot_transcript(self, tid, cell_type, suffix="", unlog_data=True, 
-                        ylim: dict = None, log_y: bool = False):
+    def plot_transcript(self, tid, cell_type, suffix="", ylim: dict = None, log_y: bool = False):
         """
-        针对特定转录本和细胞类型绘制评估结果。
-        :param ylim: 字典格式，例如 {"Ground Truth": (0, 100), "Prediction": (0, 1.5)}
+        Evaluate and plot results for a specific transcript and cell type.
+        :param ylim: Dictionary format, e.g., {"Observation": (0, 100), "Prediction": (0, 1.5)}
         """
         if cell_type not in self.preds_data or tid not in self.preds_data[cell_type]:
             print(f"Error: Prediction for TID '{tid}' and Cell Type '{cell_type}' not found in pkl.")
@@ -94,10 +90,6 @@ class PredictionVisualizer:
             
         truth = truth.astype(np.float32)
 
-        if unlog_data:
-            truth = np.expm1(truth)
-            prediction = np.expm1(prediction)
-            
         min_len = min(len(truth), len(prediction))
         truth = truth[:min_len]
         prediction = prediction[:min_len]
@@ -121,7 +113,7 @@ class PredictionVisualizer:
             save_path=os.path.join(self.out_dir, bar_plot_name),
             pcc=pcc,   
             p_val=p_val,
-            ylim=ylim,    # 传递字典
+            ylim=ylim,
             log_y=log_y
         )
 
@@ -135,32 +127,39 @@ class PredictionVisualizer:
             save_path=os.path.join(self.out_dir, scatter_plot_name)
         )
 
-    # ==========================================
-    # [MODIFIED] 实现独立分面的 ylim 控制
-    # ==========================================
     def _plot_psite_density_bar_plotnine(self, truth, pred, cds_info, save_path, 
                                          pcc=None, p_val=None, ylim=None, log_y=False):
         """
         绘制 P-site 密度图，支持独立的 Y 轴限制字典和对数变换。
+        精确匹配参考图的美学风格：经典主题、顶部图例、无Y轴线、严格的X轴边界。
         """
         x = np.arange(len(truth))
         cds_start_idx = (cds_info['start'] - 1) if cds_info else 0
         frames = (x - cds_start_idx) % 3
         
-        df_truth = pd.DataFrame({'Pos': x, 'Density': truth, 'Frame': frames, 'Source': 'Ground Truth'})
+        df_truth = pd.DataFrame({'Pos': x, 'Density': truth, 'Frame': frames, 'Source': 'Observation'})
         df_pred = pd.DataFrame({'Pos': x, 'Density': pred, 'Frame': frames, 'Source': 'Prediction'})
         df = pd.concat([df_truth, df_pred])
         
         # 确保 Category 顺序
-        source_categories = ['Ground Truth', 'Prediction']
+        source_categories = ['Observation', 'Prediction']
         df['Frame'] = df['Frame'].astype(str)
         df['Source'] = pd.Categorical(df['Source'], categories=source_categories)
 
+        # ==========================================
+        # [FIXED] 强行裁剪数据，让 ylim 在压缩坐标轴时绝对生效
+        # ==========================================
+        if ylim is not None and isinstance(ylim, dict):
+            for src in source_categories:
+                if src in ylim:
+                    y_min, y_max = ylim[src]
+                    mask = df['Source'] == src
+                    # 把超出 y_max 的柱子像割草机一样削平
+                    df.loc[mask, 'Density'] = df.loc[mask, 'Density'].clip(lower=y_min, upper=y_max)
+
         soft_colors = {"0": "#D73027", "1": "darkgray", "2": "#4575B4"}
 
-        p = (
-            ggplot(df, aes(x='Pos', y='Density', fill='Frame'))
-        )
+        p = ggplot(df, aes(x='Pos', y='Density', fill='Frame'))
 
         # 添加 CDS 阴影区域
         if cds_info:
@@ -178,52 +177,40 @@ class PredictionVisualizer:
                 inherit_aes=False
             )
         
-        # ==========================================
-        # [NEW] 利用 geom_blank 实现不同分面的特定范围
-        # ==========================================
-        # 为了让每个分面有不同的上下限，我们必须使用 scales='free_y'。
-        # 但是自由缩放是根据数据来的，怎么强加我们指定的边界呢？
-        # 技巧：我们创建一些透明的“边界点”（geom_blank），把每个分面的坐标轴“撑开”到指定的范围。
+        # 利用 geom_blank 实现不同分面的特定范围 (用于撑高坐标轴)
         if ylim is not None and isinstance(ylim, dict):
             blank_data = []
             for src in source_categories:
                 if src in ylim:
                     y_min, y_max = ylim[src]
-                    # 添加下限占位符
                     blank_data.append({'Source': src, 'Pos': 0, 'Density': y_min})
-                    # 添加上限占位符
                     blank_data.append({'Source': src, 'Pos': 0, 'Density': y_max})
                     
             if blank_data:
                 blank_df = pd.DataFrame(blank_data)
                 blank_df['Source'] = pd.Categorical(blank_df['Source'], categories=source_categories)
-                # geom_blank 专门用于隐形扩展坐标轴
                 p += geom_blank(data=blank_df, mapping=aes(x='Pos', y='Density'), inherit_aes=False)
         
-        # 因为用 geom_blank 撑起了范围，所以分面必须允许自由缩放
         p = ( 
             p + geom_col(width=1.0, size=0) 
             + facet_wrap('~Source', ncol=1, scales='free_y') 
             + scale_fill_manual(values=soft_colors, labels=['Frame 0', 'Frame 1', 'Frame 2'])
+            + scale_x_continuous(expand=(0, 0), limits=(-0.5, len(truth) - 0.5))
         )
             
-        # 添加文本注释 (相关系数)
-        if pcc is not None and p_val is not None:
-            p_text = f"{p_val:.1e}" if p_val < 0.001 else f"{p_val:.3f}"
-            annot_text = f"R = {pcc:.2f}\nP = {p_text}"
+        # 添加文本注释 (相关系数，仅保留 R 值并使用斜体)
+        if pcc is not None:
+            annot_text = f"R = {pcc:.2f}"
             
             max_x = df['Pos'].max()
             
-            # [MODIFIED] 智能决定文本高度
             if ylim is not None and "Prediction" in ylim:
-                # 如果用户指定了 Prediction 的上限，基于上限决定高度
                 text_y_pos = ylim["Prediction"][1] * 0.85
             else:
-                # 否则基于真实数据的最高点
-                text_y_pos = df_pred['Density'].max() * 0.90
+                text_y_pos = df_pred['Density'].max() * 0.85
             
             annot_df = pd.DataFrame({
-                'Pos': [max_x * 0.98], 
+                'Pos': [max_x * 0.95], # 位置略微偏左一点，避免贴边太紧
                 'Density': [text_y_pos], 
                 'Source': ['Prediction'], 
                 'Label': [annot_text]
@@ -235,31 +222,50 @@ class PredictionVisualizer:
                 mapping=aes(x='Pos', y='Density', label='Label'),
                 ha='right',   
                 va='top',     
-                size=12, 
+                size=14, 
+                fontstyle='italic', # 斜体 R 以匹配参考图
                 color='black',
                 inherit_aes=False
             )
 
-        # ==========================================
-        # [MODIFIED] 坐标轴对数变换
-        # ==========================================
-        y_axis_label = "P-site score"
+        y_axis_label = "Translation signal"
         
-        # 注意：在使用 scales='free_y' 和 geom_blank 的技巧后，
-        # 不能再使用 scale_y_continuous(limits=...)，这会破坏独立分面！
-        # 如果需要 log 变换，只传 trans 参数即可。
         if log_y:
-            y_axis_label = "P-site score (log1p)"
+            y_axis_label = "Translation signal (log1p)"
             p += scale_y_continuous(trans='log1p')
 
         p = (
-            p + theme_bw() 
+            p + theme_classic() 
             + theme(
-                figure_size=(12, 4),
+                figure_size=(10, 4),
+                
+                # --- 图例设置：顶部横向排列 ---
+                legend_position="top",
+                legend_direction="horizontal",
+                legend_title=element_text(size=14, color='black'),
+                legend_text=element_text(size=12, color='black'),
+                
+                # --- 分面标题：无背景，居中大号字体 ---
                 strip_background=element_blank(), 
-                strip_text=element_text(size=12)
+                strip_text=element_text(size=16, color='black'),
+                
+                # --- Y轴设定：去轴线，留刻度 ---
+                axis_line_y=element_blank(),
+                axis_ticks_major_y=element_line(color="black", size=0.8),
+                
+                # --- X轴设定：保留轴线和刻度 ---
+                axis_line_x=element_line(color="black", size=0.8),
+                axis_ticks_major_x=element_line(color="black", size=0.8),
+                
+                # --- 网格线：保留灰色主刻度网格线 ---
+                panel_grid_major=element_line(color="#E0E0E0", size=0.8, alpha=0.8),
+                panel_grid_minor=element_blank(),
+                
+                # --- 字体设定 ---
+                axis_title=element_text(size=14, color='black'),
+                axis_text=element_text(size=12, color='black')
             )
-            + labs(x="Transcript Position (nt)", y=y_axis_label, fill="Reading Frame")
+            + labs(x="Transcript Position (nt)", y=y_axis_label, fill="Reading frame")
         )
 
         p.save(save_path, verbose=False)
@@ -267,7 +273,7 @@ class PredictionVisualizer:
 
     def _plot_correlation_scatter_plotnine(self, truth, pred, pcc, p_val, mse, save_path):
         """
-        绘制真实的散点图，通过点密度着色
+        Plot scatter point correlation colored by point density.
         """
         df = pd.DataFrame({'True': truth, 'Predicted': pred})
         df = df.replace([np.inf, -np.inf], np.nan).dropna()
@@ -279,7 +285,7 @@ class PredictionVisualizer:
             ggplot(df, aes(x='True', y='Predicted', color='density'))
             + geom_point(alpha=0.7, size=1.5, stroke=0, show_legend=False)
             + scale_color_cmap(cmap_name='magma')
-            + theme_bw()
+            + theme_classic()
             + theme(
                 figure_size=(5, 5),
                 axis_ticks_major_y=element_blank(),
@@ -287,8 +293,8 @@ class PredictionVisualizer:
             )
             + labs(
                 title=f"Correlation: R={pcc:.3f}, MSE={mse:.3f}",
-                x="Ground Truth Density",
-                y="Predicted Density"
+                x="Observation",
+                y="Prediction"
             )
         )
 

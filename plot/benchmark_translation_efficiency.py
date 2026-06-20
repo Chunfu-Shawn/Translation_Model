@@ -280,6 +280,7 @@ def plot_te_correlation_performance(
         corr_method="Spearman", out_dir="./", suffix="", no_color=False):
     """
     Plot bar chart with error bars and jitter points for TE correlations.
+    Dynamically handles ANY number of Cell Types by manually cycling shapes.
     """
     if agg_df.empty:
         print("No data to plot.")
@@ -287,31 +288,39 @@ def plot_te_correlation_performance(
         
     agg_df = agg_df.copy()
 
+    # Replace specific unseen label
     agg_df['Cell_type'] = agg_df['Cell_type'].replace({'lung': 'lung (unseen)'})
+    
+    # =================================================================
+    # [NEW] Dynamically determine cell types to avoid hardcoding limits
+    # =================================================================
+    if cell_types:
+        target_cells = ['lung (unseen)' if ct == 'lung' else ct for ct in cell_types]
+        agg_df = agg_df[agg_df["Cell_type"].isin(target_cells)]
+    else:
+        # Extract all unique cell types present in the dataframe
+        target_cells = agg_df['Cell_type'].dropna().unique().tolist()
+        # Ensure 'lung (unseen)' stays at the end if it exists for consistent highlighting
+        if 'lung (unseen)' in target_cells:
+            target_cells.remove('lung (unseen)')
+            target_cells.append('lung (unseen)')
+
+    # Apply the dynamic categories
     agg_df['Cell_type'] = pd.Categorical(
         agg_df['Cell_type'], 
-        categories=["brain_cerebrum","kidney","liver","prostate","testis","lung (unseen)"], 
+        categories=target_cells, 
         ordered=True
-        )
-    
-    if cell_types:
-        cell_types = ['lung (unseen)' if ct == 'lung' else ct for ct in cell_types]
-        agg_df = agg_df[agg_df["Cell_type"].isin(cell_types)]
+    )
 
-    # =================================================================
-    # [MODIFIED] Use global model order
-    # =================================================================
+    # Use global model order
     valid_models = [m for m in GLOBAL_MODEL_ORDER if m in agg_df['Model'].unique()]
-    # Append any model not caught by the predefined list
     for m in agg_df['Model'].unique():
         if m not in valid_models:
             valid_models.append(m)
             
     agg_df['Model'] = pd.Categorical(agg_df['Model'], categories=valid_models, ordered=True)
-    
-    if cell_types:
-        agg_df['Cell_type'] = pd.Categorical(agg_df['Cell_type'], categories=cell_types, ordered=True)
 
+    # Aggregate summaries
     summary_df = agg_df.groupby('Model', observed=False).agg(
         Overall_Mean=('Mean', 'mean'),
         SEM=('Mean', lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0) 
@@ -321,20 +330,21 @@ def plot_te_correlation_performance(
     summary_df['ymin'] = summary_df['Overall_Mean'] - summary_df['SEM']
     summary_df['ymax'] = summary_df['Overall_Mean'] + summary_df['SEM']
 
-    # =================================================================
-    # [MODIFIED] Apply global colors dynamically based on present models
-    # =================================================================
+    # Assign global model colors
     model_colors = {}
     for m in valid_models:
-        model_colors[m] = GLOBAL_MODEL_COLORS.get(m, "#C0C0C0") # Fallback color
+        model_colors[m] = GLOBAL_MODEL_COLORS.get(m, "#C0C0C0")
 
-    unique_cells = agg_df['Cell_type'].unique()
-    point_colors = {ct: "#202020" for ct in unique_cells}
+    # Assign Point Colors
+    point_colors = {ct: "#202020" for ct in target_cells}
     if "lung (unseen)" in point_colors:
         point_colors["lung (unseen)"] = "#E74C3C" 
 
-    y_max_data = summary_df['ymax'].max() if not summary_df.empty else 0.5
-    y_limit = max(0.5, y_max_data * 1.2)
+    # =================================================================
+    # [NEW] Create a robust shape pool to prevent IndexError
+    # =================================================================
+    shapes_pool = ['o', '^', 's', 'D', 'v', '*', '<', '>', 'p', 'h', '8', 'X', 'd', 'P', 'H']
+    point_shapes = {ct: shapes_pool[i % len(shapes_pool)] for i, ct in enumerate(target_cells)}
 
     plot = (
         ggplot(mapping=aes(x='Model'))
@@ -343,6 +353,7 @@ def plot_te_correlation_performance(
         + geom_jitter(data=agg_df, mapping=aes(y='Mean', shape='Cell_type', color='Cell_type'), 
                       width=0.2, size=3.5, alpha=0.8)
         + scale_color_manual(values=point_colors) 
+        + scale_shape_manual(values=point_shapes)  # [NEW] Force manual shape assignment
         + theme_bw()
         + theme(
             axis_text_x=element_text(angle=45, hjust=1, color="black"), 
@@ -360,14 +371,14 @@ def plot_te_correlation_performance(
     )
 
     if not no_color:
-        # [MODIFIED] Inject our global color dictionary mapping
         plot += scale_fill_manual(values=model_colors)
     else:
-        plot += scale_fill_manual(values="gray")
+        # Safely map all models to gray when no_color is True
+        plot += scale_fill_manual(values={m: "gray" for m in valid_models})
 
     os.makedirs(out_dir, exist_ok=True)
     save_path = os.path.join(out_dir, f"te_correlation_performance_{metric_name}.{suffix}.pdf")
-    plot.save(save_path, width=6, height=5, dpi=300, verbose=False)
+    plot.save(save_path, width=max(6, len(valid_models)*0.6), height=5, dpi=300, verbose=False)
     print(f"Plot saved to: {save_path}")
 
 
@@ -732,6 +743,7 @@ def plot_polysome_correlation_heatmap(
     return heatmap_data
 
 
+
 def plot_polysome_correlation_bar(
         agg_df: pd.DataFrame, 
         out_dir: str = "./", 
@@ -739,6 +751,7 @@ def plot_polysome_correlation_bar(
         suffix: str = ""):
     """
     Plot bar chart with error bars and jitter points for Polysome correlations.
+    [MODIFIED] Removed Cell_type coloring. Focus strictly on Dataset shapes.
     """
 
     if agg_df.empty:
@@ -756,11 +769,8 @@ def plot_polysome_correlation_bar(
     summary_df['ymin'] = summary_df['Overall_Mean'] - summary_df['SEM']
     summary_df['ymax'] = summary_df['Overall_Mean'] + summary_df['SEM']
 
-    # =================================================================
-    # [MODIFIED] Use global model order
-    # =================================================================
+    # --- Use global model order ---
     valid_models = [m for m in GLOBAL_MODEL_ORDER if m in plot_df['Model'].unique()]
-    # Append any model not caught by the predefined list
     for m in plot_df['Model'].unique():
         if m not in valid_models:
             valid_models.append(m)
@@ -768,25 +778,10 @@ def plot_polysome_correlation_bar(
     plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=valid_models, ordered=True)
     summary_df['Model'] = pd.Categorical(summary_df['Model'], categories=valid_models, ordered=True)
 
-    # =================================================================
-    # [MODIFIED] Apply global colors dynamically based on present models
-    # =================================================================
+    # --- Apply global colors dynamically ---
     model_colors = {}
     for m in valid_models:
-        model_colors[m] = GLOBAL_MODEL_COLORS.get(m, "#C0C0C0") # Fallback color
-
-    unique_cells = plot_df['Cell_type'].unique().tolist()
-    unseen_cells = [c for c in unique_cells if 'unseen' in c.lower()]
-    seen_cells = [c for c in unique_cells if c not in unseen_cells]
-    ordered_cells = seen_cells + unseen_cells
-    
-    plot_df['Cell_type'] = pd.Categorical(plot_df['Cell_type'], categories=ordered_cells, ordered=True)
-        
-    cell_colors = {}
-    for ct in seen_cells:
-        cell_colors[ct] = "#202020"
-    for ct in unseen_cells:
-        cell_colors[ct] = "#D6715E"
+        model_colors[m] = GLOBAL_MODEL_COLORS.get(m, "#C0C0C0")
 
     if 'Dataset' not in plot_df.columns:
         raise ValueError("The input DataFrame must contain a 'Dataset' column for shape mapping.")
@@ -794,7 +789,13 @@ def plot_polysome_correlation_bar(
     unique_datasets = plot_df['Dataset'].unique().tolist()
     plot_df['Dataset'] = pd.Categorical(plot_df['Dataset'], categories=unique_datasets, ordered=True)
     
-    shapes_pool = ['o', '^', 's', 'D', 'v', 'p', 'h', '8']
+    # =================================================================
+    # [MODIFIED] Selected high-contrast, universally recognized shapes 
+    # for Plotnine/Matplotlib. 
+    # o=circle, ^=triangle up, s=square, D=diamond, v=triangle down, 
+    # *=star, >=triangle right, <=triangle left, X=x
+    # =================================================================
+    shapes_pool = ['o', '^', 's', 'D', 'v', '*', '>', '<', 'X']
     dataset_shapes = {}
     for i, ds in enumerate(unique_datasets):
         dataset_shapes[ds] = shapes_pool[i % len(shapes_pool)]
@@ -815,22 +816,25 @@ def plot_polysome_correlation_bar(
             size=0.8, 
             color="black"
         )
+        # =================================================================
+        # [MODIFIED] Removed 'color' mapping to Cell_type. Added a fixed dark 
+        # gray color and a slight outline to make points pop against the bars.
+        # =================================================================
         + geom_jitter(
             data=plot_df, 
-            mapping=aes(x='Model', y='Mean', shape='Dataset', color='Cell_type'), 
+            mapping=aes(x='Model', y='Mean', shape='Dataset'), 
             width=0.2, 
             size=3.5, 
+            color="#202020",
             stroke=0.8,
-            alpha=0.8
+            alpha=0.85
         )
-        # [MODIFIED] Inject our global color dictionary mapping
         + scale_fill_manual(values=model_colors, guide=None) 
         + scale_shape_manual(values=dataset_shapes, name="Dataset") 
-        + scale_color_manual(values=cell_colors, name="Cell type")
         + theme_bw()
         + labs(
             x="",
-            y=f"{metric_name} correlation with ribosome load"
+            y=f"{metric_name}\ncorrelation with ribosome load"
         )
         + theme(
             axis_text_x=element_text(angle=45, hjust=1, color="black"),
@@ -839,13 +843,431 @@ def plot_polysome_correlation_bar(
             panel_grid_major_x=element_blank(), 
             legend_position="right",
             legend_title=element_text(size=13, fontweight='bold'),
-            legend_text=element_text(size=11)
+            legend_text=element_text(size=11),
+            figure_size=(7, 5) # Ensured figure size is properly set in theme
         )
     )
 
     file_suffix = f".{suffix}" if suffix else ""
     save_path = os.path.join(out_dir, f"polysome_multidataset_correlation_bar{file_suffix}.pdf")
     p.save(save_path, width=7, height=5, dpi=300, verbose=False)
+    print(f"✅ Bar chart saved to: {save_path}")
+
+    return summary_df
+
+
+def load_and_calculate_silac_correlation(
+        data_config: dict, 
+        ref_dfs: dict,           
+        target_ref_groups=None,     # Filter the 'Group' column in the SILAC reference datasets
+        target_model_cells=None,    # Filter the 'Cell_Type' column in the model prediction datasets
+        model_metric="mORF_Mean_Density", 
+        ref_metric="Translation rate", 
+        corr_method="spearman",
+        meta_pkl_path="/home/user/data3/rbase/translation_model/models/lib/transcript_meta.pkl"):
+    """
+    Load model prediction results and calculate correlation with SILAC mass spec translation rates.
+    Supports MULTIPLE CSV files per model.
+    [NEW] Supports 1-to-1 nested array mapping between `target_ref_groups` and `target_model_cells`.
+    """
+    aggregated_data = []
+    print(f"--- Processing SILAC Data ---")
+    print(f"  Target Model Metric : {model_metric} (Fallback: TE)")
+    print(f"  Target Ref Metric   : {ref_metric}")
+    print(f"  Method              : {corr_method.capitalize()}")
+
+    # 1. Parse target_ref_groups into dict of lists
+    target_ref_group_map = {}
+    if target_ref_groups is not None:
+        if isinstance(target_ref_groups, dict):
+            for k, v in target_ref_groups.items():
+                target_ref_group_map[k] = [v] if isinstance(v, str) else list(v)
+        elif isinstance(target_ref_groups, list):
+            if len(target_ref_groups) != len(ref_dfs):
+                raise ValueError("Length of target_ref_groups list must match the number of datasets in ref_dfs.")
+            for i, ds_name in enumerate(ref_dfs.keys()):
+                val = target_ref_groups[i]
+                target_ref_group_map[ds_name] = [val] if isinstance(val, str) else list(val)
+        else:
+            raise TypeError("target_ref_groups must be a dictionary or a list.")
+
+    # 2. Parse target_model_cells into dict of lists
+    target_model_cell_map = {}
+    if target_model_cells is not None:
+        if isinstance(target_model_cells, dict):
+            for k, v in target_model_cells.items():
+                target_model_cell_map[k] = [v] if isinstance(v, str) else list(v)
+        elif isinstance(target_model_cells, list):
+            if len(target_model_cells) != len(ref_dfs):
+                raise ValueError("Length of target_model_cells list must match the number of datasets in ref_dfs.")
+            for i, ds_name in enumerate(ref_dfs.keys()):
+                val = target_model_cells[i]
+                target_model_cell_map[ds_name] = [val] if isinstance(val, str) else list(val)
+        else:
+            raise TypeError("target_model_cells must be a dictionary or a list.")
+
+    processed_refs = {}
+    id_cols_master = ['ENSEMBL ID', 'Tid', 'EnsemblTranscriptID', 'Gid', 'EnsemblGeneID', 'gene_name']
+    pair_map = {} # Internal map to track [ref_name][ref_group] -> target_model_cell
+    
+    # ---------------------------------------------------------
+    # Phase 0: Preprocess SILAC Reference Datasets & Build Pairing Map
+    # ---------------------------------------------------------
+    for ref_name, ref_df in ref_dfs.items():
+        if ref_metric not in ref_df.columns:
+            print(f"  [Warning] Missing metric '{ref_metric}' in {ref_name}. Skipping this dataset.")
+            continue
+
+        ref_merge_key = next((col for col in id_cols_master if col in ref_df.columns), None)
+        if not ref_merge_key:
+            print(f"  [Warning] No valid ID column found in {ref_name}. Skipping...")
+            continue
+            
+        target_level = 'Transcript' if ref_merge_key in ['ENSEMBL ID', 'Tid', 'EnsemblTranscriptID'] else 'Gene'
+        
+        if 'Group' not in ref_df.columns:
+            ref_clean = ref_df[[ref_merge_key, ref_metric]].copy()
+            ref_clean['Group'] = "All"
+        else:
+            ref_clean = ref_df[[ref_merge_key, 'Group', ref_metric]].copy()
+            
+        ref_clean = ref_clean.rename(columns={'Group': 'Ref_Group'})
+        ref_clean = ref_clean.dropna(subset=[ref_metric])
+        ref_clean['ID_clean'] = ref_clean[ref_merge_key].astype(str).str.split('.').str[0]
+        
+        if target_ref_group_map and ref_name in target_ref_group_map:
+            tgt_groups = target_ref_group_map[ref_name]
+            ref_clean = ref_clean[ref_clean['Ref_Group'].isin(tgt_groups)]
+            if ref_clean.empty:
+                print(f"  [Warning] Specified groups {tgt_groups} not found in '{ref_name}'. Skipping...")
+                continue
+        
+        ref_clean = ref_clean.groupby(['ID_clean', 'Ref_Group'], as_index=False)[ref_metric].mean()
+        surviving_groups = ref_clean['Ref_Group'].unique().tolist()
+        
+        processed_refs[ref_name] = {
+            'df': ref_clean,
+            'level': target_level,
+            'metric': ref_metric,
+            'surviving_groups': surviving_groups
+        }
+        print(f"  -> Ready SILAC Ref [{ref_name}]: ID = {ref_merge_key} ({target_level}), Evaluated Groups = {surviving_groups}")
+
+        # =================================================================
+        # Build strict 1-to-1 pairing map based on arrays
+        # =================================================================
+        pair_map[ref_name] = {}
+        tgt_models = target_model_cell_map.get(ref_name, [])
+        
+        if target_ref_group_map and ref_name in target_ref_group_map:
+            user_ref_groups = target_ref_group_map[ref_name]
+            if len(tgt_models) == 1:
+                # Broadcast single model cell to all requested ref groups
+                for rg in user_ref_groups:
+                    pair_map[ref_name][rg] = tgt_models[0]
+            elif len(tgt_models) == len(user_ref_groups):
+                # 1-to-1 Mapping (e.g. [A, B] -> [X, Y])
+                for rg, mc in zip(user_ref_groups, tgt_models):
+                    pair_map[ref_name][rg] = mc
+            elif len(tgt_models) > 0:
+                raise ValueError(f"Length mismatch in '{ref_name}': {len(user_ref_groups)} ref groups vs {len(tgt_models)} model cells.")
+        else:
+            if len(tgt_models) == 1:
+                for rg in surviving_groups:
+                    pair_map[ref_name][rg] = tgt_models[0]
+            elif len(tgt_models) > 1:
+                raise ValueError(f"Cannot map {len(tgt_models)} model cells to dataset '{ref_name}' because target_ref_groups is not specified.")
+
+    if not processed_refs:
+        raise ValueError("No valid reference datasets processed.")
+
+    # ---------------------------------------------------------
+    # Load meta mapping if required
+    # ---------------------------------------------------------
+    tid2gene = {}
+    if any(info['level'] == 'Gene' for info in processed_refs.values()):
+        print(f"\n  -> Loading transcript metadata mapping from {meta_pkl_path}...")
+        try:
+            with open(meta_pkl_path, 'rb') as f:
+                transcript_meta = pickle.load(f)
+            for tid, info in transcript_meta.items():
+                clean_tid = str(tid).split('.')[0]
+                if isinstance(info, dict) and 'gene_id' in info:
+                    raw_gene = info['gene_id']
+                elif hasattr(info, 'gene_id'):
+                    raw_gene = info.gene_id
+                else:
+                    raw_gene = info
+                tid2gene[clean_tid] = str(raw_gene).split('.')[0]
+        except Exception as e:
+            raise RuntimeError(f"Failed to load metadata pickle: {e}")
+
+    processed_models = {}  
+    global_id_sets = {}    
+    
+    # ---------------------------------------------------------
+    # Phase 1: Data Loading & Initial Mapping
+    # ---------------------------------------------------------
+    print("\n--- Phase 1: Data Loading & Initial Mapping ---")
+    for idx, (model_name, file_paths) in enumerate(data_config.items()):
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+            
+        print(f"Processing model: {model_name} (Loading {len(file_paths)} files...)")
+        
+        model_dfs = []
+        for file_path in file_paths:
+            if not os.path.exists(file_path):
+                print(f"  [Warning] File not found: {file_path}")
+                continue
+            try:
+                sep = '\t' if file_path.endswith(('.tsv', '.txt')) else ','
+                df = pd.read_csv(file_path, sep=sep)
+                model_dfs.append(df)
+            except Exception as e:
+                print(f"  [Error] Could not read {file_path}: {e}")
+                
+        if not model_dfs:
+            print(f"  [Warning] No valid files loaded for model '{model_name}'. Skipping...")
+            continue
+            
+        combined_df_raw = pd.concat(model_dfs, ignore_index=True)
+        
+        current_model_metric = model_metric
+        if current_model_metric not in combined_df_raw.columns:
+            if 'TE' in combined_df_raw.columns:
+                current_model_metric = 'TE'
+            else:
+                print(f"  [Warning] Missing metric '{model_metric}' and 'TE' in {model_name}. Skipping...")
+                continue
+
+        processed_models[model_name] = {}
+        
+        for ref_name, ref_info in processed_refs.items():
+            ref_level = ref_info['level']
+            ref_metric_name = ref_info['metric']
+            ref_clean_full = ref_info['df']
+            surviving_groups = ref_info['surviving_groups']
+            
+            # Map IDs uniformly first
+            combined_df_mapped = combined_df_raw.copy()
+            has_tid = [c for c in ['Tid', 'EnsemblTranscriptID', 'TranscriptID', 'ENSEMBL ID'] if c in combined_df_mapped.columns]
+            has_gid = [c for c in ['Gid', 'EnsemblGeneID', 'GeneID'] if c in combined_df_mapped.columns]
+
+            if ref_level == 'Gene':
+                if has_gid:
+                    combined_df_mapped['ID_clean'] = combined_df_mapped[has_gid[0]].astype(str).str.split('.').str[0]
+                elif has_tid:
+                    combined_df_mapped['clean_tid_temp'] = combined_df_mapped[has_tid[0]].astype(str).str.split('.').str[0]
+                    combined_df_mapped['ID_clean'] = combined_df_mapped['clean_tid_temp'].map(tid2gene)
+                    combined_df_mapped = combined_df_mapped.dropna(subset=['ID_clean'])
+                else:
+                    continue
+            else: 
+                if has_tid:
+                    combined_df_mapped['ID_clean'] = combined_df_mapped[has_tid[0]].astype(str).str.split('.').str[0]
+                else:
+                    continue
+
+            # =================================================================
+            # Process each specific Ref_Group with its paired Model Cell_Type
+            # =================================================================
+            for group_name in surviving_groups:
+                ref_clean_sub = ref_clean_full[ref_clean_full['Ref_Group'] == group_name]
+                
+                tgt_model_cell = pair_map.get(ref_name, {}).get(group_name)
+                
+                combined_df_sub = combined_df_mapped.copy()
+                if tgt_model_cell and 'Cell_Type' in combined_df_sub.columns:
+                    combined_df_sub = combined_df_sub[combined_df_sub['Cell_Type'] == tgt_model_cell]
+                    if combined_df_sub.empty:
+                        print(f"    [Skip] {model_name} has no Cell_Type == '{tgt_model_cell}' for Dataset '{ref_name}' Group '{group_name}'")
+                        continue
+                
+                # Aggregate identical IDs
+                combined_df_agg = combined_df_sub.groupby(['ID_clean'], as_index=False)[current_model_metric].mean()
+                
+                # Merge model specific cell type with ref specific group
+                merged_df = pd.merge(combined_df_agg, ref_clean_sub, on='ID_clean', how='inner')
+                
+                if merged_df.empty:
+                    continue
+
+                # Store by group tuple
+                key = (ref_name, group_name)
+                processed_models[model_name][key] = (merged_df, current_model_metric, ref_metric_name)
+                
+                # Record valid IDs for strict intersection
+                group_clean = merged_df.dropna(subset=[current_model_metric, ref_metric_name])
+                if key not in global_id_sets:
+                    global_id_sets[key] = []
+                global_id_sets[key].append(set(group_clean['ID_clean']))
+
+    # ---------------------------------------------------------
+    # Phase 2: Compute Strict Intersections across Models
+    # ---------------------------------------------------------
+    print("\n--- Phase 2: Intersecting Common IDs across Models ---")
+    intersected_ids_dict = {}
+    expected_model_count = len(processed_models)
+    
+    for key, sets_list in global_id_sets.items():
+        ref_name, group_name = key
+        if len(sets_list) < expected_model_count:
+            print(f"  [Warning] Dataset '{ref_name}' (Group: {group_name}) is missing in some models. Strict comparison may drop models.")
+        
+        common_ids = set.intersection(*sets_list)
+        intersected_ids_dict[key] = common_ids
+        print(f"  -> {ref_name:<20} | {group_name:<15} | Fair IDs found: {len(common_ids)}")
+
+    # ---------------------------------------------------------
+    # Phase 3: Calculate Fair Correlations
+    # ---------------------------------------------------------
+    print("\n--- Phase 3: Calculating Fair Correlations ---")
+    for model_name, group_dict in processed_models.items():
+        print(f"\nEvaluating: {model_name}")
+        
+        for (ref_name, group_name), (merged_df, current_model_metric, ref_metric_name) in group_dict.items():
+            valid_ids = intersected_ids_dict.get((ref_name, group_name), set())
+            group_clean_raw = merged_df.dropna(subset=[current_model_metric, ref_metric_name])
+            n_before = len(group_clean_raw)
+            
+            group_clean = group_clean_raw[group_clean_raw['ID_clean'].isin(valid_ids)]
+            n_after = len(group_clean)
+            
+            print(f"  -> {ref_name:<15} ({group_name}) | N Filtered: {n_before:>5} -> {n_after:>5}")
+
+            if n_after < 5:
+                continue
+
+            # Handle outliers using 1%-99% filtering
+            p01_m = group_clean[current_model_metric].quantile(0.01)
+            p99_m = group_clean[current_model_metric].quantile(0.99)
+            p01_p = group_clean[ref_metric_name].quantile(0.01)
+            p99_p = group_clean[ref_metric_name].quantile(0.99)
+            
+            valid_mask = (
+                (group_clean[current_model_metric] >= p01_m) & (group_clean[current_model_metric] <= p99_m) &
+                (group_clean[ref_metric_name] >= p01_p) & (group_clean[ref_metric_name] <= p99_p)
+            )
+            group_clean = group_clean[valid_mask]
+            
+            if len(group_clean) < 5:
+                continue
+
+            x = group_clean[current_model_metric].values
+            y = group_clean[ref_metric_name].values
+            
+            if corr_method.lower() == 'spearman':
+                r_val, p_val = spearmanr(x, y)
+            else:
+                r_val, p_val = pearsonr(x, y)
+                
+            aggregated_data.append({
+                'Dataset': ref_name,
+                'Group': group_name,  
+                'Model': model_name,
+                'Mean': r_val,
+                'P_value': p_val,
+                'N': len(group_clean) 
+            })
+
+    return pd.DataFrame(aggregated_data)
+
+# =================================================================
+# 2. 柱状图可视化 (SILAC Correlation Bar)
+# =================================================================
+def plot_silac_correlation_bar(
+        agg_df: pd.DataFrame, 
+        out_dir: str = "./", 
+        metric_name: str = "Model Translation Prediction",
+        suffix: str = "",
+        GLOBAL_MODEL_ORDER=GLOBAL_MODEL_ORDER, 
+        GLOBAL_MODEL_COLORS=GLOBAL_MODEL_COLORS):
+    """
+    Plot bar chart with error bars and jitter points for SILAC translation rate correlations.
+    Points are mapped to Dataset via shapes. Group variance is aggregated.
+    """
+    if agg_df.empty:
+        print("No data to plot.")
+        return
+    
+    file_suffix = f".{suffix}" if suffix else ""
+    os.makedirs(out_dir, exist_ok=True)
+
+    agg_df.to_csv(out_dir + f"silac_correlation{file_suffix}.csv")
+    plot_df = agg_df.copy()
+
+    summary_df = plot_df.groupby('Model', observed=False).agg(
+        Overall_Mean=('Mean', 'mean'),
+        SEM=('Mean', lambda x: np.std(x, ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0)
+    ).reset_index()
+    
+    summary_df['ymin'] = summary_df['Overall_Mean'] - summary_df['SEM']
+    summary_df['ymax'] = summary_df['Overall_Mean'] + summary_df['SEM']
+
+    valid_models = [m for m in GLOBAL_MODEL_ORDER if m in plot_df['Model'].unique()]
+    for m in plot_df['Model'].unique():
+        if m not in valid_models:
+            valid_models.append(m)
+            
+    plot_df['Model'] = pd.Categorical(plot_df['Model'], categories=valid_models, ordered=True)
+    summary_df['Model'] = pd.Categorical(summary_df['Model'], categories=valid_models, ordered=True)
+
+    model_colors = {m: GLOBAL_MODEL_COLORS.get(m, "#C0C0C0") for m in valid_models}
+
+    unique_datasets = plot_df['Dataset'].unique().tolist()
+    plot_df['Dataset'] = pd.Categorical(plot_df['Dataset'], categories=unique_datasets, ordered=True)
+    
+    # 采用高对比度形状用于区分不同的 Dataset
+    shapes_pool = ['o', '^', 's', 'D', 'v', '*', '>', '<', 'X']
+    dataset_shapes = {ds: shapes_pool[i % len(shapes_pool)] for i, ds in enumerate(unique_datasets)}
+
+    print(f"Generating SILAC Correlation Bar Chart...")
+    
+    p = (
+        ggplot()
+        + geom_col(
+            data=summary_df, 
+            mapping=aes(x='Model', y='Overall_Mean', fill='Model'), 
+            width=0.7
+        )
+        + geom_errorbar(
+            data=summary_df, 
+            mapping=aes(x='Model', ymin='ymin', ymax='ymax'), 
+            width=0.2, 
+            size=0.8, 
+            color="black"
+        )
+        + geom_jitter(
+            data=plot_df, 
+            mapping=aes(x='Model', y='Mean', shape='Dataset'), 
+            width=0.2, 
+            size=3.5, 
+            color="#202020",
+            stroke=0.8,
+            alpha=0.85
+        )
+        + scale_fill_manual(values=model_colors, guide=None) 
+        + scale_shape_manual(values=dataset_shapes, name="SILAC Dataset") 
+        + theme_bw()
+        + labs(
+            x="",
+            y=f"{metric_name} correlation with SILAC Translation Rate"
+        )
+        + theme(
+            axis_text_x=element_text(angle=45, hjust=1, color="black"),
+            axis_text_y=element_text(color="black"),
+            axis_title_y=element_text(margin={'r': 10}),
+            panel_grid_major_x=element_blank(), 
+            legend_position="right",
+            legend_title=element_text(size=13, fontweight='bold'),
+            legend_text=element_text(size=11),
+            figure_size=(6, 5) 
+        )
+    )
+
+    save_path = os.path.join(out_dir, f"silac_correlation_bar{file_suffix}.pdf")
+    p.save(save_path, width=6, height=5, dpi=300, verbose=False)
     print(f"✅ Bar chart saved to: {save_path}")
 
     return summary_df

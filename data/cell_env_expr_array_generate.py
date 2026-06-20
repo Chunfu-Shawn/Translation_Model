@@ -66,6 +66,7 @@ def prepare_ortholog_mapping(ortho_csv_path):
         }
 
     print(f"Cleaning complete: Parsed {len(df_triplets)} strict 1-to-1-to-1 shared ortholog gene families.")
+
     return id_mapping, anchor_to_native
 
 

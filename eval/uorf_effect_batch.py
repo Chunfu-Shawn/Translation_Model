@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import torch
-from eval.calculate_te import *
+from eval.calculate_te import calculate_morf_mean_signal
 
 class uORFEvaluatorEmb:
     def __init__(self, model, out_dir="."):
@@ -114,7 +114,7 @@ class uORFEvaluatorEmb:
             try:
                 pred_wt_batch = self.predict([base_emb], [cell_type_emb])
                 pred_wt = pred_wt_batch[0]
-                te_wt = calculate_morf_efficiency(pred_wt, m_start, m_end)
+                te_wt = calculate_morf_mean_signal(pred_wt, m_start, m_end)
                 if te_wt < 1e-6: continue 
             except Exception as e:
                 continue
@@ -156,7 +156,7 @@ class uORFEvaluatorEmb:
                 
                 for j, pred_mut in enumerate(batch_preds):
                     meta = meta_buffer[i + j]
-                    te_mut = calculate_morf_efficiency(pred_mut, m_start, m_end)
+                    te_mut = calculate_morf_mean_signal(pred_mut, m_start, m_end)
                     results.append({
                         'UUID': sample['uuid'],
                         'Distance': meta['dist'], 
@@ -188,7 +188,7 @@ class uORFEvaluatorEmb:
             try:
                 pred_wt_batch = self.predict([base_emb], [cell_type_emb])
                 pred_wt = pred_wt_batch[0]
-                te_wt = calculate_morf_efficiency(pred_wt, m_start, m_end)
+                te_wt = calculate_morf_mean_signal(pred_wt, m_start, m_end)
                 if te_wt < 1e-6: continue
             except: continue
                 
@@ -224,7 +224,7 @@ class uORFEvaluatorEmb:
                 
                 for j, pred_mut in enumerate(batch_preds):
                     meta = meta_buffer[i + j]
-                    te_mut = calculate_morf_efficiency(pred_mut, m_start, m_end)
+                    te_mut = calculate_morf_mean_signal(pred_mut, m_start, m_end)
                     results.append({
                         'UUID': sample['uuid'],
                         'uORF_Length': meta['len'],
@@ -259,7 +259,7 @@ class uORFEvaluatorEmb:
             try:
                 pred_wt_batch = self.predict([base_emb], [cell_type_emb])
                 pred_wt = pred_wt_batch[0]
-                te_wt = calculate_morf_efficiency(pred_wt, m_start, m_end)
+                te_wt = calculate_morf_mean_signal(pred_wt, m_start, m_end)
                 if te_wt < 1e-6: continue
             except: continue
 
@@ -355,7 +355,7 @@ class uORFEvaluatorEmb:
 
                 for j, pred_mut in enumerate(batch_preds):
                     meta = meta_buffer[i + j]
-                    te_mut = calculate_morf_efficiency(pred_mut, m_start, m_end)
+                    te_mut = calculate_morf_mean_signal(pred_mut, m_start, m_end)
                     results.append({
                         'UUID': sample['uuid'],
                         'uORF_Count': meta['count'],

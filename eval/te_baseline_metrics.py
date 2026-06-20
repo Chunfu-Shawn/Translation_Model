@@ -1,17 +1,15 @@
 import os
 import pickle
-import torch
 import numpy as np
 import pandas as pd
+import torch
 from tqdm import tqdm
 from eval.calculate_te import calculate_morf_mean_signal
 
-# ==========================================
-# 1. 基础权重字典配置
+#=======================================
+# 1. 基础权重字典配置 (与之前一致)
 # ==========================================
 
-# 人类密码子频率 (Frequency: per thousand)
-# 数据来源: CAIcal (Ensembl Release 57, 19250 Human Genes)
 HUMAN_CODON_WEIGHTS = {
     'TTT': 17.1, 'TTC': 19.5, 'TTA': 7.8,  'TTG': 12.9,
     'CTT': 13.3, 'CTC': 19.2, 'CTA': 7.2,  'CTG': 39.4,
@@ -31,204 +29,267 @@ HUMAN_CODON_WEIGHTS = {
     'GGT': 10.6, 'GGC': 22.3, 'GGA': 16.5, 'GGG': 16.5
 }
 
-# Kozak 上下文 PSSM 权重矩阵 (Log-odds 分数)
 KOZAK_WEIGHTS = {
     '-6': {'A': 0.00, 'C': -0.03, 'G': 0.05, 'T': -0.02},
     '-5': {'A': -0.06, 'C': 0.04,  'G': -0.01, 'T': 0.03},
     '-4': {'A': 0.07, 'C': 0.08,  'G': -0.06, 'T': -0.09}, 
-    '-3': {'A': 0.14, 'C': -0.08,  'G': 0.14, 'T': -0.29},  # Critical
+    '-3': {'A': 0.14, 'C': -0.08,  'G': 0.14, 'T': -0.29}, 
     '-2': {'A': 0.03, 'C': 0.06,  'G': -0.12, 'T': -0.01},
     '-1': {'A': 0.02, 'C': 0.04,  'G': 0.02, 'T': 0.02}, 
-    '+4': {'A': -0.02, 'C': -0.09,  'G': 0.12, 'T': -0.02},  # Critical
+    '+4': {'A': -0.02, 'C': -0.09,  'G': 0.12, 'T': -0.02}, 
     '+5': {'A': -0.01, 'C': 0.04,  'G': 0.05, 'T': -0.07},
 }
 
-# 考虑到非 ATG 变异的起始密码子惩罚得分 (经验设定)
-START_CODON_PENALTY = {
-    'ATG': 0.0,
-    'CTG': -0.5,
-    'GTG': -0.6,
-    'TTG': -0.8,
-    'ACG': -1.0,
-    'ATC': -1.0,
-    'AAG': -1.2,
-    'AGG': -1.2
+START_CODON_WEIGHTS = {
+    'ATG': 1.0,
+    'CTG': 0.3,
+    'GTG': 0.2,
+    'TTG': 0.0,
+    'ACG': -0.2,
 }
 
 # ==========================================
-# 2. 特征计算函数定义
+# 2. 特征计算函数定义 (与之前一致)
 # ==========================================
 
 def calculate_codon_freq_sum(cds_seq):
-    """
-    计算给定 CDS 序列的密码子频率总和。
-    直接提取频率数据并相加。
-    """
     cds_seq = cds_seq.upper().replace('U', 'T')
     codons = [cds_seq[i:i+3] for i in range(0, len(cds_seq) - len(cds_seq)%3, 3)]
-    
-    if not codons:
-        return np.nan
-        
+    if not codons: return np.nan
     score = 0.0
     for codon in codons:
-        if codon in HUMAN_CODON_WEIGHTS:
-            # 跳过终止密码子的计分
-            if codon not in ['TAA', 'TAG', 'TGA']: 
-                score += HUMAN_CODON_WEIGHTS[codon]
-                
+        if codon in HUMAN_CODON_WEIGHTS and codon not in ['TAA', 'TAG', 'TGA']: 
+            score += HUMAN_CODON_WEIGHTS[codon]
     return float(score)
 
 def calculate_gc_content(seq):
-    """计算序列的 GC 含量比例 (0~1)"""
-    if not seq or len(seq) == 0:
-        return np.nan
+    if not seq or len(seq) == 0: return np.nan
     seq = seq.upper()
     g_count = seq.count('G')
     c_count = seq.count('C')
     return (g_count + c_count) / len(seq)
 
 def calculate_kozak_score(full_seq, cds_start):
-    """
-    基于 PSSM 矩阵和 Start Codon 本身变异计算连续的 Kozak 打分。
-    """
-    if cds_start < 6 or cds_start + 4 >= len(full_seq):
-        return np.nan
-        
+    if cds_start < 6 or cds_start + 4 >= len(full_seq): return np.nan
     full_seq = full_seq.upper().replace('U', 'T')
     score = 0.0
-    
-    # 1. 计算 -6 到 -1 (上游上下文)
     for i, pos_name in enumerate(['-6', '-5', '-4', '-3', '-2', '-1']):
         base = full_seq[cds_start - 6 + i]
         score += KOZAK_WEIGHTS[pos_name].get(base, 0)
-        
-    # 2. 计算起始密码子变异惩罚
     start_codon = full_seq[cds_start:cds_start+3]
-    score += START_CODON_PENALTY.get(start_codon, -2.0)
-        
-    # 3. 计算 +4 到 +5 (下游上下文)
+    score += START_CODON_WEIGHTS.get(start_codon, -1.0)
     for i, pos_name in enumerate(['+4', '+5']):
         base = full_seq[cds_start + 3 + i]
         score += KOZAK_WEIGHTS[pos_name].get(base, 0)
-        
     return float(score)
 
 # ==========================================
 # 3. 核心提取引擎
 # ==========================================
 
-# [MODIFIED] 在参数中加入了 unlog_data，与你的 Analyzer 保持一致
-def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/baselines", unlog_data=True):
+def generate_comprehensive_baselines(seq_pkl_path, out_dir="./results/baselines", 
+                                     dataset=None, tx_cds_file=None, 
+                                     unlog_data=True, target_cell_types=None):
     """
-    遍历 Dataset，计算大基线特征，并提取 meta_info 中的 te_scale 以及真实的 mORF_Mean_Density：
-    CDS/5'UTR/3'UTR Length, Codon Freq Sum, uAUG Count, Kozak Score, CDS GC%, te_scale, mORF_Mean_Density
+    Generate baseline features.
+    Priority 1: Use `dataset` to extract real mORF_Mean_Density if available.
+    Priority 2: Fallback to `tx_cds_file` to only extract sequence-intrinsic features.
+    If `target_cell_types` is provided, features are broadcasted to these cells (with missing TE as NaN).
     """
+    if dataset is None and tx_cds_file is None:
+        raise ValueError("You must provide either 'dataset' or 'tx_cds_file'.")
+        
     os.makedirs(out_dir, exist_ok=True)
     print(f"Loading sequence dictionary from {seq_pkl_path}...")
     with open(seq_pkl_path, 'rb') as f:
         seqs_dict = pickle.load(f)
         
-    results = []
-    
-    print(f"Extracting baseline features from Dataset (N={len(dataset)})...")
-    for i in tqdm(range(len(dataset))):
-        uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb = dataset[i]
-        uuid_str = str(uuid)
-        parts = uuid_str.split('-')
-        
-        if len(parts) < 2: continue
-        tid = parts[0]
-        
-        lookup_tid = tid
-        if lookup_tid not in seqs_dict:
-            tid_no_version = tid.split('.')[0]
-            if tid_no_version in seqs_dict:
-                lookup_tid = tid_no_version
-            else:
-                continue
+    feature_dict = {}
+    cells_to_broadcast = set(target_cell_types) if target_cell_types else set()
+
+    # ==========================================
+    # PATH A: Use Dataset (Preferred)
+    # ==========================================
+    if dataset is not None:
+        print(f"Extracting baseline features from Dataset (N={len(dataset)})...")
+        for i in tqdm(range(len(dataset))):
+            uuid, species, cell_type, expr_vector, meta_info, seq_emb, count_emb = dataset[i]
+            uuid_str = str(uuid)
+            parts = uuid_str.split('-')
+            
+            if len(parts) < 2: continue
+            tid = parts[0]
+            
+            lookup_tid = tid
+            if lookup_tid not in seqs_dict:
+                tid_no_version = tid.split('.')[0]
+                if tid_no_version in seqs_dict:
+                    lookup_tid = tid_no_version
+                else:
+                    continue
+                    
+            cds_s = int(meta_info.get("cds_start_pos", -1))
+            cds_e = int(meta_info.get("cds_end_pos", -1))
+            if cds_s == -1 or cds_e == -1: continue
                 
-        cds_s = int(meta_info.get("cds_start_pos", -1))
-        cds_e = int(meta_info.get("cds_end_pos", -1))
-        if cds_s == -1 or cds_e == -1: 
-            continue
+            m_start = max(0, cds_s - 1)
+            m_end = cds_e
+            full_seq = seqs_dict[lookup_tid].upper()
             
-        m_start = max(0, cds_s - 1)
-        m_end = cds_e
-        full_seq = seqs_dict[lookup_tid].upper()
-        
-        # 1. 区域划分
-        utr5_seq = full_seq[:m_start]
-        cds_seq = full_seq[m_start:m_end]
-        utr3_seq = full_seq[m_end:]
-        
-        cds_len = len(cds_seq)
-        if cds_len <= 0: continue
+            if m_start < 0 or m_end > len(full_seq) or m_start >= m_end: continue
             
-        # 2. 计算各项序列特征
-        utr5_len = len(utr5_seq)
-        utr3_len = len(utr3_seq)
-        
-        codon_freq_sum = calculate_codon_freq_sum(cds_seq)
-        cds_gc = calculate_gc_content(cds_seq)
-        kozak_score = calculate_kozak_score(full_seq, m_start) 
-        uaug_count = utr5_seq.replace('U', 'T').count('ATG')
-        
-        te_scale_val = meta_info.get("te_scale", np.nan)
-        if te_scale_val is not None and not pd.isna(te_scale_val):
-            te_scale_val = float(te_scale_val)
-
-        # ==========================================
-        # [NEW] 从 count_emb 提取真实的 mORF_Mean_Density
-        # ==========================================
-        if isinstance(count_emb, torch.Tensor):
-            density = count_emb.detach().cpu().numpy()
-        else:
-            density = count_emb
-
-        # 还原 Log (兼容 expm1 训练数据)
-        if unlog_data:
-            density = np.expm1(density.astype(np.float32))
-        
-        # 维度压缩兼容性处理 (L, 10) -> (L,) 或 (L, 1) -> (L,)
-        if len(density.shape) > 1 and density.shape[1] > 1:
-            density_profile = np.sum(density, axis=1)
-        elif len(density.shape) > 1 and density.shape[1] == 1:
-            density_profile = density.flatten()
-        else:
-            density_profile = density
+            # Sequence Segmentation
+            utr5_seq = full_seq[:m_start]
+            cds_seq = full_seq[m_start:m_end]
+            utr3_seq = full_seq[m_end:]
             
-        # 计算该样本在其真实环境下的翻译效率
-        morf_mean_density = calculate_morf_mean_signal(density_profile, m_start, m_end)
+            cds_len = len(cds_seq)
+            if cds_len <= 0: continue
+                
+            # Sequence Features
+            utr5_len = len(utr5_seq)
+            utr3_len = len(utr3_seq)
+            codon_freq_sum = calculate_codon_freq_sum(cds_seq)
+            cds_gc = calculate_gc_content(cds_seq)
+            kozak_score = calculate_kozak_score(full_seq, m_start) 
+            uaug_count = utr5_seq.replace('U', 'T').count('ATG')
+            
+            seq_features = {
+                '5UTR_Length': utr5_len,
+                'Inverse_5UTR_Length': 1000 / (utr5_len + 10),
+                'CDS_Length': cds_len,
+                'Inverse_CDS_Length': 1000 / (cds_len + 10),
+                '3UTR_Length': utr3_len,
+                'Inverse_3UTR_Length': 1000 / (utr3_len + 10),
+                'CAI': codon_freq_sum / cds_len,
+                'CDS_GC_Content': cds_gc,
+                'Inverse_CDS_GC_Content': 1 - cds_gc,
+                'Kozak_Score': kozak_score,
+                'uAUG_Count': uaug_count,
+                'Inverse_uAUG_Count': 10 / (uaug_count + 1)
+            }
 
-        
-        results.append({
-            'Tid': tid,
-            'Cell_Type': cell_type,
-            '5UTR_Length': utr5_len,
-            "Inverse_5UTR_Length": 1000/(utr5_len + 10),
-            'CDS_Length': cds_len,
-            'Inverse_CDS_Length': 1000/(cds_len + 10),
-            '3UTR_Length': utr3_len,
-            'Inverse_3UTR_Length': 1000/(utr3_len + 10),
-            'CAI': codon_freq_sum / cds_len,
-            'CDS_GC_Content': cds_gc,
-            "Inverse_CDS_GC_Content": 1 - cds_gc,
-            'Kozak_Score': kozak_score,
-            'uAUG_Count': uaug_count,
-            'Inverse_uAUG_Count': 10/(uaug_count + 1),
-            'te_scale': te_scale_val,
-            'mORF_Mean_Density': morf_mean_density
-        })
+            # Extract real TE indicators
+            te_scale_val = meta_info.get("te_scale", np.nan)
+            if te_scale_val is not None and not pd.isna(te_scale_val):
+                te_scale_val = float(te_scale_val)
 
-    df_all = pd.DataFrame(results)
+            if isinstance(count_emb, torch.Tensor):
+                density = count_emb.detach().cpu().numpy()
+            else:
+                density = count_emb
+
+            if unlog_data:
+                density = np.expm1(density.astype(np.float32))
+            
+            if len(density.shape) > 1 and density.shape[1] > 1:
+                density_profile = np.sum(density, axis=1)
+            elif len(density.shape) > 1 and density.shape[1] == 1:
+                density_profile = density.flatten()
+            else:
+                density_profile = density
+                
+            morf_mean_density = calculate_morf_mean_signal(density_profile, m_start, m_end)
+
+            # Broadcasting
+            cells_to_process = cells_to_broadcast.copy()
+            cells_to_process.add(cell_type) 
+            
+            for ct in cells_to_process:
+                key = (tid, ct)
+                if key not in feature_dict:
+                    row_data = {'Tid': tid, 'Cell_Type': ct}
+                    row_data.update(seq_features)
+                    row_data['te_scale'] = np.nan
+                    row_data['mORF_Mean_Density'] = np.nan
+                    feature_dict[key] = row_data
+                
+                # Fill real TE values only for the actual cell type present in the dataset
+                if ct == cell_type:
+                    feature_dict[key]['te_scale'] = te_scale_val
+                    feature_dict[key]['mORF_Mean_Density'] = morf_mean_density
+
+    # ==========================================
+    # PATH B: Use tx_cds_file (Fallback)
+    # ==========================================
+    else:
+        print(f"Loading transcript CDS metadata from {tx_cds_file}...")
+        with open(tx_cds_file, 'rb') as f:
+            cds_dict = pickle.load(f)
+            
+        print(f"Extracting baseline features entirely from sequence dictionary...")
+        if not cells_to_broadcast:
+            print("Warning: No target_cell_types provided. Using ['Generic'] as default.")
+            cells_to_broadcast = {'Generic'}
+            
+        for tid, seq_str in tqdm(seqs_dict.items(), desc="Calculating Features"):
+            clean_tid = str(tid).split('.')[0] if str(tid).startswith('ENST') else str(tid).split('|')[0]
+            
+            cds_info = cds_dict.get(clean_tid, cds_dict.get(tid))
+            if not cds_info: continue
+                
+            cds_s = int(cds_info.get("cds_start_pos", -1)) if isinstance(cds_info, dict) else getattr(cds_info, "cds_start_pos", -1)
+            cds_e = int(cds_info.get("cds_end_pos", -1)) if isinstance(cds_info, dict) else getattr(cds_info, "cds_end_pos", -1)
+            
+            if cds_s == -1 or cds_e == -1: continue
+                
+            m_start = max(0, cds_s - 1)
+            m_end = cds_e
+            full_seq = seq_str.upper()
+            
+            if m_start < 0 or m_end > len(full_seq) or m_start >= m_end: continue
+            
+            # Sequence Segmentation
+            utr5_seq = full_seq[:m_start]
+            cds_seq = full_seq[m_start:m_end]
+            utr3_seq = full_seq[m_end:]
+            
+            cds_len = len(cds_seq)
+            if cds_len <= 0: continue
+                
+            # Sequence Features
+            utr5_len = len(utr5_seq)
+            utr3_len = len(utr3_seq)
+            codon_freq_sum = calculate_codon_freq_sum(cds_seq)
+            cds_gc = calculate_gc_content(cds_seq)
+            kozak_score = calculate_kozak_score(full_seq, m_start) 
+            uaug_count = utr5_seq.replace('U', 'T').count('ATG')
+            
+            seq_features = {
+                '5UTR_Length': utr5_len,
+                'Inverse_5UTR_Length': 1000 / (utr5_len + 10),
+                'CDS_Length': cds_len,
+                'Inverse_CDS_Length': 1000 / (cds_len + 10),
+                '3UTR_Length': utr3_len,
+                'Inverse_3UTR_Length': 1000 / (utr3_len + 10),
+                'CAI': codon_freq_sum / cds_len,
+                'CDS_GC_Content': cds_gc,
+                'Inverse_CDS_GC_Content': 1 - cds_gc,
+                'Kozak_Score': kozak_score,
+                'uAUG_Count': uaug_count,
+                'Inverse_uAUG_Count': 10 / (uaug_count + 1)
+            }
+
+            # Broadcasting
+            for ct in cells_to_broadcast:
+                key = (clean_tid, ct)
+                if key not in feature_dict:
+                    row_data = {'Tid': clean_tid, 'Cell_Type': ct}
+                    row_data.update(seq_features)
+                    # No real data to extract, keep them NaN
+                    row_data['te_scale'] = np.nan
+                    row_data['mORF_Mean_Density'] = np.nan
+                    feature_dict[key] = row_data
+
+    # Convert to DataFrame
+    df_all = pd.DataFrame(list(feature_dict.values()))
     
     if df_all.empty:
         print("No valid baseline data generated.")
         return
         
     # ==========================================
-    # 批量保存
+    # Batch Export CSVs
     # ==========================================
     metrics_to_export = [
         ('5UTR_Length', 'baseline_5utr_length.csv'),
@@ -242,17 +303,27 @@ def generate_comprehensive_baselines(dataset, seq_pkl_path, out_dir="./results/b
         ('Inverse_CDS_GC_Content', 'baseline_inv_cds_gc.csv'),
         ('Kozak_Score', 'baseline_kozak_score.csv'),
         ('uAUG_Count', 'baseline_uaug_count.csv'),
-        ('Inverse_uAUG_Count', 'baseline_inv_uaug_count.csv'),
-        ('te_scale', 'baseline_te_scale.csv'),
-        ('mORF_Mean_Density', 'baseline_morf_mean_density.csv')  # [NEW] 添加密度导出配置
+        ('Inverse_uAUG_Count', 'baseline_inv_uaug_count.csv')
     ]
+    
+    # Only export real TE metrics if Dataset was used
+    if dataset is not None:
+        metrics_to_export.extend([
+            ('te_scale', 'baseline_te_scale.csv'),
+            ('mORF_Mean_Density', 'baseline_morf_mean_density.csv') 
+        ])
     
     print("\n>>> Exporting Baseline CSVs:")
     for col_name, file_name in metrics_to_export:
         df_sub = df_all[['Tid', 'Cell_Type', col_name]].copy()
+        
+        # Drop rows where the metric could not be calculated (or is NaN)
         df_sub = df_sub.dropna(subset=[col_name])
         
-        # 将所有的评估指标列都统一重命名为 'TE'，方便无缝送入你后续的相关性代码
+        if df_sub.empty:
+            continue
+            
+        # Standardize metric column name to 'TE' for downstream pipeline compatibility
         df_sub.rename(columns={col_name: 'TE'}, inplace=True)
         
         save_path = os.path.join(out_dir, file_name)

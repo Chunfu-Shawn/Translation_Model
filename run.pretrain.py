@@ -55,7 +55,7 @@ base_model = DDP(
 )
 
 # trainer
-epoch_num = 50
+epoch_num = 40
 trainer = PretrainingTrainer(
     model = base_model,
     dataset_paths = [human_train_dataset_path, macaque_train_dataset_path, mouse_train_dataset_path],
@@ -70,8 +70,8 @@ trainer = PretrainingTrainer(
     save_every = 1,
     epoch_num = epoch_num,
     mask_value = 0,
-    mask_perc = {"count": (0.4, 1.5), "species": 0.1, "cell": 0.15},
-    alpha_limit = (4.0, 4.0),
+    mask_perc = {"count": (0.4, 1.5), "species": 0.15, "cell": 0.15},
+    alpha_limit = (5.0, 5.0),
     expr_noise_std = 0.1,
     learning_rate = 0.001,
     lr_warmup_perc = 0.3,

@@ -194,18 +194,6 @@ def collate_fn_denovo(batch):
     
     return uuids, species_list, cell_exprs, meta_infos, seq_padded, count_padded, lengths
 
-# =================================================================
-# 主引擎: 仅预测翻译图谱
-# =================================================================
-import os
-import pickle
-import numpy as np
-import torch
-from typing import Optional, Union, List
-from tqdm import tqdm
-
-from eval.save_prediction_results import _prepare_prediction_dataloader
-from utils import unwrap_model, clean_up_memory
 
 class TranslationProfilePredictor:
     def __init__(self, 
