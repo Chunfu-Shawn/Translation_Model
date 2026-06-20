@@ -70,9 +70,6 @@ def _prepare_prediction_dataloader(
     return dataloader, rank, world_size
 
 
-# ==============================================================================
-# 预测函数 1: 专门用于 Count Head (P-site / 翻译动态性)
-# ==============================================================================
 def save_count_predictions(
     model, 
     dataset, 
@@ -146,10 +143,14 @@ def save_count_predictions(
             else:
                 pred = pred_batch[i, :valid_len].squeeze().cpu().numpy().astype(np.float16)
             
-            # 解析 UUID 获取 tid 和 cell_type (例如: "ENST00000652508.1-liver-3")
+            # 解析 UUID 获取 tid
             parts = str(uuid).split('-')
             tid = parts[0]
-            cell_type = parts[1] if len(parts) > 1 else "unknown"
+            
+            # =================================================================
+            # [MODIFIED] 直接使用 dataset 提供的干净 cell_type，不再依赖 uuid 解析
+            # =================================================================
+            cell_type = str(b_cell_types[i])
 
             # 嵌套字典赋值
             if cell_type not in saved_data:

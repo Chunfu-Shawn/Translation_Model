@@ -1180,9 +1180,8 @@ def plot_silac_correlation_bar(
         agg_df: pd.DataFrame, 
         out_dir: str = "./", 
         metric_name: str = "Model Translation Prediction",
-        suffix: str = "",
-        GLOBAL_MODEL_ORDER=GLOBAL_MODEL_ORDER, 
-        GLOBAL_MODEL_COLORS=GLOBAL_MODEL_COLORS):
+        suffix: str = ""
+        ):
     """
     Plot bar chart with error bars and jitter points for SILAC translation rate correlations.
     Points are mapped to Dataset via shapes. Group variance is aggregated.
