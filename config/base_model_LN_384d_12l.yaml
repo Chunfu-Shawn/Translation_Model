@@ -1,0 +1,7 @@
+d_seq: 4
+d_count: 1
+d_model: 384
+number_of_layers: 12
+d_ff: 768
+p_drop: 0.1
+model_name: "base_model_LN_384d_12l"

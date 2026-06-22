@@ -199,7 +199,8 @@ if __name__ == "__main__":
     macque_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/macaque_featureCounts.txt"
     mouse_counts = "/home/user/data3/yaoc/translation_model/rna-seq/counts_gene/mouse_featureCounts.txt"
     
-    out_dir = "/home/user/data3/rbase/translation_model/models/lib"
+    lib_dir = "/home/user/data3/rbase/translation_model/models/lib"
+    out_dir = "/home/user/data3/rbase/translation_model/models/src/config"
 
     # 1. Preprocess the ortholog table
     id_mapping, anchor_to_native = prepare_ortholog_mapping(ortholog_csv)
@@ -208,7 +209,7 @@ if __name__ == "__main__":
     # Phase 1: Process Human data to establish the "Global Reference Coordinates"
     # ---------------------------------------------------------
     print("\n========== Phase 1: Establishing Human Reference Coordinates ==========")
-    human_tpm = os.path.join(out_dir, "human_expression_tpm.csv")
+    human_tpm = os.path.join(lib_dir, "human_expression_tpm.csv")
     human_pt = os.path.join(out_dir, "human_expression_dict.pt")
     _, global_anchor_ids = build_cross_species_expression_dict(
         file_path=human_counts, 
@@ -235,7 +236,7 @@ if __name__ == "__main__":
     # Phase 2: Process other species, forcibly aligning to the reference coordinates
     # ---------------------------------------------------------
     print("\n========== Phase 2: Aligning Macaque Data ==========")
-    macaque_tpm = os.path.join(out_dir, "macaque_expression_tpm.csv")
+    macaque_tpm = os.path.join(lib_dir, "macaque_expression_tpm.csv")
     macaque_pt = os.path.join(out_dir, "macaque_expression_dict.pt")
     build_cross_species_expression_dict(
         file_path=macque_counts, 
@@ -247,7 +248,7 @@ if __name__ == "__main__":
     )
 
     print("\n========== Phase 3: Aligning Mouse Data ==========")
-    mouse_tpm = os.path.join(out_dir, "mouse_expression_tpm.csv")
+    mouse_tpm = os.path.join(lib_dir, "mouse_expression_tpm.csv")
     mouse_pt = os.path.join(out_dir, "mouse_expression_dict.pt")
     build_cross_species_expression_dict(
         file_path=mouse_counts, 
