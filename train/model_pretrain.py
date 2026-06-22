@@ -739,14 +739,13 @@ class PretrainingTrainer:
 
                 # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
                 with self._amp_context():
-                    outputs = unwrap_model(self.model).predict(
+                    outputs = unwrap_model(self.model)(
                         seq_batch=seq_embs_padded, 
                         count_batch=count_embs_masked, 
                         species=species_list,
                         expr_vector=expr_batch,
                         src_mask=pad_masks, 
                         head_names=["count"],
-                        move_inputs_to_device=False # Already moved manually
                     )
                     loss = self.count_task_criterion(outputs, count_embs_padded, count_emb_masks, cds_masks, is_eval=True)
 

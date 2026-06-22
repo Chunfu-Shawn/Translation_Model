@@ -844,7 +844,7 @@ class TranslationBaseModel(nn.Module):
         # report helpful info
         missing = load_res.missing_keys if hasattr(load_res, "missing_keys") else None
         unexpected = load_res.unexpected_keys if hasattr(load_res, "unexpected_keys") else None
-        print(f"[model] load_pretrained_weights: path={ckpt_path}, strict={strict}, all={all}, missing={missing}, unexpected={unexpected}")
+        print(f"[model] load_pretrained_weights: path={ckpt_path}, strict={strict}, missing={missing}, unexpected={unexpected}")
         return load_res
 
     def load_lora_and_heads(self, ckpt_path: Optional[str], map_location: Optional[str] = None, strict: bool = False):

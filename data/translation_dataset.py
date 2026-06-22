@@ -48,8 +48,8 @@ class TranslationDataset(Dataset):
                 data = pickle.load(f)
             # 如果存的是 numpy arrays，就可以直接给构造函数使用
             return cls(data)
-        except FileNotFoundError:
-            print(f"### Error: No such file: {path} ! ###")
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Dataset file not found: {path}") from e
        
     @classmethod
     def from_h5(cls, path, lazy=False):
@@ -96,8 +96,8 @@ class TranslationDataset(Dataset):
                         data["seq_embs"].append(f["sequences"][tid][:]) # (L, 4)
                         data["count_embs"].append(grp["count_emb"][:]) # (L, 1)
                 return cls(data)
-            except FileNotFoundError:
-                print(f"### Error: No such file: {path} ! ###")
+            except FileNotFoundError as e:
+                raise FileNotFoundError(f"Dataset file not found: {path}") from e
         else:
             # Lazy model：将 h5 文件路径记录下来，按需读取（注意：DataLoader 多 worker 时需特殊处理）
             obj = object.__new__(cls)
@@ -129,8 +129,8 @@ class TranslationDataset(Dataset):
                         lengths.append(int(grp["count_emb"].shape[0]))
                         species.append(str(grp.attrs.get("species", None)))
                         cell_types.append(str(grp.attrs.get("cell_type", None)))
-            except FileNotFoundError:
-                print(f"### Error: No such file: {path} ! ###")
+            except FileNotFoundError as e:
+                raise FileNotFoundError(f"Dataset file not found: {path}") from e
 
             obj.uuids = uuids
             obj.lengths = lengths
