@@ -572,14 +572,13 @@ class TranslationBaseModel(nn.Module):
             raise KeyError(name)
         torch.save(self.heads[name].state_dict(), path)
 
-    def load_head(self, name: str, path: str, map_location: Optional[str] = None, overwrite: bool = False) -> None:
-        # if head dont exist, add a same head，then load
-        if name not in self.heads and not overwrite:
-            raise KeyError(f"Head {name} missing: create it via add_head before load.")
+   def load_head(self, name: str, path: str, map_location: Optional[str] = None, overwrite: bool = False) -> None:
+        """Load saved head state dict into an existing head module.
+        The head must already be registered via add_head() before calling this."""
+        if name not in self.heads:
+            raise KeyError(f"Head '{name}' does not exist. Register it via add_head() before load_head().")
         map_loc = map_location or ("cuda" if torch.cuda.is_available() else "cpu")
         state = torch.load(path, map_location=map_loc)
-        if name not in self.heads:
-            raise KeyError("Head not present. Please add a matching head module first.")
         self.heads[name].load_state_dict(state)
 
     def load_pretrained_weights(self, ckpt_path: Optional[str], map_location: Optional[str] = None, strict: bool = False):

@@ -152,9 +152,9 @@ class DeNovoSequenceDataset(Dataset):
             self.lengths.append(len(seq))
             
             # 清理 ID，防止带版本号或复合格式影响后续映射
-            tid_clean = str(tid).split('|')[0]
-            # if tid_clean.startswith('ENS') and '.' in tid_clean:
-            #     tid_clean = tid_clean.split('.')[0]
+           tid_clean = str(tid).split('|')[0]
+            if tid_clean.startswith('ENST') and '.' in tid_clean:
+                tid_clean = tid_clean.split('.')[0]
                 
             uuid = f"{tid_clean}-{self.species}-{self.cell_type}-Prediction"
             self.uuids.append(uuid)

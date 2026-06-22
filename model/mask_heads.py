@@ -445,9 +445,9 @@ class TranslationProfileHead(nn.Module):
         d_pred_h: Optional[int] = None,
         p_drop: float = 0.1,
         init_xavier: bool = True,
-    ) -> "PsiteDensityHead":
+    ) -> "TranslationProfileHead":
         """
-        Create a PsiteDensityHead by inferring missing dimensions from `parent_model`.
+        Create a TranslationProfileHead by inferring missing dimensions from `parent_model`.
 
         parent_model is expected to expose attributes:
           - d_model (model hidden size)

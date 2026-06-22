@@ -424,16 +424,12 @@ class PretrainingTrainer:
         # ==========================================
         # Cell Type Masking 
         # ==========================================
-        cell_mask = torch.zeros(B, dtype=torch.bool)
-        if "cell" in self.mask_perc and not is_eval:
-            cell_mask = torch.rand(B) < self.mask_perc.get("cell", 0)
-            cell_types_masked = [
-                "unknown" if mask_flag else ct 
-                for ct, mask_flag in zip(cell_types, cell_mask)
-            ]
+       cell_mask = torch.zeros(B, dtype=torch.bool)
+       if "cell" in self.mask_perc and not is_eval:
+           cell_mask = torch.rand(B) < self.mask_perc.get("cell", 0)
 
-        # ==========================================
-        # Logical Matrix for Expression Vector Masking
+       # ==========================================
+       # Logical Matrix for Expression Vector Masking
         # ==========================================
         for i in range(B):
             s_masked = species_mask[i].item()
@@ -737,9 +733,9 @@ class PretrainingTrainer:
                 cds_masks = self._to_device(cds_masks)
                 pad_masks = self._to_device(pad_masks)
 
-                # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
-                with self._amp_context():
-                    outputs = unwrap_model(self.model)(
+               # NOTE: We DO NOT add noise during eval_epoch. Model sees pure expression profile.
+               with self._amp_context():
+                    outputs = self.model(
                         seq_batch=seq_embs_padded, 
                         count_batch=count_embs_masked, 
                         species=species_list,

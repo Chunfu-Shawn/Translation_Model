@@ -248,8 +248,117 @@ Evaluation scripts are in `src/eval/`:
 | `uaug_effect.py` / `uorf_effect_batch.py` | uAUG/uORF effect |
 | `orf_coding_performance.py` | ORF coding potential benchmark |
 
-## Citation
+## Quick Start / Test Case
 
+The following example demonstrates how to run a full inference pipeline: load a pretrained model and expression dictionary, provide a transcriptome FASTA file, and predict per-position ribosome density profiles.
+
+### Data Structure
+
+The pre-built expression dictionaries in `config/{species}_expression_dict.pt` have the following structure:
+
+```
+{
+    "cell_type_name_1": torch.Tensor(shape=(d_expr=16839,), dtype=float16),   # Z-scored expression values
+    "cell_type_name_2": torch.Tensor(shape=(d_expr=16839,), dtype=float16),   # aligned to global_anchor_gene_order.txt
+    ...
+}
+```
+
+Each tensor is a dense Z-score vector following the global anchor gene order (`config/global_anchor_gene_order.txt`), where the position in the tensor corresponds to a specific ortholog anchor gene. The model loads these via `model.load_expression_dict()`.
+
+### Test Case: Predict Translation Profiles from FASTA
+
+```python
+import torch
+from model.translation_base_model import TranslationBaseModel
+from model.mask_heads import TranslationProfileHead
+from model.translation_predictor import TranslationProfilePredictor
+
+# ==========================================
+# Step 1: Load Model
+# ==========================================
+# Load base model from a YAML config (adjust path as needed)
+base_model = TranslationBaseModel.from_config(
+    "config/base_model_expr_384d_16h_12l_128env_32ad.yaml"
+)
+base_model.add_head(
+    "count",
+    TranslationProfileHead.create_from_model(base_model, d_pred_h=384),
+    overwrite=True,
+)
+base_model.load_pretrained_weights("/path/to/pretrained_checkpoint.pt")
+
+# ==========================================
+# Step 2: Load Cell Environment Expression Vectors
+# ==========================================
+species = "human"  # or "macaque", "mouse"
+expr_dict_path = f"config/{species}_expression_dict.pt"
+expr_dict = torch.load(expr_dict_path, map_location="cpu")
+
+# Register expression profiles into the model
+base_model.load_expression_dict(expr_dict)
+
+print(f"Loaded {len(base_model.cell_expr_dict)} cell types for {species}.")
+# Example: base_model.cell_expr_dict keys might include
+# "heart", "liver", "brain", "HepG2", "K562", etc.
+
+# ==========================================
+# Step 3: Prepare FASTA Input
+# ==========================================
+# Provide one or more FASTA files containing transcript sequences
+fasta_files = ["/path/to/transcriptome.fasta"]
+
+# Optional: filter to specific transcript IDs (e.g., from RNA-seq TPM analysis)
+target_tids = ["ENST00000335137", "ENST00000448941"]  # or load from get_active_transcripts()
+
+# ==========================================
+# Step 4: Initialize Predictor and Run
+# ==========================================
+predictor = TranslationProfilePredictor(
+    model=base_model,
+    fasta_files=fasta_files,
+)
+
+# Select a cell type to predict in
+cell_type = "heart"  # must be a key in expr_dict
+
+# Get the expression vector for this cell type
+cell_expr_vector = base_model.cell_expr_dict[cell_type].numpy()
+
+# Run prediction
+output_path = predictor.run(
+    species=species,
+    cell_type=cell_type,
+    cell_expr_vector=cell_expr_vector,
+    target_tids=target_tids,      # optional: predict only specific transcripts
+    out_dir="./results",
+    suffix="heart_test",
+    min_len=200,
+    max_len=20000,
+    batch_size=32,
+)
+
+print(f"Predictions saved to: {output_path}")
+```
+
+### Output
+
+The prediction is saved as a pickle (`.pkl`) file containing a dictionary:
+
+```python
+{
+    "cell_type_name": {
+        "ENST00000335137": np.ndarray(shape=(seq_len, 1), dtype=float16),  # per-position RPF density
+        "ENST00000448941": np.ndarray(shape=(seq_len, 1), dtype=float16),  # per-position RPF density
+        ...
+    }
+}
+```
+
+Each entry maps a transcript ID → a 1D per-nucleotide ribosome density profile (float16) of the same length as the transcript sequence.
+
+
+## Citation
 If you use this code, please cite:
 
 ```bibtex
