@@ -1174,7 +1174,7 @@ def load_and_calculate_silac_correlation(
     return pd.DataFrame(aggregated_data)
 
 # =================================================================
-# 2. 柱状图可视化 (SILAC Correlation Bar)
+# 2. Bar chart visualization (SILAC Correlation Bar)
 # =================================================================
 def plot_silac_correlation_bar(
         agg_df: pd.DataFrame, 
@@ -1217,7 +1217,7 @@ def plot_silac_correlation_bar(
     unique_datasets = plot_df['Dataset'].unique().tolist()
     plot_df['Dataset'] = pd.Categorical(plot_df['Dataset'], categories=unique_datasets, ordered=True)
     
-    # 采用高对比度形状用于区分不同的 Dataset
+    # Use high-contrast shapes to distinguish different Datasets
     shapes_pool = ['o', '^', 's', 'D', 'v', '*', '>', '<', 'X']
     dataset_shapes = {ds: shapes_pool[i % len(shapes_pool)] for i, ds in enumerate(unique_datasets)}
 

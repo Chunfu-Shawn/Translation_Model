@@ -88,7 +88,6 @@ translation_model/
 │   ├── run.pretrain.py                  # Pretraining entry point
 │   ├── run.fine_tune.py                 # Fine-tuning entry point
 │   ├── utils.py                         # Shared utilities
-│   └── lora_utils.py                    # LoRA adapter utilities
 ├── data/                                # Data directory (not tracked)
 ├── figures/                             # Paper figures
 ├── results/                             # Experiment results
@@ -198,15 +197,6 @@ adaptive_dim: 32
 p_drop: 0.1
 all_species: ["human", "macaque", "mouse"]
 d_species: 16
-```
-
-### Fine-tuning
-
-Fine-tuning supports LoRA adapters for parameter-efficient transfer learning:
-
-```python
-from lora_utils import build_lora_model_from_pretrained
-model = build_lora_model_from_pretrained(base_model, r=4, lora_alpha=16)
 ```
 
 ## Inference
